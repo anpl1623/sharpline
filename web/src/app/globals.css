@@ -1,0 +1,39 @@
+@import "tailwindcss";
+
+/*
+ * PHASE 0 BASELINE ONLY — this is not the design system.
+ *
+ * CLAUDE.md §7 mandates that `/design-consultation` runs BEFORE any component
+ * is written, and that work happens in phase 7. Everything below is the
+ * minimum needed for the container to build and render legible text:
+ * a dark-first ground (§7: "dark mode is the primary theme, not an
+ * afterthought") and tabular numerals declared once, because every number on
+ * this product's surface is a price. The phase 7 agent replaces this file
+ * wholesale with the approved type scale, color system, spacing scale and
+ * motion language. Do not grow it here.
+ */
+
+@theme {
+  --color-ground: oklch(0.16 0.008 260);
+  --color-ink: oklch(0.95 0.005 260);
+  --color-ink-muted: oklch(0.68 0.01 260);
+  --color-rule: oklch(0.28 0.01 260);
+}
+
+:root {
+  color-scheme: dark;
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background-color: var(--color-ground);
+    color: var(--color-ink);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+      "Helvetica Neue", Arial, sans-serif;
+    font-variant-numeric: tabular-nums;
+  }
+}

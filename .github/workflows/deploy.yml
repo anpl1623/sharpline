@@ -1,0 +1,422 @@
+# ==============================================================================
+# Sharpline deploy  --  CLAUDE.md section 9, "CI/CD (GitHub Actions)": the "deploy
+# job" of the pipeline. Helm is the sole deploy path (section 9, "Kubernetes -- Helm
+# only"; Kustomize is deliberately not used).
+# ==============================================================================
+#
+# CURRENT STATE -- READ THIS BEFORE BELIEVING A GREEN RUN
+#
+#   `deploy/helm/` DOES NOT EXIST YET. CLAUDE.md section 11 puts the Helm chart,
+#   the Terraform, the StatefulSets and the HPA in PHASE 10; the repository is at
+#   phase 0 (the container substrate). There is therefore no chart to render and
+#   nothing to roll out, and this workflow cannot deploy anything today.
+#
+#   That is encoded mechanically rather than left to a comment nobody reads:
+#
+#     * `preflight` looks for `deploy/helm/Chart.yaml`. That file's existence is
+#       the definition of "phase 10 has landed".
+#     * `plan` and `deploy` are gated on it, so with no chart they are SKIPPED --
+#       grey and visibly not-run. A job that never executed cannot pass, which is
+#       the property that matters: this workflow must never report a rollout it
+#       did not perform.
+#     * `result` runs unconditionally and FAILS when nothing was deployed, with
+#       the reason in the log and in the run summary. A deploy workflow that was
+#       explicitly asked to deploy (a `v*` tag push, or a manual dispatch -- there
+#       is no other trigger) and rolled out nothing is a failed deploy, not a
+#       successful no-op.
+#
+#   Delete nothing here when phase 10 lands. Adding `deploy/helm/Chart.yaml` flips
+#   the gate on its own; that is the whole design.
+#
+# PRIME DIRECTIVE: as in ci.yml, no setup-go / setup-node / setup-python /
+# setup-java / setup-terraform, and no `helm` or `kubectl` binary is installed onto
+# the runner. Both live in the `tools` image built from
+# `deploy/docker/tools.Dockerfile` -- verified present there: helm v4.2.4 and
+# kubectl v1.36.3, each fetched from the vendor's release channel and pinned by
+# SHA-256. The `make deploy*` targets are what drive them; per CLAUDE.md section 12
+# ("every make target is a docker invocation") they must run Helm inside that
+# container and must not fall back to a host binary.
+#
+# The only non-make `run:` steps here are POSIX shell: resolving image coordinates,
+# testing for a file, and writing the kubeconfig secret to a path the container
+# mounts. No compiler, no package manager, no interpreter beyond the shell.
+#
+# The deployed images are the ones ci.yml already built, scanned and pushed to GHCR
+# for this exact commit. This workflow never builds an image; it only rolls one out.
+# That is deliberate: deploying an artifact different from the one that passed
+# `trivy` would make the scan job decorative.
+#
+# BRANCH PROTECTION on `main` (CLAUDE.md section 9) is a repository setting and is
+# documented in ci.yml, which is the only place it can be recorded in-tree.
+#
+# ENVIRONMENT PROTECTION: `dev` and `prod` are GitHub Environments and must be
+# created by hand (Settings > Environments). `prod` should carry a required
+# reviewer and be restricted to the `main` branch and `v*` tags. Each environment
+# holds its own KUBECONFIG secret. Like branch protection, this is a repo setting,
+# not a file.
+#
+# Required secrets, per environment:
+#   KUBECONFIG_B64  -- base64 of a kubeconfig scoped to the release namespace only.
+#                      Never a cluster-admin kubeconfig.
+#
+# MAKEFILE INTERFACE -- every target this workflow invokes:
+#   verify-no-host-toolchain   deploy-dry-run   deploy   deploy-status
+# ==============================================================================
+
+name: deploy
+
+on:
+  # Tagged release -> prod. CLAUDE.md section 12: Conventional Commits, PRs into
+  # main, CI green before merge; a tag is the deliberate act that promotes a green
+  # main commit to the cluster.
+  push:
+    tags: ["v*"]
+
+  # Manual rollout, including rollback to an earlier image tag.
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment (selects deploy/helm/values-<env>.yaml)"
+        type: choice
+        required: true
+        default: dev
+        options: [dev, prod]
+      image_tag:
+        description: "Image tag to roll out, e.g. sha-0123456789ab or v1.2.3. Defaults to this commit."
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# One rollout per environment at a time; never cancel a rollout in flight.
+concurrency:
+  group: deploy-${{ github.event.inputs.environment || 'prod' }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Is there anything to deploy?
+  #
+  # This job never fails -- it is fact-finding, and a hard failure here would make
+  # the downstream jobs skip for the wrong reason ("dependency failed") instead of
+  # the right one ("there is no chart"). It reports, `result` adjudicates.
+  # ---------------------------------------------------------------------------
+  preflight:
+    name: preflight (is there a chart?)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      ready: ${{ steps.chart.outputs.ready }}
+      reason: ${{ steps.chart.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: chart
+        run: |
+          set -euo pipefail
+
+          if [ -f deploy/helm/Chart.yaml ]; then
+            ready=true
+            reason="deploy/helm/Chart.yaml is present"
+          else
+            ready=false
+            reason="deploy/helm/Chart.yaml does not exist -- the Helm chart is CLAUDE.md phase 10 and has not been built yet"
+          fi
+
+          {
+            echo "ready=${ready}"
+            echo "reason=${reason}"
+          } >> "$GITHUB_OUTPUT"
+
+          # Informational only: whether the Makefile defines the targets this
+          # workflow calls. `make -n` expands a recipe without running it. Two
+          # messages mean "not usable": "No rule to make target" (the name does
+          # not exist) and "Nothing to be done for" (make matched something with
+          # no recipe -- note `deploy` is also a DIRECTORY in this repo root, so
+          # without `.PHONY: deploy` that is exactly what `make deploy` does, and
+          # it exits 0). A phase-gated target that refuses to run is still
+          # DEFINED. ci.yml's `directive` job runs the same check as a hard gate
+          # over the union of both workflows' targets; here it is a readout,
+          # because the rollout gate is the chart.
+          {
+            echo "## Makefile targets this workflow calls"
+            echo ""
+            echo "| target | defined |"
+            echo "|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for t in verify-no-host-toolchain deploy-dry-run deploy deploy-status; do
+            out=$(make --dry-run --no-print-directory "$t" 2>&1) || true
+            if printf '%s\n' "$out" | grep -qE 'No rule to make target|Nothing to be done for'; then
+              echo "| \`$t\` | **NO** |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "| \`$t\` | yes |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+          {
+            echo ""
+            echo "## Rollout gate"
+            echo ""
+            if [ "$ready" = "true" ]; then
+              echo ":white_check_mark: **Chart found.** \`$reason\`"
+            else
+              echo ":no_entry: **Nothing to deploy.** $reason"
+              echo ""
+              echo "\`plan\` and \`deploy\` are skipped, and this run will be marked"
+              echo "failed by the \`result\` job. That is correct: this workflow only"
+              echo "runs on a \`v*\` tag push or a manual dispatch, both of which are"
+              echo "explicit requests to roll something out. Reporting success for a"
+              echo "rollout that did not happen is the failure mode this gate exists"
+              echo "to prevent."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$ready" = "true" ]; then
+            echo "::notice::$reason"
+          else
+            echo "::warning::$reason"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # The prime-directive check runs here too, and is NOT gated on the chart. A
+  # deploy path that quietly grew a host toolchain dependency is exactly as broken
+  # as a build path that did, and that is checkable today.
+  # ---------------------------------------------------------------------------
+  directive:
+    name: no host toolchain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: make verify-no-host-toolchain
+
+  # ---------------------------------------------------------------------------
+  # Resolve what is being deployed, where. Pure shell.
+  # ---------------------------------------------------------------------------
+  meta:
+    name: resolve release coordinates
+    needs: [preflight]
+    if: needs.preflight.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      environment: ${{ steps.coords.outputs.environment }}
+      registry: ${{ steps.coords.outputs.registry }}
+      project: ${{ steps.coords.outputs.project }}
+      version: ${{ steps.coords.outputs.version }}
+    steps:
+      - id: coords
+        # Variable names match the Makefile's interface (PROJECT / REGISTRY /
+        # VERSION); IMAGE_PREFIX is a `:=` assignment there and cannot be set from
+        # the environment. See the same note in ci.yml.
+        env:
+          OWNER: ${{ github.repository_owner }}
+          NAME: ${{ github.event.repository.name }}
+          SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+          INPUT_ENV: ${{ github.event.inputs.environment }}
+          INPUT_TAG: ${{ github.event.inputs.image_tag }}
+        run: |
+          set -euo pipefail
+
+          # A tag push is always a production rollout; workflow_dispatch chooses.
+          if [ "$EVENT" = "push" ]; then
+            target_env=prod
+          else
+            target_env="${INPUT_ENV:-dev}"
+          fi
+          case "$target_env" in
+            dev|prod) ;;
+            *) echo "::error::unknown environment '$target_env'"; exit 1 ;;
+          esac
+
+          # Default to the image ci.yml built for this commit (see ci.yml `meta`).
+          tag="${INPUT_TAG:-}"
+          if [ -z "$tag" ]; then
+            tag="sha-${SHA:0:12}"
+          fi
+          # Reject anything that is not a plain OCI tag before it reaches a shell
+          # inside the tools container.
+          if ! printf '%s' "$tag" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'; then
+            echo "::error::refusing image tag '$tag': not a valid OCI tag"
+            exit 1
+          fi
+
+          owner=$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')
+          project=$(printf '%s' "$NAME" | tr '[:upper:]' '[:lower:]')
+
+          {
+            echo "environment=$target_env"
+            echo "registry=ghcr.io/${owner}"
+            echo "project=${project}"
+            echo "version=${tag}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Rollout"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| environment | \`$target_env\` |"
+            echo "| image prefix | \`ghcr.io/${owner}/${project}\` |"
+            echo "| image tag | \`$tag\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # `helm upgrade --install --dry-run` against the live cluster, so the rendered
+  # manifests are validated by the real API server (and the real CRDs) before
+  # anything is applied. Runs `make deploy-dry-run`, which runs Helm inside the
+  # tools container.
+  #
+  # This job declares `environment:` because that is the only way to reach the
+  # environment-scoped KUBECONFIG_B64 secret. Consequence worth knowing: if the
+  # `prod` environment has required reviewers, a production rollout prompts an
+  # approver TWICE -- once to let the dry-run read the cluster, and again to apply.
+  # That is the intended shape: approve "show me what would change", read the
+  # rendered diff in the job log, then approve "apply it".
+  # ---------------------------------------------------------------------------
+  plan:
+    name: helm dry-run
+    needs: [preflight, meta, directive]
+    if: needs.preflight.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: ${{ needs.meta.outputs.environment }}
+    env:
+      DEPLOY_ENV: ${{ needs.meta.outputs.environment }}
+      REGISTRY: ${{ needs.meta.outputs.registry }}
+      PROJECT: ${{ needs.meta.outputs.project }}
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: materialise kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KUBECONFIG_B64:-}" ]; then
+            echo "::error::KUBECONFIG_B64 is not set for environment '${DEPLOY_ENV}'"
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$KUBECONFIG_B64" | base64 -d > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+
+      - run: make deploy-dry-run
+
+      - name: shred kubeconfig
+        if: always()
+        run: rm -f "$RUNNER_TEMP/kubeconfig"
+
+  # ---------------------------------------------------------------------------
+  # The rollout. `helm upgrade --install --atomic --wait` inside the tools
+  # container. CLAUDE.md section 9: `migrate` is a Job with a pre-install /
+  # pre-upgrade hook, so schema migration happens as part of this single command
+  # and never as a binary someone runs by hand.
+  # ---------------------------------------------------------------------------
+  rollout:
+    name: helm upgrade --install
+    needs: [preflight, meta, directive, plan]
+    if: needs.preflight.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # GitHub Environment: attach the required reviewer here for `prod`.
+    environment:
+      name: ${{ needs.meta.outputs.environment }}
+    env:
+      DEPLOY_ENV: ${{ needs.meta.outputs.environment }}
+      REGISTRY: ${{ needs.meta.outputs.registry }}
+      PROJECT: ${{ needs.meta.outputs.project }}
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: materialise kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KUBECONFIG_B64:-}" ]; then
+            echo "::error::KUBECONFIG_B64 is not set for environment '${DEPLOY_ENV}'"
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$KUBECONFIG_B64" | base64 -d > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+
+      - run: make deploy
+
+      - name: report rollout
+        if: always()
+        run: make deploy-status
+
+      - name: shred kubeconfig
+        if: always()
+        run: rm -f "$RUNNER_TEMP/kubeconfig"
+
+  # ---------------------------------------------------------------------------
+  # Adjudicate the run. This is the job to require if this workflow is ever gated.
+  #
+  # It exists because GitHub marks a run green when every job either succeeded or
+  # was SKIPPED -- so without it, "no chart, nothing deployed, all deploy jobs
+  # skipped" would render as a successful deploy. It does not.
+  # ---------------------------------------------------------------------------
+  result:
+    name: rollout result
+    if: always()
+    needs: [preflight, directive, meta, plan, rollout]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          READY: ${{ needs.preflight.outputs.ready }}
+          REASON: ${{ needs.preflight.outputs.reason }}
+          PREFLIGHT: ${{ needs.preflight.result }}
+          DIRECTIVE: ${{ needs.directive.result }}
+          META: ${{ needs.meta.result }}
+          PLAN: ${{ needs.plan.result }}
+          ROLLOUT: ${{ needs.rollout.result }}
+        run: |
+          set -euo pipefail
+
+          echo "preflight=$PREFLIGHT directive=$DIRECTIVE meta=$META plan=$PLAN rollout=$ROLLOUT"
+
+          rc=0
+
+          if [ "$PREFLIGHT" != "success" ] || [ "$DIRECTIVE" != "success" ]; then
+            echo "::error::a gating job did not succeed (preflight=$PREFLIGHT directive=$DIRECTIVE)"
+            rc=1
+          fi
+
+          if [ "$READY" != "true" ]; then
+            echo "::error::NOTHING WAS DEPLOYED -- $REASON"
+            echo "::error::This workflow only runs on a v* tag push or a manual dispatch. Both are explicit requests to roll something out, so a no-op is a failure, not a success."
+            rc=1
+          else
+            for r in "$META" "$PLAN" "$ROLLOUT"; do
+              if [ "$r" != "success" ]; then
+                echo "::error::a rollout job did not succeed (meta=$META plan=$PLAN rollout=$ROLLOUT)"
+                rc=1
+                break
+              fi
+            done
+          fi
+
+          if [ "$rc" -eq 0 ]; then
+            echo "### :rocket: Rolled out" >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### :x: Not rolled out"
+              echo ""
+              echo "\`$REASON\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          exit "$rc"

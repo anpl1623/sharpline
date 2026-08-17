@@ -1,0 +1,92 @@
+# =============================================================================
+# Sharpline frontend — DEVELOPMENT image (hot reload, in a container).
+#
+# CLAUDE.md §7: "a node:24-alpine service in compose running the Next dev
+# server. web/src bind-mounted for hot reload; node_modules and .next on named
+# volumes so host-arch binaries (sharp, SWC, esbuild) never collide with the
+# container's. WATCHPACK_POLLING=true because bind-mount filesystem events are
+# unreliable across the Docker VM boundary on macOS."
+#
+# -----------------------------------------------------------------------------
+# BUILD CONTEXT IS `web/`, NOT THE REPO ROOT. This is load-bearing.
+#
+#   docker build -f web/Dockerfile.dev -t sharpline/web:dev ./web
+#
+# and in the compose dev override:
+#
+#   build:
+#     context: ../../web          # <-- web/, relative to deploy/compose/
+#     dockerfile: Dockerfile.dev
+#
+# Every COPY below is written against that context (`package.json`, `src`, not
+# `web/package.json`, `web/src`). Do not "fix" this to a repo-root context:
+# web/.dockerignore only applies to a context rooted at web/, so a repo-root
+# context would drag the whole Go tree and the host's `web/node_modules` into the
+# build — host-arch binaries leaking into the image is exactly what §7 forbids.
+# -----------------------------------------------------------------------------
+#
+# NOTE — no `# syntax=` parser directive on purpose, matching
+# deploy/docker/go.Dockerfile:26-31. That directive makes BuildKit fetch and
+# execute `docker/dockerfile:1` as the build frontend on every build: a floating
+# tag whose digest moves, which CLAUDE.md §12 forbids. Everything used here
+# (ARG-before-FROM, ARG in FROM, RUN --mount=type=cache with sharing=locked,
+# COPY --chown) is supported by the BuildKit frontend built into the daemon.
+#
+# Expected compose wiring (owned by the compose agent, stated here so the two
+# agree):
+#   volumes:
+#     - ../../web/src:/app/src              # bind mount, hot reload
+#     - web_node_modules:/app/node_modules  # NAMED volume — never the host's
+#     - web_next_cache:/app/.next           # NAMED volume
+#
+# Both /app/node_modules and /app/.next are created and chowned to `node` in
+# this image on purpose: Docker seeds an empty named volume from the image
+# contents at that path, so the volume inherits `node` ownership. If the path
+# did not exist in the image, Docker would create it root-owned and the dev
+# server, running as non-root, could not write to it.
+#
+# Do NOT bind-mount the whole `web/` directory over /app — that would shadow
+# the container's node_modules with the host's (absent, or worse, host-arch)
+# copy. Mount `src/` only, which is what §7 specifies.
+#
+# Base image digest copied verbatim from the contract ledger's resolved table.
+# =============================================================================
+
+ARG NODE_IMAGE=node:24-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
+
+FROM ${NODE_IMAGE} AS dev
+WORKDIR /app
+
+ENV NODE_ENV=development
+ENV NEXT_TELEMETRY_DISABLED=1
+# Poll the filesystem — inotify does not cross the Docker VM boundary reliably
+# on macOS, so without this the bind mount produces no change events at all
+# and hot reload silently never fires.
+ENV WATCHPACK_POLLING=true
+ENV CHOKIDAR_USEPOLLING=true
+ENV PORT=3000
+ENV HOSTNAME=0.0.0.0
+
+# Proxy paths, same as prod: the browser never addresses a container hostname.
+ENV NEXT_PUBLIC_API_URL=/api
+ENV NEXT_PUBLIC_WS_URL=/ws
+
+COPY --chown=node:node package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm,sharing=locked \
+    npm ci --no-audit --no-fund
+
+# Config files are baked in; `src/` arrives over the bind mount at run time.
+# The image's own copy of src/ is the fallback that lets this image run
+# standalone (e.g. in CI) with no mount at all.
+COPY --chown=node:node next.config.ts tsconfig.json postcss.config.mjs eslint.config.mjs ./
+COPY --chown=node:node src ./src
+
+RUN mkdir -p /app/.next /app/public && chown -R node:node /app
+
+USER node
+EXPOSE 3000
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=60s --retries=12 \
+  CMD wget --quiet --spider --tries=1 http://127.0.0.1:3000/ || exit 1
+
+CMD ["npm", "run", "dev"]

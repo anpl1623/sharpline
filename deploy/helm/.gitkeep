@@ -1,0 +1,1 @@
+deploy/helm — the only Kubernetes deploy path (chart, templates/, values{,-dev,-prod}.yaml). Filled in phase 10 (CLAUDE.md §11).

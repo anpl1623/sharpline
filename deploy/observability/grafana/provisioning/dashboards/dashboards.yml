@@ -1,0 +1,32 @@
+# Sharpline — Grafana dashboard provider
+#
+# Mounted read-only at /etc/grafana/provisioning/dashboards. Grafana walks
+# `options.path` at boot and imports every dashboard JSON it finds, so
+# CLAUDE.md §9's "pre-built Grafana dashboard" is present the first time anyone
+# opens Grafana. No import step, no clicking, no README ritual.
+#
+# Compose/Helm owner: mount deploy/observability/grafana/dashboards at
+# /var/lib/grafana/dashboards (read-only is fine —
+# `allowUiUpdates: false` means Grafana never writes back).
+
+apiVersion: 1
+
+providers:
+  - name: sharpline
+    orgId: 1
+    # Empty folder => dashboards land at the top level of the General folder,
+    # which is what you want when there is exactly one dashboard.
+    folder: ""
+    folderUid: ""
+    type: file
+    # The dashboard is version-controlled in this repo. A change made in the
+    # Grafana UI is a change that disappears on the next `docker compose up`,
+    # so disallow it outright rather than letting it look like it stuck.
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      # Mirror the on-disk layout into folder structure if more dashboards are
+      # added later.
+      foldersFromFilesStructure: false

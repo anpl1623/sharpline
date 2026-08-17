@@ -1,0 +1,74 @@
+# Sharpline — Grafana datasource provisioning
+#
+# Mounted read-only at /etc/grafana/provisioning/datasources. Grafana reads it
+# at boot, so the datasources exist before the dashboard provider runs and the
+# dashboard resolves its `uid` references with zero clicking.
+#
+# The uids below are STABLE IDENTIFIERS, not cosmetic. sharpline-overview.json
+# references them literally. Renaming one silently breaks every panel.
+
+apiVersion: 1
+
+# Delete anything a previous boot left behind under these names before
+# re-provisioning, so an edited file cannot leave two half-configured copies.
+deleteDatasources:
+  - name: Prometheus
+    orgId: 1
+  - name: Jaeger
+    orgId: 1
+
+datasources:
+  - name: Prometheus
+    uid: sharpline-prometheus
+    type: prometheus
+    access: proxy
+    # Compose service-name DNS on the internal bridge network. Nothing here is
+    # published to the host; the proxy is the only container with host ports.
+    url: http://prometheus:9090
+    orgId: 1
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      # Must match `global.scrape_interval` in prometheus.yml, otherwise
+      # Grafana picks $__rate_interval badly and the staleness rate() panels
+      # go jagged.
+      timeInterval: 15s
+      manageAlerts: false
+      prometheusType: Prometheus
+      prometheusVersion: 3.13.2
+      # This is what makes CLAUDE.md §9's "follow a single odds update end to
+      # end" a click rather than a copy-paste: a latency histogram exemplar
+      # carries the trace_id, and Grafana turns it into a link into Jaeger.
+      # Requires the Go services to expose exemplars — i.e. register the
+      # Prometheus collectors with native-histogram/exemplar support and attach
+      # the active span's TraceID on Observe().
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: sharpline-jaeger
+          urlDisplayLabel: "View trace"
+
+  - name: Jaeger
+    uid: sharpline-jaeger
+    type: jaeger
+    access: proxy
+    # jaegertracing/all-in-one v1 query UI + API.
+    url: http://jaeger:16686
+    orgId: 1
+    isDefault: false
+    editable: false
+    jsonData:
+      # Jump from a span straight to the RED metrics for the service that
+      # emitted it.
+      tracesToMetrics:
+        datasourceUid: sharpline-prometheus
+        tags:
+          - key: service.name
+            value: service
+        queries:
+          - name: "Request rate"
+            query: 'sum(rate(sharpline_http_requests_total{$$__tags}[$$__rate_interval]))'
+          - name: "Pricing p99"
+            query: 'histogram_quantile(0.99, sum by (le) (rate(sharpline_pricing_duration_seconds_bucket{$$__tags}[$$__rate_interval])))'
+      nodeGraph:
+        enabled: true

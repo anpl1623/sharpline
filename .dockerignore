@@ -1,0 +1,180 @@
+# =============================================================================
+#  Sharpline — repository-root build-context exclusions
+#
+#  WHY THIS FILE IS AT THE REPOSITORY ROOT
+#  --------------------------------------
+#  BuildKit resolves the ignore file for a build in exactly this order:
+#
+#      1. <dockerfile-path>.dockerignore      (per-Dockerfile; wins outright)
+#      2. <context-root>/.dockerignore        (this file; the fallback)
+#
+#  There is no third lookup. A file at, say, `deploy/docker/.dockerignore` is
+#  never consulted for a build whose context is the repository root, no matter
+#  which Dockerfile under `deploy/docker/` is used. Every build in this repo
+#  passes the repository root as its context:
+#
+#      Makefile  build-%          docker build --file deploy/docker/go.Dockerfile  $(ROOT_DIR)
+#      compose.yaml       x-go-build     context: ../..   dockerfile: deploy/docker/go.Dockerfile
+#      compose.tools.yaml x-tools-image  context: ../..   dockerfile: deploy/docker/tools.Dockerfile
+#      compose.tools.yaml playwright     context: ../..   dockerfile: deploy/docker/playwright.Dockerfile
+#      compose.tools.yaml locust         context: ../..   dockerfile: deploy/docker/locust.Dockerfile
+#
+#  So this file is the one that applies to all of them — with one exception:
+#  the Go service build has its own sibling, `deploy/docker/go.Dockerfile.dockerignore`,
+#  which takes precedence and prunes far more aggressively (it drops every
+#  first-party tree the Go compiler never reads, so a frontend edit cannot
+#  invalidate the Go build cache).
+#
+#  SCOPE OF THIS FILE — deliberately CONSERVATIVE
+#  ----------------------------------------------
+#  This is the fallback for builds whose Dockerfile has no sibling ignore file,
+#  including ones added later by someone who never reads this comment. It
+#  therefore excludes ONLY things that are never legitimately needed inside any
+#  image: version-control metadata, host-produced dependency and build output,
+#  secrets, caches, and OS/editor noise.
+#
+#  It does NOT exclude first-party source trees (web/, deploy/, docs/, test/,
+#  e2e/, load/, analysis/, flink/, migrations/). Removing a source tree here
+#  would silently break any future Dockerfile that legitimately COPYs it, and a
+#  missing-file failure inside a build stage is far harder to diagnose than a
+#  slightly larger context. Per-build pruning belongs in a per-Dockerfile
+#  sibling, where its blast radius is one build.
+#
+#  Two entries below are load-bearing and must not be "tidied up":
+#    * `migrations` is NOT excluded — the `migrate` binary embeds the goose SQL
+#      via go:embed, so it must be inside the Go build context.
+#    * `!.env.example` re-includes the committed template after `.env.*` removes
+#      the real secrets file. Order matters; a later broad pattern would undo it.
+# =============================================================================
+
+
+# ── Version control and CI metadata ──────────────────────────────────────────
+# Never needed in an image, and .git changes on every commit, which would
+# invalidate the context digest for builds that are otherwise identical.
+# Safe because go.Dockerfile builds with `-buildvcs=false`.
+.git
+.gitignore
+.gitattributes
+.github
+
+
+# ── Secrets ──────────────────────────────────────────────────────────────────
+# A file in the build context is readable by every stage and can be baked into a
+# layer by an over-broad COPY. Real credentials must never get that close.
+# `.env.example` is the committed, non-secret template and is deliberately kept.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+secrets/
+secrets.yaml
+*.dec.yaml
+kubeconfig
+kubeconfig.*
+
+
+# ── Host-produced Node output ────────────────────────────────────────────────
+# CLAUDE.md §7: node_modules and .next live on named Docker volumes and are
+# produced inside a build stage. Anything the host produced carries the host's
+# architecture (sharp, SWC, esbuild) and is a contaminant, not a shortcut.
+**/node_modules
+**/.next
+**/.turbo
+web/out
+.npm
+.pnpm-store
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+
+
+# ── Host-produced Go output ──────────────────────────────────────────────────
+# Builds happen in containers (prime directive), so none of this should exist on
+# the host. Excluding it means a stray host `go build` cannot leak a host-arch
+# binary into an image.
+bin/
+dist/
+build/
+vendor/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+__debug_bin*
+coverage.out
+coverage.*
+cover.html
+*.prof
+*.pprof
+
+
+# ── Terraform state ──────────────────────────────────────────────────────────
+# State files can contain credentials in plaintext. The lockfile is committed and
+# is intentionally not excluded.
+**/.terraform
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+crash.log
+crash.*.log
+.terraformrc
+terraform.rc
+
+
+# ── Test and load-run artifacts ──────────────────────────────────────────────
+# Output of a previous run, never an input to a build.
+e2e/test-results
+e2e/playwright-report
+e2e/blob-report
+e2e/.cache
+playwright/.auth
+load/reports
+*_stats.csv
+*_stats_history.csv
+*_failures.csv
+
+
+# ── Python bytecode and virtualenvs (load/ and analysis/) ────────────────────
+# CLAUDE.md §2 keeps Python out of the serving path entirely; its build detritus
+# has no business in any image.
+**/__pycache__
+*.py[cod]
+.venv
+venv
+.ipynb_checkpoints
+.pytest_cache
+.mypy_cache
+.ruff_cache
+analysis/data
+
+
+# ── Local runtime scratch ────────────────────────────────────────────────────
+*.log
+tmp/
+.tmp/
+.cache/
+
+
+# ── Editor and OS noise ──────────────────────────────────────────────────────
+.vscode
+.idea
+*.iml
+*.swp
+*.swo
+*~
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.AppleDouble
+.LSOverride
+ehthumbs.db
+Thumbs.db
+desktop.ini

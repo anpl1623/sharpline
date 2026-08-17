@@ -1,0 +1,1 @@
+deploy/terraform/envs/local — Terraform root for the local (kind + compose) environment. First filled in phase 3 (Kafka topics), extended in phase 10 (CLAUDE.md §11).

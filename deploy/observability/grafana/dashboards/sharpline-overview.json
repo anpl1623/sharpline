@@ -1,0 +1,878 @@
+{
+  "uid": "sharpline-overview",
+  "title": "Sharpline — Overview",
+  "description": "CLAUDE.md §9 pre-built dashboard: odds staleness p50/p99 (headline SLO), provider quota remaining, WebSocket connections and dropped clients, pricing latency, and bus lag. Panels read 'No data' until phases 3–6 emit the sharpline_* metrics; that is correct, not a defect.",
+  "tags": ["sharpline", "slo", "overview"],
+  "timezone": "browser",
+  "editable": false,
+  "graphTooltip": 1,
+  "schemaVersion": 41,
+  "version": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": ["5s", "10s", "30s", "1m", "5m", "15m", "1h"]
+  },
+  "links": [
+    {
+      "title": "Traces (Jaeger)",
+      "type": "link",
+      "icon": "external link",
+      "url": "/explore?left=%7B%22datasource%22:%22sharpline-jaeger%22%7D",
+      "targetBlank": true,
+      "tooltip": "Follow a single odds update ingest → pricer → stream",
+      "asDropdown": false,
+      "includeVars": false,
+      "keepTime": true,
+      "tags": []
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "league",
+        "label": "League",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+        "definition": "label_values(sharpline_odds_staleness_seconds_count{stage=\"fanout\"}, league)",
+        "query": {
+          "qryType": 1,
+          "query": "label_values(sharpline_odds_staleness_seconds_count{stage=\"fanout\"}, league)",
+          "refId": "league-variable"
+        },
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "refresh": 2,
+        "sort": 1,
+        "current": { "text": ["All"], "value": ["$__all"] },
+        "options": []
+      },
+      {
+        "name": "provider",
+        "label": "Provider",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+        "definition": "label_values(sharpline_provider_quota_remaining, provider)",
+        "query": {
+          "qryType": 1,
+          "query": "label_values(sharpline_provider_quota_remaining, provider)",
+          "refId": "provider-variable"
+        },
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "refresh": 2,
+        "sort": 1,
+        "current": { "text": ["All"], "value": ["$__all"] },
+        "options": []
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "name": "Odds staleness SLO breach",
+        "enable": true,
+        "iconColor": "red",
+        "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+        "expr": "ALERTS{alertname=~\"OddsStalenessP99Degraded|OddsStalenessP99Critical|OddsFanoutStopped\",alertstate=\"firing\"}",
+        "titleFormat": "{{alertname}}",
+        "textFormat": "{{description}}",
+        "step": "60s",
+        "useValueForTime": false
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Odds staleness — p50 / p99 (HEADLINE SLO)",
+      "description": "staleness = fanout instant − provider observation timestamp. Series are the recording rules sharpline:odds_staleness_seconds:p50 / :p99, i.e. the exact expressions the alert rules evaluate, so the graph and the alert can never disagree.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 10, "w": 15, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "decimals": 3,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisLabel": "staleness",
+            "gradientMode": "opacity"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "#EAB839", "value": 2 },
+              { "color": "red", "value": 5 }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "p50" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "p99" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "p50 objective (0.5s)" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "text" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
+              { "id": "custom.fillOpacity", "value": 0 },
+              { "id": "custom.lineWidth", "value": 1 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "p99 objective (2s)" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
+              { "id": "custom.fillOpacity", "value": 0 },
+              { "id": "custom.lineWidth", "value": 1 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sharpline:odds_staleness_seconds:p50",
+          "legendFormat": "p50",
+          "range": true,
+          "exemplar": true
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sharpline:odds_staleness_seconds:p99",
+          "legendFormat": "p99",
+          "range": true,
+          "exemplar": true
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "vector(0.5)",
+          "legendFormat": "p50 objective (0.5s)",
+          "range": true
+        },
+        {
+          "refId": "D",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "vector(2)",
+          "legendFormat": "p99 objective (2s)",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "text",
+      "title": "Headline SLO — the definition",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 10, "w": 9, "x": 15, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "code": { "language": "plaintext", "showLineNumbers": false, "showMiniMap": false },
+        "content": "### Odds staleness\n\n```\nstaleness =\n    instant the price is written\n    to the client socket\n  − provider observation timestamp\n    carried on that price\n```\n\nMeasured by **`stream`, at the moment of fanout** — i.e. at the point the price reaches the browser, not at the point ingest received it. The provider observation timestamp is the provider's own `last_update` for the market, propagated **unchanged** through `ingest → Kafka → pricer → stream`. No hop re-stamps it.\n\nSeries: `sharpline_odds_staleness_seconds{stage=\"fanout\"}` (histogram).\nThe same histogram is recorded at `stage=\"received\" | \"normalized\" | \"priced\"` so a regression can be attributed to a pipeline segment. **Only `stage=\"fanout\"` is the SLO.**\n\n| | objective |\n|---|---|\n| p50 | ≤ 0.5 s |\n| p99 | ≤ 2.0 s |\n| compliance | 99 % of prices under 2 s |\n| page | p99 > 5 s |\n\nAlerts: `OddsStalenessP99Degraded`, `OddsStalenessP99Critical`, `OddsStalenessSLOBudgetBurn`, `OddsFanoutStopped` — see `deploy/observability/rules/sharpline-alerts.yml`.\n\n> `OddsFanoutStopped` exists because a stalled pipeline makes the SLO look *perfect*: with nothing fanning out there is nothing slow to measure. Zero fanout with connected clients is a critical, not a pass.\n\n---\n\n**\"No data\" is expected** until phases 3–6 emit these metrics. Sample values are never fabricated here."
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Staleness p50",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 10 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "#EAB839", "value": 0.5 },
+              { "color": "red", "value": 2 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sharpline:odds_staleness_seconds:p50",
+          "legendFormat": "p50",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Staleness p99",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 10 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "#EAB839", "value": 2 },
+              { "color": "red", "value": 5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sharpline:odds_staleness_seconds:p99",
+          "legendFormat": "p99",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "SLO compliance (1h, ≤ 2s)",
+      "description": "Fraction of fanned-out prices that reached the browser within the 2s objective over the last hour. Objective: 99%.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 4, "w": 5, "x": 8, "y": 10 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 3,
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "#EAB839", "value": 0.99 },
+              { "color": "green", "value": 0.995 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sharpline:odds_staleness_slo_ratio:1h",
+          "legendFormat": "compliance",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "WebSocket connections active",
+      "description": "sharpline_ws_connections_active — also the custom metric the `stream` HPA scales on (CLAUDE.md §9).",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 4, "w": 5, "x": 13, "y": 10 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "blue", "value": null }]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum(sharpline_ws_connections_active)",
+          "legendFormat": "active",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Provider quota remaining",
+      "description": "CLAUDE.md §5 mandates the remaining provider quota be exposed as a Prometheus gauge. Shown per provider.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 10 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "#EAB839", "value": 100 },
+              { "color": "green", "value": 1000 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value_and_name",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sharpline_provider_quota_remaining{provider=~\"$provider\"}",
+          "legendFormat": "{{provider}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Staleness p99 by pipeline stage",
+      "description": "Where the latency is added. received → normalized → priced → fanout. The gap between two adjacent stages is the cost of that segment.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 14 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "decimals": 3,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "mode": "none", "group": "A" }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (le, stage) (rate(sharpline_odds_staleness_seconds_bucket{league=~\"$league\"}[$__rate_interval])))",
+          "legendFormat": "{{stage}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Staleness p99 by league (fanout)",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 14 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "decimals": 3,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (le, league) (rate(sharpline_odds_staleness_seconds_bucket{stage=\"fanout\",league=~\"$league\"}[$__rate_interval])))",
+          "legendFormat": "{{league}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Provider quota remaining",
+      "description": "Left axis: requests left in the budget. The burn rate is the second series — if adaptive polling is backing off correctly it flattens as the budget drains.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 14 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*burn.*" },
+            "properties": [
+              { "id": "unit", "value": "reqps" },
+              { "id": "custom.axisPlacement", "value": "right" },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "min"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sharpline_provider_quota_remaining{provider=~\"$provider\"}",
+          "legendFormat": "{{provider}} remaining",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum by (provider) (rate(sharpline_provider_requests_total{provider=~\"$provider\"}[$__rate_interval]))",
+          "legendFormat": "{{provider}} burn",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "WebSocket connections",
+      "description": "Active subscribers and the accept/reject rate. `sharpline_ws_connections_active` is the HPA custom metric.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 22 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*/s$" },
+            "properties": [
+              { "id": "unit", "value": "cps" },
+              { "id": "custom.axisPlacement", "value": "right" },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum(sharpline_ws_connections_active)",
+          "legendFormat": "active",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum by (result) (rate(sharpline_ws_connections_total[$__rate_interval]))",
+          "legendFormat": "{{result}}/s",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "WebSocket clients dropped, by reason",
+      "description": "reason=\"slow_consumer\" is the per-client bounded send queue overflowing (CLAUDE.md §5): the client is dropped and forced to resync rather than being allowed to backpressure the hub. Non-zero at idle is a defect.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 22 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 60,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "mode": "normal", "group": "A" }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum by (reason) (rate(sharpline_ws_clients_dropped_total[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum by (reason) (rate(sharpline_ws_resyncs_total[$__rate_interval]))",
+          "legendFormat": "resync: {{reason}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Pricing latency",
+      "description": "Time to devig a market and compute fair value / EV / Kelly. p99 > 250ms fires PricingLatencyHigh.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 22 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "decimals": 4,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.25 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(sharpline_pricing_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50",
+          "range": true,
+          "exemplar": true
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(sharpline_pricing_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p95",
+          "range": true
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sharpline:pricing_duration_seconds:p99",
+          "legendFormat": "p99",
+          "range": true,
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Bus lag — consumer group lag (records)",
+      "description": "sharpline_kafka_consumer_lag_records, reported by each franz-go consumer for its own assigned partitions. Sustained growth on odds.normalized or price.computed is the usual root cause of a staleness breach.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 30 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "mode": "normal", "group": "A" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 10000 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum by (group, topic) (sharpline_kafka_consumer_lag_records)",
+          "legendFormat": "{{group}} → {{topic}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Bus lag — consumer group lag (seconds) & rebalances",
+      "description": "Lag in wall-clock terms is the number that maps onto the staleness SLO. Rebalances are overlaid because a rebalance storm shows up as a lag sawtooth.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 30 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*rebalance.*" },
+            "properties": [
+              { "id": "unit", "value": "cps" },
+              { "id": "custom.axisPlacement", "value": "right" },
+              { "id": "custom.drawStyle", "value": "bars" },
+              { "id": "custom.fillOpacity", "value": 50 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "max by (group, topic) (sharpline_kafka_consumer_lag_seconds)",
+          "legendFormat": "{{group}} → {{topic}}",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum by (group) (rate(sharpline_kafka_consumer_group_rebalances_total[$__rate_interval]))",
+          "legendFormat": "{{group}} rebalance",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Ingest — poll outcomes",
+      "description": "result=\"unchanged\" is the change-detection hash suppressing a no-op poll (CLAUDE.md §5). A healthy pipeline is mostly unchanged; a system where everything is \"changed\" means the hash is broken and the bus is carrying junk.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 38 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "mode": "normal", "group": "A" }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum by (result) (rate(sharpline_ingest_polls_total{provider=~\"$provider\"}[$__rate_interval]))",
+          "legendFormat": "{{result}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Fanout throughput, by message kind",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 38 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "mode": "normal", "group": "A" }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum by (kind) (rate(sharpline_ws_messages_sent_total[$__rate_interval]))",
+          "legendFormat": "{{kind}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Scrape health (up)",
+      "description": "1 = Prometheus can reach the service's /metrics endpoint. `migrate` is intentionally absent: it is a run-to-completion Job with no frozen port.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 38 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1,
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "stepAfter"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "up{component=~\"backend|observability\"}",
+          "legendFormat": "{{service}}",
+          "range": true
+        }
+      ]
+    }
+  ]
+}

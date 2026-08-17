@@ -1,0 +1,319 @@
+# Sharpline — one-shot tooling. Layer ON TOP of compose.yaml, never alone.
+#
+#   docker compose --env-file .env \
+#     -f deploy/compose/compose.yaml -f deploy/compose/compose.tools.yaml \
+#     run --rm <service> [args...]
+#
+# Every service here is behind a profile, so none of them ever start with
+# `docker compose up`. They exist so the Makefile can wrap them: CLAUDE.md §12 —
+# "Every developer action has a make target, and every make target is a docker
+# invocation. If a task requires typing go, npm, psql, or goose directly, the Makefile
+# is incomplete." Nothing below assumes a host toolchain.
+#
+# Profiles:
+#   tools   lint, test, codegen, goose, psql, kafka-cli, terraform, npm
+#   e2e     Playwright
+#   load    Locust master/worker
+#
+# `docker compose run` starts each service's declared dependencies first, so
+# `run --rm psql` brings Postgres up healthy before dropping you at a prompt.
+#
+# deploy/docker/tools.Dockerfile sets no ENTRYPOINT on purpose, so each `command:`
+# below is a complete argv and the Makefile can replace it wholesale.
+#
+# THE DOCKER SOCKET PATH IS NOT /var/run/docker.sock EVERYWHERE. Docker Desktop only
+# creates that symlink when "Allow the default Docker socket to be used" is enabled;
+# with it off — which is the default on a fresh install — the socket lives at
+# ~/.docker/run/docker.sock and /var/run/docker.sock does not exist at all. Hardcoding
+# it makes `make test` and `make tf-*` fail with "bind source path does not exist" on
+# any such machine. The two services that need the socket therefore read
+# ${DOCKER_SOCKET}, which the Makefile resolves from `docker context inspect`; the
+# fallback below is the Linux/CI path.
+
+name: sharpline
+
+# Host-side path of the container runtime socket. The container side is always
+# /var/run/docker.sock, so DOCKER_HOST inside the container never changes.
+# Resolve on the host with:
+#   docker context inspect --format '{{.Endpoints.docker.Host}}'   # unix:///...
+x-docker-socket: &docker-socket ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+
+x-tools-image: &tools-image
+  build:
+    context: ../..
+    dockerfile: deploy/docker/tools.Dockerfile
+  image: sharpline/tools:local
+  working_dir: /workspace
+  profiles:
+    - tools
+  networks:
+    - sharpline
+
+# Caches are mounted at the exact paths tools.Dockerfile already creates and chmods
+# 0777 (/go/pkg/mod, /home/sharpline/.cache) — NOT at invented paths, and GOCACHE /
+# GOMODCACHE / GOLANGCI_LINT_CACHE are NOT overridden here because that image already
+# points them at these directories.
+#
+# This matters: a named volume whose mountpoint does not exist in the image is created
+# root-owned, and the image runs as uid 65532, which could then not write its own build
+# cache. Mounting over a pre-created 0777 directory inherits the writable ownership.
+x-tools-volumes: &tools-volumes
+  - ../..:/workspace
+  - go-mod-cache:/go/pkg/mod
+  - tools-cache:/home/sharpline/.cache
+
+services:
+
+  # ---- Go toolchain, in a container ---------------------------------------------------
+
+  lint:
+    <<: *tools-image
+    volumes: *tools-volumes
+    command: ["golangci-lint", "run", "./..."]
+
+  test:
+    # CLAUDE.md §10: "make test starts the Go test image with the Docker socket mounted
+    # so testcontainers-go can spawn siblings." The socket is the only host resource
+    # touched, and it is the container runtime — the one permitted host dependency.
+    <<: *tools-image
+    # Root ONLY because of that socket. Inside the container it is srw-rw---- root:root,
+    # so the image's baked-in uid 65532 cannot open it and every testcontainers call
+    # would fail with a permission error. The image's caches are 0777, so running as
+    # root here does not poison them for the non-root services.
+    user: "0:0"
+    environment:
+      DOCKER_HOST: unix:///var/run/docker.sock
+      # Sibling containers are spawned on the host daemon, so the test process reaches
+      # them through the host gateway rather than by compose service name.
+      TESTCONTAINERS_HOST_OVERRIDE: ${TESTCONTAINERS_HOST_OVERRIDE:-host.docker.internal}
+      TESTCONTAINERS_RYUK_DISABLED: ${TESTCONTAINERS_RYUK_DISABLED:-false}
+    volumes:
+      - ../..:/workspace
+      - go-mod-cache:/go/pkg/mod
+      - tools-cache:/home/sharpline/.cache
+      - *docker-socket
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["go", "test", "-race", "-count=1", "./..."]
+
+  codegen:
+    # sqlc + oapi-codegen. Override the command to run just one:
+    #   docker compose ... run --rm codegen oapi-codegen --help
+    <<: *tools-image
+    volumes: *tools-volumes
+    command: ["sqlc", "generate"]
+
+  # ---- database -----------------------------------------------------------------------
+
+  goose:
+    # Ad-hoc migration authoring and inspection. The migrate CONTAINER is still what
+    # applies migrations for real (compose service locally, k8s Job in the cluster) —
+    # CLAUDE.md is explicit that migrations are "never a binary someone runs by hand".
+    <<: *tools-image
+    environment:
+      GOOSE_DRIVER: postgres
+      GOOSE_DBSTRING: postgres://${POSTGRES_USER:-sharpline}:${POSTGRES_PASSWORD:-sharpline-dev-postgres}@postgres:5432/${POSTGRES_DB:-sharpline}?sslmode=disable
+      GOOSE_MIGRATION_DIR: /workspace/migrations
+    volumes: *tools-volumes
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["goose", "status"]
+
+  psql:
+    # CLAUDE.md §12: nothing publishes a host port, so this is how you get a SQL prompt.
+    <<: *tools-image
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-sharpline}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-sharpline-dev-postgres}
+      PGDATABASE: ${POSTGRES_DB:-sharpline}
+    volumes: *tools-volumes
+    depends_on:
+      postgres:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+    command: ["psql"]
+
+  # ---- broker -------------------------------------------------------------------------
+
+  kafka-cli:
+    # A shell with the real Apache Kafka CLI on PATH:
+    #   run --rm kafka-cli -c 'kafka-topics.sh --bootstrap-server $KAFKA_BOOTSTRAP --list'
+    # Topics themselves are declared in Terraform, never created from this prompt
+    # (CLAUDE.md §9).
+    #
+    # Non-login bash on purpose: tools.Dockerfile notes that Alpine's /etc/profile
+    # hard-resets PATH, so a login shell takes the profile.d fallback path while a
+    # non-login shell inherits the image's own ENV PATH directly.
+    <<: *tools-image
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      BOOTSTRAP_SERVERS: kafka:9092
+    volumes: *tools-volumes
+    depends_on:
+      kafka:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+    entrypoint: ["/bin/bash"]
+
+  # ---- infrastructure -----------------------------------------------------------------
+
+  terraform:
+    # Owns the kind cluster, Kafka topics + their retention/compaction settings, Grafana
+    # dashboards and alert rules, and namespaces (CLAUDE.md §9).
+    <<: *tools-image
+    # Root for the same reason as `test`: the kind provider creates cluster nodes as
+    # containers, which needs the root-owned docker socket.
+    user: "0:0"
+    working_dir: /workspace/deploy/terraform/envs/${TF_ENV:-local}
+    environment:
+      DOCKER_HOST: unix:///var/run/docker.sock
+      KUBECONFIG: /kube/config
+      TF_IN_AUTOMATION: "true"
+      KAFKA_BOOTSTRAP: kafka:9092
+    volumes:
+      - ../..:/workspace
+      - go-mod-cache:/go/pkg/mod
+      - tools-cache:/home/sharpline/.cache
+      - terraform-plugin-cache:/home/sharpline/.terraform.d/plugin-cache
+      - *docker-socket
+      - ${HOME:-/tmp}/.kube:/kube
+    command: ["terraform", "version"]
+
+  # ---- frontend dependencies ----------------------------------------------------------
+
+  npm:
+    # CLAUDE.md §7: "Dependency changes (npm install) happen through a make target that
+    # runs inside the container and writes the updated lockfile back through the mount.
+    # Never install into web/node_modules from the host."
+    #
+    # web/ is bind-mounted so package.json and package-lock.json round-trip to the host,
+    # while node_modules stays on the SAME named volume the dev server uses — so the
+    # install lands where the container will read it and no host-arch binary is ever
+    # written into the repo.
+    image: node:24-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
+    profiles:
+      - tools
+    working_dir: /app
+    environment:
+      NEXT_TELEMETRY_DISABLED: "1"
+      npm_config_cache: /npm-cache
+    volumes:
+      - ../../web:/app
+      - web-node-modules:/app/node_modules
+      - npm-cache:/npm-cache
+    networks:
+      - sharpline
+    command: ["npm", "install"]
+
+  # ---- end-to-end ---------------------------------------------------------------------
+
+  e2e:
+    # Playwright, one-shot, against the running stack through the proxy — the same
+    # entrypoint a real user hits. The image tag must stay in lockstep with
+    # @playwright/test in web/package.json or Playwright refuses to run.
+    build:
+      context: ../..
+      dockerfile: deploy/docker/playwright.Dockerfile
+    image: sharpline/playwright:local
+    profiles:
+      - e2e
+    working_dir: /workspace
+    environment:
+      PLAYWRIGHT_BASE_URL: ${PLAYWRIGHT_BASE_URL:-http://proxy}
+      CI: ${CI:-}
+    volumes:
+      - type: bind
+        source: ../../e2e
+        target: /workspace
+        bind:
+          create_host_path: false
+    depends_on:
+      proxy:
+        condition: service_healthy
+    # chromium crashes on the default 64MB /dev/shm
+    ipc: host
+    init: true
+    networks:
+      - sharpline
+
+  # ---- load ---------------------------------------------------------------------------
+  #
+  # Scale workers with:
+  #   docker compose ... --profile load up --scale locust-worker=8
+  # Headless on purpose — the Locust web UI would need a published port, and only the
+  # proxy gets one. CLAUDE.md §10 notes each Locust user is a Python greenlet, so
+  # reaching 10k connections is a matter of worker count.
+
+  locust-master:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/locust.Dockerfile
+    image: sharpline/locust:local
+    profiles:
+      - load
+    volumes:
+      - type: bind
+        source: ../../load
+        target: /mnt/locust
+        bind:
+          create_host_path: false
+    command:
+      - -f
+      - /mnt/locust/locustfile.py
+      - --master
+      - --headless
+      - --host
+      - ${LOCUST_TARGET:-http://proxy}
+      - --users
+      - ${LOCUST_USERS:-1000}
+      - --spawn-rate
+      - ${LOCUST_SPAWN_RATE:-50}
+      - --run-time
+      - ${LOCUST_RUN_TIME:-5m}
+      - --expect-workers
+      - ${LOCUST_EXPECT_WORKERS:-4}
+      # writes straight into the mounted load/ dir — no pre-existing subdirectory
+      # required, so a fresh clone can run a load test without a mkdir ritual
+      - --csv
+      - /mnt/locust/sharpline
+    depends_on:
+      proxy:
+        condition: service_healthy
+    networks:
+      - sharpline
+
+  locust-worker:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/locust.Dockerfile
+    image: sharpline/locust:local
+    profiles:
+      - load
+    volumes:
+      - type: bind
+        source: ../../load
+        target: /mnt/locust
+        bind:
+          create_host_path: false
+    command:
+      - -f
+      - /mnt/locust/locustfile.py
+      - --worker
+      - --master-host
+      - locust-master
+    depends_on:
+      locust-master:
+        condition: service_started
+    networks:
+      - sharpline
+
+volumes:
+  go-mod-cache:
+  tools-cache:
+  terraform-plugin-cache:
+  npm-cache:

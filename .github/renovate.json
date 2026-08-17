@@ -1,0 +1,184 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": [
+    "Sharpline dependency automation. CLAUDE.md section 12: 'Base images are pinned by digest, not by floating tag. Renovate or Dependabot proposes the bumps.'",
+    "Renovate PROPOSES; a human reviews and merges. Nothing here automerges, because a base-image digest bump is a reviewed change to the build substrate, not a rubber stamp.",
+    "Renovate itself runs as a hosted container against this repo, so it does not put a toolchain on any host and does not violate the prime directive."
+  ],
+  "extends": [
+    "config:recommended",
+    "docker:pinDigests",
+    "helpers:pinGitHubActionDigests",
+    ":semanticCommits",
+    ":dependencyDashboard",
+    ":rebaseStalePrs",
+    ":maintainLockFilesWeekly"
+  ],
+  "configMigration": true,
+  "timezone": "America/New_York",
+  "schedule": ["before 6am on monday"],
+  "labels": ["dependencies"],
+  "semanticCommitType": "chore",
+  "semanticCommitScope": "deps",
+  "commitMessageLowerCase": "auto",
+  "prConcurrentLimit": 8,
+  "prHourlyLimit": 3,
+  "rebaseWhen": "conflicted",
+  "separateMinorPatch": false,
+  "minimumReleaseAge": "3 days",
+  "postUpdateOptions": ["gomodTidy", "gomodUpdateImportPaths", "npmDedupe"],
+  "enabledManagers": [
+    "dockerfile",
+    "docker-compose",
+    "gomod",
+    "npm",
+    "github-actions",
+    "helmv3",
+    "helm-values",
+    "terraform",
+    "pip_requirements"
+  ],
+  "github-actions": {
+    "pinDigests": true
+  },
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 6am on the first day of the month"],
+    "commitMessageAction": "refresh lock files"
+  },
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "schedule": ["at any time"],
+    "minimumReleaseAge": null,
+    "labels": ["dependencies", "security"]
+  },
+  "osvVulnerabilityAlerts": true,
+  "packageRules": [
+    {
+      "description": "CLAUDE.md section 12: 'Base images are pinned by digest, not by floating tag.' This is the pinDigests policy itself - every container reference in a Dockerfile, a compose file or a Helm values file must carry an @sha256: digest, and Renovate opens the PR that adds one if a bare tag ever lands.",
+      "matchCategories": ["docker"],
+      "pinDigests": true
+    },
+    {
+      "description": "Container base images, version bumps. CLAUDE.md section 9 builds every service from a pinned base; moving them together keeps the compose stack and the Helm chart from drifting apart.",
+      "matchManagers": ["dockerfile", "docker-compose", "helm-values", "helmv3"],
+      "matchUpdateTypes": ["major", "minor", "patch"],
+      "groupName": "container base images",
+      "groupSlug": "base-images",
+      "addLabels": ["containers"]
+    },
+    {
+      "description": "Digest-only movement. Nine of the fifteen pinned images resolve from a floating tag (:latest, :nonroot, :latest-pg17), so a digest bump is the ONLY update Renovate can offer for them. Re-resolving that tag returns a different digest; per the ledger that is a deliberate, reviewed bump and never a silent edit.",
+      "matchManagers": ["dockerfile", "docker-compose", "helm-values", "helmv3"],
+      "matchUpdateTypes": ["digest", "pinDigest"],
+      "groupName": "container image digests",
+      "groupSlug": "image-digests",
+      "addLabels": ["containers"]
+    },
+    {
+      "description": "The `go` directive in go.mod must not drift ahead of the golang builder image, which the prime directive makes authoritative. Bump them in one PR or not at all.",
+      "matchManagers": ["gomod"],
+      "matchDepTypes": ["golang", "toolchain"],
+      "groupName": "container base images",
+      "groupSlug": "base-images"
+    },
+    {
+      "description": "The Playwright container tag must stay in lockstep with @playwright/test in web/package.json - a mismatch makes Playwright refuse to run (see 'Deviations from the requested tags' in the contract ledger). This rule sits after the generic image rules so it wins.",
+      "matchPackageNames": [
+        "mcr.microsoft.com/playwright",
+        "@playwright/test",
+        "playwright",
+        "playwright-core"
+      ],
+      "groupName": "playwright",
+      "groupSlug": "playwright",
+      "addLabels": ["e2e"]
+    },
+    {
+      "description": "CLAUDE.md sections 7 and 9 mandate the node:24-alpine container. Host Node is editor tooling only and must never pull the image forward.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["node"],
+      "allowedVersions": "<25"
+    },
+    {
+      "description": "CLAUDE.md sections 3 and 9 mandate Redis 7.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["redis"],
+      "allowedVersions": "<8"
+    },
+    {
+      "description": "CLAUDE.md section 9 mandates caddy:2-alpine as the single entrypoint.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["caddy"],
+      "allowedVersions": "<3"
+    },
+    {
+      "description": "Go modules, non-breaking. One PR per week keeps `go test -race` signal attributable.",
+      "matchManagers": ["gomod"],
+      "matchDepTypes": ["require", "indirect"],
+      "matchUpdateTypes": ["minor", "patch", "digest"],
+      "groupName": "go modules",
+      "groupSlug": "gomod",
+      "addLabels": ["go"]
+    },
+    {
+      "description": "Go module majors land one at a time, behind dashboard approval. franz-go and pgx majors are the ones that will actually hurt.",
+      "matchManagers": ["gomod"],
+      "matchDepTypes": ["require", "indirect"],
+      "matchUpdateTypes": ["major"],
+      "groupName": null,
+      "dependencyDashboardApproval": true,
+      "addLabels": ["go", "breaking"]
+    },
+    {
+      "description": "franz-go is load-bearing: CLAUDE.md section 3 forbids confluent-kafka-go because cgo breaks CGO_ENABLED=0 and therefore the distroless image. Any franz-go change gets its own PR.",
+      "matchManagers": ["gomod"],
+      "matchPackageNames": ["github.com/twmb/franz-go{/,}**"],
+      "groupName": null,
+      "addLabels": ["go", "kafka"]
+    },
+    {
+      "description": "Frontend dependencies, non-breaking.",
+      "matchManagers": ["npm"],
+      "matchUpdateTypes": ["minor", "patch", "digest"],
+      "groupName": "web dependencies",
+      "groupSlug": "web",
+      "addLabels": ["frontend"]
+    },
+    {
+      "description": "Frontend majors are dashboard-gated; a React or Tailwind major is a design-system event, not a dependency bump.",
+      "matchManagers": ["npm"],
+      "matchUpdateTypes": ["major"],
+      "groupName": null,
+      "dependencyDashboardApproval": true,
+      "addLabels": ["frontend", "breaking"]
+    },
+    {
+      "description": "CLAUDE.md section 7: 'Next.js 15 (App Router). Not negotiable.' Hold the major until that line is amended.",
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["next", "eslint-config-next"],
+      "allowedVersions": "<16"
+    },
+    {
+      "description": "GitHub Actions, pinned to commit SHAs. ci.yml and deploy.yml reference major tags today precisely so this rule can convert them.",
+      "matchManagers": ["github-actions"],
+      "groupName": "github actions",
+      "groupSlug": "actions",
+      "addLabels": ["ci"]
+    },
+    {
+      "description": "Terraform providers and modules. CLAUDE.md section 9: Terraform owns the kind cluster, Kafka topics, Grafana dashboards and namespaces.",
+      "matchManagers": ["terraform"],
+      "groupName": "terraform providers and modules",
+      "groupSlug": "terraform",
+      "addLabels": ["infra"]
+    },
+    {
+      "description": "Python appears in exactly two places (CLAUDE.md section 2): Locust load tests and the analysis/ notebooks. Never in the serving path, so these can move together.",
+      "matchManagers": ["pip_requirements"],
+      "groupName": "python tooling",
+      "groupSlug": "python",
+      "addLabels": ["load-testing"]
+    }
+  ]
+}

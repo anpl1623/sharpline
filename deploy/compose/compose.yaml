@@ -1,0 +1,597 @@
+# Sharpline — full local stack.
+#
+#   docker compose --env-file .env -f deploy/compose/compose.yaml up
+#
+# (Always pass --env-file — this is now load-bearing, not a nicety. The Compose project
+#  directory is deploy/compose/, so the repo-root .env is NOT picked up automatically,
+#  and since this file no longer uses `env_file` every secret reaches its service by
+#  interpolation or pass-through from the environment Compose was invoked with. Without
+#  --env-file, SHARPLINE_JWT_SIGNING_KEY and ODDS_API_KEY are simply absent and `api`
+#  exits non-zero on startup validation. Every non-secret interpolation carries a
+#  dev-safe default, so `docker compose config` still parses with no .env at all.)
+#
+# CLAUDE.md invariants encoded here:
+#   - prime directive: every process is a container; nothing runs on the host
+#   - §9  "The proxy is the only published port"  -> only `proxy` has `ports:`
+#   - §9  real healthcheck on every stateful container (postgres/redis/kafka)
+#   - §9  migrate runs to completion before api starts
+#   - §9  named volumes for all persistent state -> `docker compose down -v` resets
+#   - §9  single user-defined bridge network with service-name DNS
+#   - §12 base images pinned by digest, never by floating tag
+#
+# Overlays:
+#   compose.dev.yaml    hot reload (web dev server, Go rebuild/restart loop)
+#   compose.obs.yaml    otel-collector / prometheus / grafana / jaeger  (profile: obs)
+#   compose.tools.yaml  one-shot tooling                               (profile: tools|e2e|load)
+
+name: sharpline
+
+# --------------------------------------------------------------------------------------
+# shared fragments
+# --------------------------------------------------------------------------------------
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# SECRETS ARE NOT LOADED WITH `env_file`, DELIBERATELY.
+#
+# There used to be a shared `env_file: ../../.env` on all six Go services. env_file has
+# no key filter — it injects the WHOLE file — so every secret reached every service:
+# ODDS_API_KEY landed in `settle`, SHARPLINE_JWT_SIGNING_KEY landed in `ingest`, and so
+# on. Nothing needed those and a compromised container got them anyway.
+#
+# Instead each service names the variables it actually needs, in the map form
+#     SHARPLINE_JWT_SIGNING_KEY:
+# with no value. That is Compose's pass-through form: the value is taken from the
+# environment Compose was invoked with — which is where `--env-file ../../.env` puts it —
+# and the literal secret never appears in this file. A variable that is not set anywhere
+# resolves to null and is simply absent from the container, so the Go config validator
+# reports "required environment variable is not set" instead of silently seeing "".
+#
+# This shape is also what the phase-10 Kubernetes work inherits: one Secret key per
+# service that needs it, mounted only into that Deployment.
+
+# Hardening applied to every Go service (CLAUDE.md §9 "Build rules").
+#
+# HEALTHCHECK ON A DISTROLESS IMAGE. gcr.io/distroless/static:nonroot ships no
+# shell, no curl and no wget, so the usual `CMD-SHELL wget ...` probe has nothing
+# to execute. The one executable that IS in the image is the service binary, so
+# the binary probes itself: `sharpline healthcheck` resolves its own
+# SHARPLINE_HTTP_ADDR, GETs /readyz over 127.0.0.1 and exits 0 or 1
+# (internal/platform/httpx/probe.go). CMD form, not CMD-SHELL — there is no
+# shell to interpret a string.
+#
+# /readyz rather than /healthz on purpose: this is what
+# `depends_on: condition: service_healthy` consumes, so it must mean "ready to
+# serve", and once dependency Checkers are registered in phase 3+ it is the only
+# one of the two probes that can ever go false.
+x-go-service: &go-service
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "/usr/local/bin/sharpline", "healthcheck"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 10s
+  read_only: true
+  user: "65532:65532"
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=64m
+  networks:
+    - sharpline
+  logging: *logging
+
+x-go-build: &go-build
+  context: ../..
+  dockerfile: deploy/docker/go.Dockerfile
+
+# Environment is assembled per service from the fragments below rather than from one
+# blanket anchor, so a service holds credentials only for the dependencies its
+# config.Spec in internal/platform/config actually declares. Frozen env var names — do
+# not rename; they are contract with the Go config package and the Helm chart.
+
+# Every binary, including migrate. Carries no credential.
+x-env-base: &env-base
+  # Valid values are exactly dev|test|staging|prod — internal/platform/config rejects
+  # anything else and exits non-zero. "local" is NOT one of them.
+  SHARPLINE_ENV: ${SHARPLINE_ENV:-dev}
+  SHARPLINE_LOG_LEVEL: ${SHARPLINE_LOG_LEVEL:-info}
+  # Empty => telemetry export disabled. compose.obs.yaml points this at the collector.
+  SHARPLINE_OTEL_ENDPOINT: ${SHARPLINE_OTEL_ENDPOINT:-}
+
+# api, settle, migrate  (config.RequirePostgres)
+x-env-postgres: &env-postgres
+  SHARPLINE_POSTGRES_DSN: postgres://${POSTGRES_USER:-sharpline}:${POSTGRES_PASSWORD:-sharpline-dev-postgres}@postgres:5432/${POSTGRES_DB:-sharpline}?sslmode=disable
+
+# api, stream, pricer, ingest  (config.RequireRedis)
+x-env-redis: &env-redis
+  SHARPLINE_REDIS_ADDR: redis:6379
+  SHARPLINE_REDIS_PASSWORD: ${SHARPLINE_REDIS_PASSWORD:-sharpline-dev-redis}
+
+# api, stream, pricer, ingest, settle  (config.RequireKafka)
+x-env-kafka: &env-kafka
+  SHARPLINE_KAFKA_BROKERS: kafka:9092
+
+x-go-deps: &go-deps
+  postgres:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+  kafka:
+    condition: service_healthy
+  migrate:
+    condition: service_completed_successfully
+
+# --------------------------------------------------------------------------------------
+services:
+# --------------------------------------------------------------------------------------
+
+  # ---- data plane ---------------------------------------------------------------------
+
+  postgres:
+    image: timescale/timescaledb:latest-pg17@sha256:981e3016a2810fec47515e3828ad70ae97b84f4c9ef63d032180b54f61566fd6
+    restart: unless-stopped
+    # CLAUDE.md §9: "Named volume, tuned via mounted conf".
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sharpline}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sharpline-dev-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-sharpline}
+      PGDATA: /var/lib/postgresql/data
+      # The image's 001_timescaledb_tune.sh init hook runs timescaledb-tune against
+      # ${PGDATA}/postgresql.conf. That file is NOT the one this server reads —
+      # config_file above points at the mounted deploy/postgres/postgresql.conf — so
+      # the tuner would write settings nothing loads and leave two conflicting configs
+      # on disk. Skipping it makes the mounted file unambiguously authoritative.
+      # (Do NOT instead set POSTGRESQL_CONF_DIR=/etc/postgresql: the image's
+      # 000_install_timescaledb.sh appends to ${POSTGRESQL_CONF_DIR}/postgresql.conf,
+      # and that mount is read-only, so init would fail.)
+      NO_TS_TUNE: "true"
+      # Unschedules the TimescaleDB telemetry job at init. The running server is also
+      # told `timescaledb.telemetry_level = off` in the mounted conf — both are needed
+      # because that init hook writes its setting into the conf we do not read.
+      TIMESCALEDB_TELEMETRY: "off"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # create_host_path: false is deliberate. With the short `src:dst` form, a missing
+      # source makes Docker silently create a DIRECTORY at that path — postgres would
+      # then fail with an inscrutable error and the repo would gain a junk directory.
+      # This makes the missing file a loud, obvious startup error instead.
+      - type: bind
+        source: ../postgres/postgresql.conf
+        target: /etc/postgresql/postgresql.conf
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      # -h 127.0.0.1 is load-bearing, not decoration. During init the image entrypoint
+      # starts a temporary server with `-c listen_addresses=''` (docker-entrypoint.sh,
+      # docker_temp_server_start) so it is reachable over the unix socket only. A socket
+      # probe therefore reports "ready" while the DB is still being initialised; a TCP
+      # probe cannot.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    stop_grace_period: 30s
+    networks:
+      - sharpline
+    logging: *logging
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+
+  redis:
+    image: redis:7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
+    restart: unless-stopped
+    # argv[0] must stay `redis-server` so the image entrypoint chowns /data and drops
+    # privileges to the `redis` user before exec.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --dir
+      - /data
+      - --requirepass
+      - ${SHARPLINE_REDIS_PASSWORD:-sharpline-dev-redis}
+    environment:
+      # consumed by the healthcheck below, not by redis itself
+      SHARPLINE_REDIS_PASSWORD: ${SHARPLINE_REDIS_PASSWORD:-sharpline-dev-redis}
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$${SHARPLINE_REDIS_PASSWORD}\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    stop_grace_period: 20s
+    networks:
+      - sharpline
+    logging: *logging
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+
+  kafka:
+    # Kafka 4.x is KRaft-only — no ZooKeeper container exists or is needed (CLAUDE.md §3).
+    image: apache/kafka:latest@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_NUM_PARTITIONS: "3"
+      # CLAUDE.md §9: "Topics created by Terraform, not by hand."
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # /var/lib/kafka/data exists in the image owned by appuser(1000), so a fresh
+      # named volume inherits writable ownership. Verified by inspecting the image.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-5L6g3nShT-eMCtK--X86sw}
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      # A real broker API probe, not a TCP knock: this performs an ApiVersions
+      # request through the advertised listener, so it also proves the advertised
+      # address is resolvable and correct.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9092 >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 20s
+      retries: 12
+      start_period: 45s
+    stop_grace_period: 30s
+    networks:
+      - sharpline
+    logging: *logging
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+
+  kafka-ui:
+    # CLAUDE.md §9: "Dev profile only." Start with: docker compose --profile dev up
+    image: provectuslabs/kafka-ui:latest@sha256:8f2ff02d64b0a7a2b71b6b3b3148b85f66d00ec20ad40c30bdcd415d46d31818
+    profiles:
+      - dev
+    restart: unless-stopped
+    environment:
+      KAFKA_CLUSTERS_0_NAME: sharpline-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
+      SERVER_SERVLET_CONTEXT_PATH: /_kafka-ui
+      AUTH_TYPE: DISABLED
+    depends_on:
+      kafka:
+        condition: service_healthy
+    # No `ports:` — reachable through the proxy at /_kafka-ui (CLAUDE.md §12).
+    networks:
+      - sharpline
+    logging: *logging
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768m
+
+  # ---- schema -------------------------------------------------------------------------
+
+  migrate:
+    # Runs to completion before any service that touches the schema starts.
+    build:
+      <<: *go-build
+      args:
+        SERVICE: migrate
+    image: sharpline/migrate:local
+    restart: "no"
+    read_only: true
+    user: "65532:65532"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    environment:
+      # config.Migrate requires Postgres and nothing else — no listener, no Redis, no
+      # Kafka, no JWT key.
+      <<: [*env-base, *env-postgres]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - sharpline
+    logging: *logging
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256m
+
+  # ---- Go services --------------------------------------------------------------------
+
+  api:
+    <<: *go-service
+    build:
+      <<: *go-build
+      args:
+        SERVICE: api
+    image: sharpline/api:local
+    environment:
+      # config.API = HTTP | Postgres | Redis | Kafka | JWT — the only service that
+      # mints or verifies access tokens today, so the only one given the signing key.
+      # When `stream` grows WebSocket auth it gets the key added here explicitly; it
+      # does not inherit it.
+      <<: [*env-base, *env-postgres, *env-redis, *env-kafka]
+      SHARPLINE_HTTP_ADDR: ":8080"
+      SHARPLINE_JWT_SIGNING_KEY:
+    depends_on: *go-deps
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+
+  ingest:
+    <<: *go-service
+    build:
+      <<: *go-build
+      args:
+        SERVICE: ingest
+    image: sharpline/ingest:local
+    environment:
+      # config.Ingest = HTTP | Redis | Kafka. No Postgres: ingest publishes to the bus,
+      # the Timescale writer consumes from it.
+      <<: [*env-base, *env-redis, *env-kafka]
+      SHARPLINE_HTTP_ADDR: ":8083"
+      # The provider key, and the only service that gets it. Pass-through from the
+      # environment (`--env-file ../../.env`); absent => ingest selects the synthetic
+      # stochastic market-maker, which is a live generator, not fixture data.
+      ODDS_API_KEY:
+      SHARPLINE_SYNTHETIC_SEED: ${SHARPLINE_SYNTHETIC_SEED:-0}
+    depends_on: *go-deps
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+
+  pricer:
+    <<: *go-service
+    build:
+      <<: *go-build
+      args:
+        SERVICE: pricer
+    image: sharpline/pricer:local
+    environment:
+      # config.Pricer = HTTP | Redis | Kafka. Pure math over the bus; it never opens a
+      # database connection, so it is not given a DSN.
+      <<: [*env-base, *env-redis, *env-kafka]
+      SHARPLINE_HTTP_ADDR: ":8082"
+    depends_on: *go-deps
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1g
+
+  stream:
+    <<: *go-service
+    build:
+      <<: *go-build
+      args:
+        SERVICE: stream
+    image: sharpline/stream:local
+    environment:
+      # config.Stream = HTTP | Redis | Kafka. Subscription state lives in Redis so the
+      # deployment scales without session affinity (CLAUDE.md §9).
+      <<: [*env-base, *env-redis, *env-kafka]
+      SHARPLINE_HTTP_ADDR: ":8081"
+    depends_on: *go-deps
+    # give in-flight WebSocket clients time to be told to resync elsewhere
+    stop_grace_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1g
+
+  settle:
+    <<: *go-service
+    build:
+      <<: *go-build
+      args:
+        SERVICE: settle
+    image: sharpline/settle:local
+    environment:
+      # config.Settle = HTTP | Postgres | Kafka. No Redis credential: settle grades
+      # wagers and writes ledger rows, it does not touch the cache. No ODDS_API_KEY —
+      # it never talks to the provider.
+      <<: [*env-base, *env-postgres, *env-kafka]
+      SHARPLINE_HTTP_ADDR: ":8084"
+    depends_on: *go-deps
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+
+  # ---- frontend -----------------------------------------------------------------------
+
+  web:
+    # Production build: deps -> build -> runtime, Next `output: "standalone"` on
+    # node:24-alpine as the non-root `node` user (CLAUDE.md §7).
+    build:
+      # Context is web/, NOT the repo root. web/Dockerfile's first instruction is
+      # `COPY package.json package-lock.json ./`, which resolves against the context
+      # root — with `context: ../..` that is the repo root, where no package.json
+      # exists, and the build dies with:
+      #   failed to compute cache key: "/package.json": not found
+      # This also matches `make build-web`, which already passes $(ROOT_DIR)/web.
+      context: ../../web
+      dockerfile: Dockerfile
+      args:
+        # NEXT_PUBLIC_* are inlined into the client bundle at build time, so they are
+        # build args as well as runtime env. They are proxy paths, never container
+        # hostnames — the browser cannot resolve `api`.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-/api}
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-/ws}
+    image: sharpline/web:local
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0
+      NEXT_TELEMETRY_DISABLED: "1"
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-/api}
+      NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-/ws}
+      # server-side fetches stay inside the network and skip the proxy
+      SHARPLINE_INTERNAL_API_URL: http://api:8080
+    depends_on:
+      api:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 45s
+    # CLAUDE.md §9 hardening, same as the Go services. `read_only: true` is possible
+    # here only because the two paths the Next standalone server actually writes to are
+    # carved out as tmpfs below — dropping read_only instead would leave the whole
+    # 187MB image layer writable to get two directories.
+    read_only: true
+    tmpfs:
+      # Next's runtime cache: the fetch/data cache and the on-demand image optimizer
+      # both write here. It is a cache by definition, so a tmpfs that dies with the
+      # container is semantically correct, not a workaround.
+      - /app/.next/cache:rw,nosuid,nodev,size=256m
+      # noexec on /tmp: nothing legitimate execs out of it, and it closes the usual
+      # drop-a-binary-and-run-it path.
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - sharpline
+    logging: *logging
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+
+  # ---- edge ---------------------------------------------------------------------------
+
+  proxy:
+    # THE ONLY CONTAINER WITH PUBLISHED HOST PORTS (CLAUDE.md §9, §12).
+    #   /        -> web:3000
+    #   /api/*   -> api:8080
+    #   /ws      -> stream:8081  (WebSocket upgrade, no session affinity)
+    #   /metrics -> not exposed publicly
+    image: caddy:2-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - type: bind
+        source: ../proxy/Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        bind:
+          create_host_path: false
+      - caddy-data:/data
+      - caddy-config:/config
+    environment:
+      # Name fixed by deploy/proxy/Caddyfile, which reads {$SHARPLINE_PROXY_HOST}.
+      SHARPLINE_PROXY_HOST: ${SHARPLINE_PROXY_HOST:-sharpline.localhost}
+      # Only consumed once the Caddyfile is switched from `tls internal` to managed
+      # certificates for a real deployment.
+      SHARPLINE_ACME_EMAIL: ${SHARPLINE_ACME_EMAIL:-}
+    depends_on:
+      # web HAS a real healthcheck (it runs on node:24-alpine, which ships wget), so
+      # this leg is a genuine readiness gate rather than "the container exists".
+      web:
+        condition: service_healthy
+      # api and stream are gcr.io/distroless/static, which ships no shell and no
+      # HTTP client — but the service binary probes ITSELF (`sharpline healthcheck`,
+      # see the x-go-service anchor above), so these are genuine readiness gates
+      # rather than "the container process was spawned". The proxy therefore never
+      # starts in front of an upstream that is not yet accepting connections, which
+      # closes the window of 502s the previous `service_started` form allowed.
+      api:
+        condition: service_healthy
+      stream:
+        condition: service_healthy
+    healthcheck:
+      # Contract defined by deploy/proxy/Caddyfile: an internal-only :2021 listener
+      # whose sole path is /healthz, added specifically so this probe does not have to
+      # negotiate the internal CA's certificate or lean on the admin API. Timings are
+      # the ones that file specifies.
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:2021/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    cap_drop:
+      - ALL
+    cap_add:
+      # bind :80/:443
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - sharpline
+    logging: *logging
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256m
+
+# --------------------------------------------------------------------------------------
+
+networks:
+  sharpline:
+    name: sharpline
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  kafka-data:
+  caddy-data:
+  caddy-config:
+  # Declared here so both compose.dev.yaml (hot reload) and compose.tools.yaml
+  # (`npm install` inside a container) can attach the same node_modules.
+  web-node-modules:
+  web-next-cache:

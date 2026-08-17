@@ -1,0 +1,28 @@
+# Never ship host-arch binaries or build output into the image.
+# CLAUDE.md §7: node_modules and .next live on named volumes / are produced
+# inside the build stage. Anything the host produced is a contaminant.
+node_modules
+.next
+out
+.turbo
+
+# Secrets never enter an image layer (CLAUDE.md §9: .env is git-ignored).
+.env
+.env.*
+!.env.example
+
+# Build metadata that would bust the layer cache for no benefit.
+.git
+.gitignore
+Dockerfile
+Dockerfile.dev
+.dockerignore
+README.md
+*.md
+npm-debug.log*
+yarn-error.log*
+.npm
+.DS_Store
+coverage
+playwright-report
+test-results

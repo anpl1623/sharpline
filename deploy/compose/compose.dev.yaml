@@ -1,0 +1,195 @@
+# Sharpline — hot-reload overrides. Layer ON TOP of compose.yaml, never alone.
+#
+#   docker compose --env-file .env --profile dev \
+#     -f deploy/compose/compose.yaml -f deploy/compose/compose.dev.yaml watch
+#
+# `watch` (not `up`) is the entrypoint for this overlay: it is what drives the Go
+# rebuild/restart loop declared under `develop:` below. `up` still works, you just
+# lose the Go loop; the web dev server hot-reloads either way because its source is
+# bind-mounted.
+#
+# `--profile dev` additionally starts kafka-ui, which compose.yaml declares under the
+# `dev` profile (CLAUDE.md §9: "Dev profile only").
+#
+# Still true in dev, and not negotiable: NOTHING publishes a host port except proxy.
+# Reach the web dev server at http://localhost/ and kafka-ui at
+# http://localhost/_kafka-ui — both through Caddy.
+
+name: sharpline
+
+services:
+
+  # ---- frontend: Next dev server in a container, hot reload intact ---------------------
+
+  web:
+    # CLAUDE.md §7: "Containerized in both dev and prod — no `npm run dev` on the host."
+    build:
+      # Context is web/, not the repo root. web/Dockerfile.dev's COPY instructions are
+      # written against a web/ context (`package.json`, `src`, `tsconfig.json` — not
+      # `web/package.json`), and web/.dockerignore only applies to a context rooted at
+      # web/, so a repo-root context would both fail the COPYs and drag the host's
+      # web/node_modules into the build. Restated here rather than inherited so this
+      # file reads correctly on its own.
+      context: ../../web
+      dockerfile: Dockerfile.dev
+    image: sharpline/web:dev
+    command: ["npm", "run", "dev", "--", "--hostname", "0.0.0.0", "--port", "3000"]
+    environment:
+      NODE_ENV: development
+      # CLAUDE.md §7: bind-mount filesystem events are unreliable across the Docker VM
+      # boundary on macOS, so watchers must poll.
+      WATCHPACK_POLLING: "true"
+      CHOKIDAR_USEPOLLING: "true"
+      NEXT_TELEMETRY_DISABLED: "1"
+    volumes:
+      # Source is bind-mounted so edits on the host reach the container instantly...
+      # create_host_path: false so a missing web/src is a loud error rather than an
+      # empty auto-created directory that shadows the image's own source.
+      - type: bind
+        source: ../../web/src
+        target: /app/src
+        bind:
+          create_host_path: false
+      # ...but node_modules and .next live on NAMED VOLUMES, so host-architecture
+      # binaries (sharp, SWC, esbuild) never collide with the container's. Never
+      # bind-mount web/node_modules.
+      - web-node-modules:/app/node_modules
+      - web-next-cache:/app/.next
+    # The PRODUCTION web container in compose.yaml runs read_only: true. The DEV one
+    # cannot, and this is a real constraint rather than laziness: `next dev` writes into
+    # its own working tree on every start — it regenerates /app/next-env.d.ts and
+    # normalises /app/tsconfig.json. Both sit directly in /app alongside the mounted
+    # src/, node_modules/ and .next/, so there is no subdirectory to carve out as tmpfs;
+    # a tmpfs over /app itself would shadow all three mounts. Observed, not assumed:
+    #   [Error: EROFS: read-only file system, open '/app/next-env.d.ts']
+    # and the container exits before serving a request.
+    #
+    # The hardening that does survive is inherited from the base service and left alone:
+    # cap_drop ALL, no-new-privileges, non-root `node` user, and the tmpfs carve-outs.
+    read_only: false
+    healthcheck:
+      # the dev server compiles the first route on demand — be patient
+      start_period: 180s
+      interval: 20s
+      timeout: 10s
+      retries: 10
+
+  # ---- Go services: rebuild + restart on source change --------------------------------
+  #
+  # `action: rebuild` re-runs the ordinary container build (deploy/docker/go.Dockerfile)
+  # and recreates the container. No host toolchain, no `air` binary, no bind-mounted
+  # source into a builder image — the prime directive holds all the way down. It stays
+  # fast because go.Dockerfile uses BuildKit cache mounts for the module and build caches.
+
+  migrate:
+    environment:
+      SHARPLINE_ENV: dev
+      SHARPLINE_LOG_LEVEL: ${SHARPLINE_LOG_LEVEL:-debug}
+    develop:
+      watch:
+        - action: rebuild
+          path: ../../migrations
+        - action: rebuild
+          path: ../../cmd/migrate
+
+  api:
+    environment:
+      SHARPLINE_ENV: dev
+      SHARPLINE_LOG_LEVEL: ${SHARPLINE_LOG_LEVEL:-debug}
+    develop:
+      watch:
+        - action: rebuild
+          path: ../../cmd/api
+        - action: rebuild
+          path: ../../internal
+        - action: rebuild
+          path: ../../pkg
+        - action: rebuild
+          path: ../../go.mod
+        - action: rebuild
+          path: ../../go.sum
+
+  ingest:
+    environment:
+      SHARPLINE_ENV: dev
+      SHARPLINE_LOG_LEVEL: ${SHARPLINE_LOG_LEVEL:-debug}
+    develop:
+      watch:
+        - action: rebuild
+          path: ../../cmd/ingest
+        - action: rebuild
+          path: ../../internal
+        - action: rebuild
+          path: ../../go.mod
+        - action: rebuild
+          path: ../../go.sum
+
+  pricer:
+    environment:
+      SHARPLINE_ENV: dev
+      SHARPLINE_LOG_LEVEL: ${SHARPLINE_LOG_LEVEL:-debug}
+    develop:
+      watch:
+        - action: rebuild
+          path: ../../cmd/pricer
+        - action: rebuild
+          path: ../../internal
+        - action: rebuild
+          path: ../../go.mod
+        - action: rebuild
+          path: ../../go.sum
+
+  stream:
+    environment:
+      SHARPLINE_ENV: dev
+      SHARPLINE_LOG_LEVEL: ${SHARPLINE_LOG_LEVEL:-debug}
+    develop:
+      watch:
+        - action: rebuild
+          path: ../../cmd/stream
+        - action: rebuild
+          path: ../../internal
+        - action: rebuild
+          path: ../../go.mod
+        - action: rebuild
+          path: ../../go.sum
+
+  settle:
+    environment:
+      SHARPLINE_ENV: dev
+      SHARPLINE_LOG_LEVEL: ${SHARPLINE_LOG_LEVEL:-debug}
+    develop:
+      watch:
+        - action: rebuild
+          path: ../../cmd/settle
+        - action: rebuild
+          path: ../../internal
+        - action: rebuild
+          path: ../../go.mod
+        - action: rebuild
+          path: ../../go.sum
+
+  # ---- edge ---------------------------------------------------------------------------
+
+  proxy:
+    depends_on:
+      # Relaxed back to service_started for dev only. compose.yaml gates the proxy on
+      # `web` being HEALTHY, which is right for the production image (it boots in under
+      # a second). The dev server compiles the first route on demand and its healthcheck
+      # start_period above is 180s, so the same gate would leave the proxy — and with it
+      # kafka-ui at /_kafka-ui and the whole API surface — unreachable for minutes after
+      # `make dev`, for no benefit: Caddy handles a cold upstream by returning 502 and
+      # retrying.
+      web:
+        condition: service_started
+      api:
+        condition: service_started
+      stream:
+        condition: service_started
+    # Caddy reloads its own config on change; watching the Caddyfile keeps the dev loop
+    # honest without a container restart.
+    develop:
+      watch:
+        - action: sync+restart
+          path: ../proxy/Caddyfile
+          target: /etc/caddy/Caddyfile

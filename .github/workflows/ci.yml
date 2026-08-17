@@ -1,0 +1,490 @@
+# ==============================================================================
+# Sharpline CI  --  CLAUDE.md section 9, "CI/CD (GitHub Actions)"
+# ==============================================================================
+#
+# PRIME DIRECTIVE ENFORCEMENT (CLAUDE.md, top of file; section 9 restates it):
+#
+#   "CI uses no `setup-go` or `setup-node` actions. Every job runs `make <target>`,
+#    which runs a container. The runner is treated as a bare machine with Docker and
+#    nothing else - this is what mechanically enforces the prime directive, because
+#    any step that quietly depends on a host toolchain fails in CI even though it
+#    passed on the author's Mac. Registry-backed BuildKit cache keeps that
+#    affordable."
+#
+#   Consequences encoded in this file, which must not be "optimised away" later:
+#
+#     * actions/setup-go, actions/setup-node, actions/setup-python,
+#       actions/setup-java and hashicorp/setup-terraform are FORBIDDEN here.
+#       There is no exception for "just this one fast job".
+#     * The only actions used are actions/checkout and the docker/* family
+#       (setup-buildx-action, setup-qemu-action, login-action). None of those
+#       installs a language toolchain onto the runner; they configure the container
+#       runtime that is the runner's single permitted dependency.
+#     * Every job body is `make <target>`. Every make target is a `docker run` or
+#       `docker compose run`. The only non-make `run:` steps in this file are pure
+#       POSIX shell (tr / printf / test) computing image coordinates -- no compiler,
+#       no package manager, no interpreter beyond the shell itself.
+#     * The `directive` job runs `make verify-no-host-toolchain`, which is the
+#       machine check for all of the above. It gates every other job.
+#
+# BRANCH PROTECTION  --  CLAUDE.md section 9: "Branch protection on `main`."
+#
+#   Branch protection is a REPOSITORY SETTING, not a file, so it cannot be committed
+#   to this repo and this comment is the only place it can be recorded. It must be
+#   configured once, by hand, on GitHub (Settings > Branches > Add rule, target
+#   `main`), or with the `gh` CLI. Required configuration:
+#
+#     * Require a pull request before merging (CLAUDE.md section 12: "Feature
+#       branches, PRs into `main`, CI green before merge").
+#     * Require status checks to pass before merging. Require exactly ONE context:
+#
+#           ci
+#
+#       That is the aggregate job at the bottom of this file, which fails unless
+#       every other job succeeded. Requiring the aggregate rather than the seven
+#       individual checks means adding a job later cannot silently make it
+#       non-blocking -- the classic way a green `main` stops meaning anything.
+#       (A status-check context is the job's `name:`, so listing them individually
+#       would also be ambiguous here: deploy.yml has a job named "no host
+#       toolchain" too.)
+#     * Require branches to be up to date before merging, and enable the merge
+#       queue -- the `merge_group` trigger below exists for exactly this.
+#     * Require conversation resolution before merging.
+#     * Do not allow force pushes; do not allow deletions.
+#     * Include administrators.
+#
+#   Reference invocation (run once, from a machine with `gh` authenticated -- this
+#   is repo administration, not a build step, so it is outside the prime directive's
+#   scope):
+#
+#     gh api -X PUT repos/{owner}/{repo}/branches/main/protection \
+#       -H "Accept: application/vnd.github+json" \
+#       --input - <<'JSON'
+#     {
+#       "required_status_checks": { "strict": true, "contexts": ["ci"] },
+#       "enforce_admins": true,
+#       "required_pull_request_reviews": {
+#         "required_approving_review_count": 1,
+#         "dismiss_stale_reviews": true
+#       },
+#       "required_conversation_resolution": true,
+#       "allow_force_pushes": false,
+#       "allow_deletions": false,
+#       "restrictions": null
+#     }
+#     JSON
+#
+# ACTION VERSION PINNING
+#
+#   CLAUDE.md section 12 pins *base images* by digest. GitHub Actions are referenced
+#   by major tag here because their commit SHAs cannot be verified offline and this
+#   charter forbids inventing a digest. `.github/renovate.json` enables
+#   `helpers:pinGitHubActionDigests`, so Renovate opens the PR that converts each
+#   `@v4` below into `@<sha> # v4.x.y`. Accept that PR; do not hand-write SHAs.
+#
+# MAKEFILE INTERFACE  --  the complete set of targets these two workflows call, and
+# the variables they parameterise them with. CI has no other way to touch the repo.
+#
+#   target                      workflow
+#   --------------------------  ---------
+#   verify-no-host-toolchain    both
+#   lint                        ci
+#   test-race                   ci
+#   vuln                        ci
+#   migrate-dry-run             ci
+#   buildx-multiarch            ci
+#   buildx-web                  ci
+#   build                       ci
+#   build-web                   ci
+#   scan-all                    ci
+#   deploy-dry-run              deploy
+#   deploy                      deploy
+#   deploy-status               deploy
+#
+#   This list is not documentation, it is a checked contract: the `directive` job's
+#   second step expands every name above with `make -n` and fails the run if one
+#   does not resolve. A workflow that calls a target the Makefile does not define
+#   is a pipeline that is red for a reason nobody can see from the YAML, and it has
+#   happened here before. Add a target to this list when you add it to a `run:`.
+#
+#   variables (all `?=` in the Makefile, so the environment wins):
+#     PROJECT REGISTRY VERSION PLATFORMS BUILDX_OUTPUT SCAN_SEVERITY
+#     BUILDX_CACHE_FROM BUILDX_CACHE_TO   <- reach buildx via the Makefile's
+#                                            BUILDX_CACHE_ARGS, which emits no
+#                                            flag at all when the value is empty
+#                                            (as it is on a fork PR -- buildx
+#                                            rejects a bare --cache-from)
+#     DEPLOY_ENV KUBECONFIG               <- for the deploy targets
+#
+#   IMAGE_PREFIX is deliberately NOT in that list: the Makefile defines it with `:=`
+#   as $(REGISTRY)/$(PROJECT), which GNU Make does not let the environment override.
+# ==============================================================================
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  merge_group:
+
+# Least privilege by default. Only the jobs that publish to GHCR widen this.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # BuildKit is what the Makefile's docker invocations drive. Nothing here installs
+  # a toolchain; these only configure the container runtime.
+  DOCKER_BUILDKIT: "1"
+  COMPOSE_DOCKER_CLI_BUILD: "1"
+  BUILDKIT_PROGRESS: plain
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The prime directive check. Everything else depends on it, so a Makefile that
+  # cheats by shelling out to a host toolchain cannot reach the rest of the
+  # pipeline.
+  # ---------------------------------------------------------------------------
+  directive:
+    name: no host toolchain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: make verify-no-host-toolchain
+
+      # Every `make <target>` either workflow invokes, checked for EXISTENCE
+      # before any job spends 40 minutes getting to it.
+      #
+      # This exists because the reverse has already bitten this repo: ci.yml
+      # called `make migrate-dry-run` and deploy.yml called `make deploy`,
+      # `deploy-dry-run` and `deploy-status` when none of the four were defined.
+      # Nothing in the YAML said so; it would only have surfaced as a "No rule to
+      # make target" deep in a job log. Keep this list in sync with the MAKEFILE
+      # INTERFACE table at the top of this file.
+      #
+      # `make -n` expands a recipe without executing it, so this costs nothing.
+      # The verdict is the *reason* make failed, not its exit status. Three cases:
+      #
+      #   "No rule to make target"  -> the name does not exist.        MISSING
+      #   "Nothing to be done for"  -> make matched something and has  MISSING
+      #        no recipe to run. This is the dangerous one, and it is not
+      #        hypothetical: `deploy` is also a DIRECTORY in this repo root, so
+      #        with no `deploy:` rule and no `.PHONY: deploy`, GNU Make treats
+      #        `make deploy` as an up-to-date file and EXITS 0. A deploy job
+      #        would have gone green having rolled out nothing. Exit status alone
+      #        cannot see this; the message can.
+      #   any other non-zero        -> defined, but its recipe refuses to expand
+      #        here (a phase-gate stub calling $(error) is legitimate).  OK
+      - name: every make target the workflows call is defined
+        run: |
+          set -uo pipefail
+          missing=0
+          for t in \
+            verify-no-host-toolchain \
+            lint \
+            test-race \
+            vuln \
+            migrate-dry-run \
+            buildx-multiarch \
+            buildx-web \
+            build \
+            build-web \
+            scan-all \
+            deploy-dry-run \
+            deploy \
+            deploy-status
+          do
+            out=$(make --dry-run --no-print-directory "$t" 2>&1) && rc=0 || rc=$?
+            if printf '%s\n' "$out" | grep -q 'No rule to make target'; then
+              echo "::error::the workflows call \`make $t\`, but the Makefile does not define it"
+              missing=1
+            elif printf '%s\n' "$out" | grep -q 'Nothing to be done for'; then
+              echo "::error::\`make $t\` has no recipe -- it exits 0 doing nothing, which would report a green job that did no work. If a path named '$t' exists in the repo, the Makefile needs \`.PHONY: $t\`."
+              missing=1
+            elif [ "$rc" -ne 0 ]; then
+              # Defined, but its recipe refuses to expand here. Legitimate for a
+              # phase-gated target; the job that actually calls it will fail on
+              # its own terms with its own message.
+              echo "defined (does not run here) $t"
+            else
+              echo "ok                          $t"
+            fi
+          done
+          exit "$missing"
+
+  # ---------------------------------------------------------------------------
+  # Image coordinates. Pure shell: `tr` and string tests, no toolchain.
+  #
+  # The variable NAMES below are dictated by the Makefile, which is the interface
+  # CI is required to go through. It defines:
+  #     PROJECT  ?= sharpline
+  #     REGISTRY ?= ghcr.io/anpl1623
+  #     IMAGE_PREFIX := $(REGISTRY)/$(PROJECT)
+  #     VERSION  ?= dev
+  # IMAGE_PREFIX is a `:=` assignment, so it is NOT overridable from the
+  # environment -- CI must set REGISTRY and PROJECT instead, and VERSION is the
+  # image tag. Do not "simplify" this by exporting IMAGE_PREFIX; it is silently
+  # ignored by GNU Make.
+  #
+  # GHCR rejects uppercase path segments, hence the lowercasing.
+  # ---------------------------------------------------------------------------
+  meta:
+    name: resolve image coordinates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      registry: ${{ steps.coords.outputs.registry }}
+      project: ${{ steps.coords.outputs.project }}
+      version: ${{ steps.coords.outputs.version }}
+      pushable: ${{ steps.coords.outputs.pushable }}
+      platforms: ${{ steps.coords.outputs.platforms }}
+      buildx_output: ${{ steps.coords.outputs.buildx_output }}
+      cache_from: ${{ steps.coords.outputs.cache_from }}
+      cache_to: ${{ steps.coords.outputs.cache_to }}
+    steps:
+      - id: coords
+        # Context values are passed through `env:` rather than interpolated into the
+        # script body: `head_repo` is attacker-controlled on a fork PR and direct
+        # ${{ }} interpolation into bash is a script-injection hole.
+        env:
+          OWNER: ${{ github.repository_owner }}
+          NAME: ${{ github.event.repository.name }}
+          REPO: ${{ github.repository }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          EVENT: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          owner=$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')
+          project=$(printf '%s' "$NAME" | tr '[:upper:]' '[:lower:]')
+
+          # A pull request from a fork has no GHCR credentials, so it can neither
+          # read nor write the registry-backed BuildKit cache and must not push.
+          if [ "$EVENT" = "pull_request" ] && [ "$HEAD_REPO" != "$REPO" ]; then
+            pushable=false
+          else
+            pushable=true
+          fi
+
+          # Only a real push to `main` publishes. A pull_request or merge_group run
+          # still builds both arches and still warms the cache, but must not litter
+          # GHCR with tags for commits that may never land.
+          if [ "$EVENT" = "push" ] && [ "$pushable" = "true" ]; then
+            buildx_output="--push"
+          else
+            buildx_output=""
+          fi
+
+          # CLAUDE.md section 9: "Registry-backed BuildKit cache keeps that
+          # affordable." Emitted here rather than inline in each job's env: block so
+          # the build and scan jobs share one definition. Empty on a fork PR, which
+          # must fall back to an uncached build rather than fail on a 401 from GHCR.
+          cache_from=""
+          cache_to=""
+          if [ "$pushable" = "true" ]; then
+            cache_from="type=registry,ref=ghcr.io/${owner}/${project}/buildcache"
+            cache_to="${cache_from},mode=max,compression=zstd"
+          fi
+
+          # CLAUDE.md section 9: "Multi-arch via buildx (arm64 for the dev Mac,
+          # amd64 for the server)." Both arches are built on main; PRs build amd64
+          # only, because arm64 under QEMU roughly triples PR latency and the
+          # multi-arch manifest is only meaningful for something being published.
+          if [ "$EVENT" = "push" ] || [ "$EVENT" = "merge_group" ]; then
+            platforms="linux/amd64,linux/arm64"
+          else
+            platforms="linux/amd64"
+          fi
+
+          {
+            echo "registry=ghcr.io/${owner}"
+            echo "project=${project}"
+            echo "version=sha-${SHA:0:12}"
+            echo "pushable=${pushable}"
+            echo "platforms=${platforms}"
+            echo "buildx_output=${buildx_output}"
+            echo "cache_from=${cache_from}"
+            echo "cache_to=${cache_to}"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # golangci-lint  --  runs inside deploy/docker/tools.Dockerfile's image.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: golangci-lint
+    needs: [directive]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: make lint
+
+  # ---------------------------------------------------------------------------
+  # go test -race  --  CLAUDE.md section 9 names the race detector explicitly, so
+  # this is `make test-race`, not `make test`. CLAUDE.md section 10: the Go test
+  # image runs with the Docker socket mounted so testcontainers-go can spawn real
+  # Postgres / Redis / Kafka siblings. GitHub-hosted runners expose
+  # /var/run/docker.sock, so the mount the Makefile performs works here unchanged.
+  # ---------------------------------------------------------------------------
+  test:
+    name: go test -race
+    needs: [directive]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: make test-race
+
+  # ---------------------------------------------------------------------------
+  # govulncheck
+  # ---------------------------------------------------------------------------
+  vuln:
+    name: govulncheck
+    needs: [directive]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: make vuln
+
+  # ---------------------------------------------------------------------------
+  # Migration dry-run  --  CLAUDE.md section 12: "Migrations are forward-only, and
+  # every one is reversible in review before it is applied." The target brings up a
+  # throwaway Timescale container, applies every goose migration up, then down, then
+  # up again, and diffs the resulting schema. Nothing touches a real database.
+  # ---------------------------------------------------------------------------
+  migrate-dry-run:
+    name: migration dry-run
+    needs: [directive]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: make migrate-dry-run
+
+  # ---------------------------------------------------------------------------
+  # Multi-arch build, and push to GHCR on a push to main.
+  #
+  # `BUILDX_OUTPUT` is the Makefile's own knob (`BUILDX_OUTPUT ?=`, consumed by
+  # buildx-multiarch / buildx-web): `--push` publishes, empty discards the result
+  # after building. Setting it here means both the PR path and the publish path are
+  # the same target with the same flags, so a green PR build is evidence about the
+  # thing that will actually be published.
+  #
+  # Registry-backed BuildKit cache (CLAUDE.md section 9: "Registry-backed BuildKit
+  # cache keeps that affordable") is exported here as BUILDX_CACHE_FROM /
+  # BUILDX_CACHE_TO. The consuming side is the Makefile's buildx-multiarch /
+  # buildx-web recipes, which must pass them as `--cache-from` / `--cache-to`.
+  #
+  # Both are deliberately EMPTY on a fork PR (see the `meta` job): a fork has no
+  # GHCR credentials, so a non-empty --cache-to would 401. The Makefile recipes
+  # must therefore tolerate an empty value and fall back to an uncached build
+  # rather than emitting a bare `--cache-from` with no argument.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build images
+    needs: [directive, meta, lint, test, vuln]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REGISTRY: ${{ needs.meta.outputs.registry }}
+      PROJECT: ${{ needs.meta.outputs.project }}
+      VERSION: ${{ needs.meta.outputs.version }}
+      PLATFORMS: ${{ needs.meta.outputs.platforms }}
+      BUILDX_OUTPUT: ${{ needs.meta.outputs.buildx_output }}
+      BUILDX_CACHE_FROM: ${{ needs.meta.outputs.cache_from }}
+      BUILDX_CACHE_TO: ${{ needs.meta.outputs.cache_to }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU provides the linux/arm64 emulation buildx needs on an amd64 runner.
+      # It is a binfmt registration shipped as a container image, not a toolchain.
+      - uses: docker/setup-qemu-action@v3
+        if: contains(needs.meta.outputs.platforms, 'arm64')
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: needs.meta.outputs.pushable == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The six Go binaries, from the one parameterized go.Dockerfile.
+      - name: six Go service images
+        run: make buildx-multiarch
+
+      # The Next.js standalone image.
+      - name: web image
+        run: make buildx-web
+
+  # ---------------------------------------------------------------------------
+  # trivy image scan  --  CLAUDE.md section 9.
+  #
+  # Scans all seven images (six Go services + web). The images are rebuilt into the
+  # local daemon with plain `docker build` first, because `trivy image` reads from
+  # the daemon and a `--push`-only buildx run leaves nothing there. On a fork PR
+  # there is no pushed image to pull either, so building locally is the only path
+  # that behaves identically on every event. amd64 only: the arm64 layers of a
+  # distroless static image carry the same package set.
+  # ---------------------------------------------------------------------------
+  scan:
+    name: trivy image scan
+    needs: [directive, meta, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: read
+    env:
+      REGISTRY: ${{ needs.meta.outputs.registry }}
+      PROJECT: ${{ needs.meta.outputs.project }}
+      VERSION: ${{ needs.meta.outputs.version }}
+      SCAN_SEVERITY: HIGH,CRITICAL
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: six Go service images into the local daemon
+        run: make build
+
+      - name: web image into the local daemon
+        run: make build-web
+
+      - run: make scan-all
+
+  # ---------------------------------------------------------------------------
+  # Single required check to hang branch protection off, so adding a job later does
+  # not silently stop being required.
+  # ---------------------------------------------------------------------------
+  ci:
+    name: ci
+    if: always()
+    needs: [directive, lint, test, vuln, migrate-dry-run, build, scan]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          set -euo pipefail
+          echo "upstream job results: $RESULTS"
+          for r in $RESULTS; do
+            if [ "$r" != "success" ]; then
+              echo "::error::a required CI job did not succeed ($r)"
+              exit 1
+            fi
+          done

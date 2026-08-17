@@ -1,0 +1,142 @@
+# Sharpline — Prometheus scrape configuration
+#
+# CLAUDE.md §9 "Observability": Prometheus metrics with a pre-built Grafana
+# dashboard: odds staleness p50/p99, provider quota remaining, WebSocket
+# connections and dropped clients, pricing latency, bus lag.
+#
+# Frozen topology (see CONTRACT.md): every Go service serves
+#   GET /healthz  GET /readyz  GET /metrics
+# on its own internal port. Nothing here is published to the host — Prometheus
+# reaches every target over the compose bridge network by service-name DNS,
+# exactly as it will reach them by Service DNS in Kubernetes.
+#
+# Metric-name contract: every application series is prefixed `sharpline_`.
+# The authoritative list lives in the phase handoff notes; the dashboard and
+# the alert rules in ./rules/ are written against those names.
+#
+# Validated with:
+#   docker run --rm -v ./prometheus.yml:/etc/prometheus/prometheus.yml \
+#     -v ./rules:/etc/prometheus/rules \
+#     --entrypoint /bin/promtool prom/prometheus@sha256:508729e0... \
+#     check config /etc/prometheus/prometheus.yml
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: sharpline-local
+    env: local
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+# Alertmanager is deliberately NOT in the container inventory (CLAUDE.md §9
+# names prometheus / grafana / jaeger / otel-collector and nothing else), so no
+# `alerting.alertmanagers` block is declared. Rules still evaluate and fire —
+# they surface in Prometheus /alerts and in Grafana's alert list. Adding
+# Alertmanager is an inventory change and needs an ADR.
+
+scrape_configs:
+  # ---------------------------------------------------------------- self ----
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels:
+          service: prometheus
+          component: observability
+
+  # ------------------------------------------------- Go services (six) ------
+  # One job per service rather than one job with six targets: the jobs have
+  # different scrape intervals, and a per-job name makes `up{job=...}` and the
+  # Grafana variables read cleanly.
+
+  - job_name: sharpline-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8080"]
+        labels:
+          service: api
+          component: backend
+
+  - job_name: sharpline-stream
+    metrics_path: /metrics
+    # Faster than global: `sharpline_ws_connections_active` is the custom
+    # metric the `stream` HPA scales on (CLAUDE.md §9), and a 15s sample makes
+    # the autoscaler visibly laggy in the Locust demo.
+    scrape_interval: 10s
+    scrape_timeout: 5s
+    static_configs:
+      - targets: ["stream:8081"]
+        labels:
+          service: stream
+          component: backend
+
+  - job_name: sharpline-pricer
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["pricer:8082"]
+        labels:
+          service: pricer
+          component: backend
+
+  - job_name: sharpline-ingest
+    metrics_path: /metrics
+    # Provider quota is a hard budget; sample it often enough that the burn
+    # rate on the dashboard is meaningful.
+    scrape_interval: 10s
+    scrape_timeout: 5s
+    static_configs:
+      - targets: ["ingest:8083"]
+        labels:
+          service: ingest
+          component: backend
+
+  - job_name: sharpline-settle
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["settle:8084"]
+        labels:
+          service: settle
+          component: backend
+
+  # - job_name: sharpline-migrate
+  #   NOT SCRAPABLE AS A STATIC TARGET, AND DELIBERATELY OMITTED.
+  #   `migrate` is the sixth Go binary but it is a run-to-completion workload:
+  #   a compose service that exits 0 before `api` starts, and a Helm
+  #   pre-install/pre-upgrade Job in the cluster. The frozen topology assigns
+  #   it no port (api 8080 | stream 8081 | pricer 8082 | ingest 8083 |
+  #   settle 8084 | web 3000 — migrate is absent), and a static target that is
+  #   down 99.99% of the time produces a permanent `up == 0` and poisons every
+  #   "is anything broken" query.
+  #   If migration duration/outcome must be graphed, the correct mechanism is a
+  #   Pushgateway (not in the container inventory -> needs an ADR) or, in the
+  #   cluster, kube-state-metrics `kube_job_status_*`. Flagged to the topology
+  #   owner rather than fabricated here.
+
+  # ------------------------------------------------- OTel collector ---------
+  # Two endpoints, two jobs, different meanings:
+
+  # (a) Collector-internal telemetry: receiver/exporter throughput, queue size,
+  #     refused/dropped spans. This is how you find out the trace pipeline is
+  #     silently dropping data.
+  - job_name: otel-collector-internal
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["otel-collector:8888"]
+        labels:
+          service: otel-collector
+          component: observability
+
+  # (b) The collector's `prometheus` exporter, re-exposing metrics that arrived
+  #     over OTLP (Go runtime / SDK-native instrumentation). The sharpline_*
+  #     contract series come from the services' own /metrics endpoints above,
+  #     NOT from here — services must not double-export, or every series lands
+  #     in Prometheus twice under two different job labels.
+  - job_name: otel-collector-otlp
+    metrics_path: /metrics
+    honor_labels: true
+    static_configs:
+      - targets: ["otel-collector:8889"]
+        labels:
+          component: observability

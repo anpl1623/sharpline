@@ -1,0 +1,279 @@
+# Sharpline — Prometheus recording + alerting rules
+#
+# CLAUDE.md §9: "Odds staleness is the headline SLO — define it, alert on it,
+# put it on the dashboard." This file is the "alert on it" half. The dashboard
+# half is ../grafana/dashboards/sharpline-overview.json, and the definition is
+# written verbatim into that dashboard's top text panel.
+#
+# ODDS STALENESS — THE DEFINITION (one place, copied everywhere else):
+#
+#   staleness = (wall-clock instant the price is written to the client socket)
+#             - (provider observation timestamp carried on that price)
+#
+#   Measured by `stream`, at the moment of fanout, and recorded as
+#   sharpline_odds_staleness_seconds{stage="fanout"}. The provider observation
+#   timestamp is the provider's own `last_update` for the market, propagated
+#   unchanged through ingest -> Kafka -> pricer -> stream. It is NOT the time
+#   ingest received the payload, and NOT a timestamp re-stamped at any hop.
+#
+#   The intermediate stages record the same histogram under stage="received",
+#   stage="normalized", stage="priced" so the pipeline segment responsible for
+#   a regression is identifiable. Only stage="fanout" is the SLO.
+#
+# SLO TARGETS (objective, not a hard limit):
+#   p50 <= 0.5s   p99 <= 2.0s   over a rolling 30d window, 99% of the time.
+#   Page-worthy breach: p99 > 5s.
+#
+# Loaded by prometheus.yml via `rule_files: /etc/prometheus/rules/*.yml`, so
+# the compose/Helm owner must mount deploy/observability/rules at
+# /etc/prometheus/rules.
+
+groups:
+  # =====================================================================
+  # Recording rules — precompute the SLO series so the dashboard, the alerts
+  # and any future prometheus-adapter HPA all read the identical number.
+  # =====================================================================
+  - name: sharpline.slo.recording
+    interval: 15s
+    rules:
+      - record: sharpline:odds_staleness_seconds:p50
+        expr: |
+          histogram_quantile(
+            0.50,
+            sum by (le) (rate(sharpline_odds_staleness_seconds_bucket{stage="fanout"}[5m]))
+          )
+
+      - record: sharpline:odds_staleness_seconds:p99
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(sharpline_odds_staleness_seconds_bucket{stage="fanout"}[5m]))
+          )
+
+      # Fraction of fanned-out prices that met the 2s objective. This is the
+      # SLI; 1 - this is the error budget burn.
+      - record: sharpline:odds_staleness_slo_ratio:5m
+        expr: |
+          sum(rate(sharpline_odds_staleness_seconds_bucket{stage="fanout",le="2"}[5m]))
+            /
+          sum(rate(sharpline_odds_staleness_seconds_count{stage="fanout"}[5m]))
+
+      - record: sharpline:odds_staleness_slo_ratio:1h
+        expr: |
+          sum(rate(sharpline_odds_staleness_seconds_bucket{stage="fanout",le="2"}[1h]))
+            /
+          sum(rate(sharpline_odds_staleness_seconds_count{stage="fanout"}[1h]))
+
+      - record: sharpline:pricing_duration_seconds:p99
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(sharpline_pricing_duration_seconds_bucket[5m]))
+          )
+
+  # =====================================================================
+  # Headline SLO alerts
+  # =====================================================================
+  - name: sharpline.slo.odds_staleness
+    interval: 15s
+    rules:
+      - alert: OddsStalenessP99Degraded
+        expr: sharpline:odds_staleness_seconds:p99 > 2
+        for: 5m
+        labels:
+          severity: warning
+          slo: odds_staleness
+          service: stream
+        annotations:
+          summary: "Odds staleness p99 above the 2s objective"
+          description: >-
+            p99 staleness at fanout is {{ $value | humanizeDuration }}, above the
+            2s objective, for 5 minutes. Staleness = fanout instant minus the
+            provider observation timestamp on the price. Compare the per-stage
+            breakdown (stage=received|normalized|priced|fanout) to find which
+            pipeline segment added the delay.
+          runbook: "Check consumer lag on odds.normalized and price.computed, then pricer CPU."
+
+      - alert: OddsStalenessP99Critical
+        expr: sharpline:odds_staleness_seconds:p99 > 5
+        for: 2m
+        labels:
+          severity: critical
+          slo: odds_staleness
+          service: stream
+        annotations:
+          summary: "Odds staleness p99 above 5s — the live board is visibly wrong"
+          description: >-
+            p99 staleness at fanout is {{ $value | humanizeDuration }}. At this
+            level a user is being shown prices that no longer exist. Suspend
+            affected markets before anything else.
+
+      - alert: OddsStalenessSLOBudgetBurn
+        expr: sharpline:odds_staleness_slo_ratio:1h < 0.99
+        for: 15m
+        labels:
+          severity: warning
+          slo: odds_staleness
+        annotations:
+          summary: "Odds staleness error budget burning"
+          description: >-
+            Only {{ $value | humanizePercentage }} of prices reached the browser
+            within 2s over the last hour; the objective is 99%.
+
+      # The SLO is unmeasurable if nothing is fanning out. That is a distinct
+      # failure from "slow", and it must not read as "healthy".
+      - alert: OddsFanoutStopped
+        expr: |
+          sum(rate(sharpline_odds_staleness_seconds_count{stage="fanout"}[5m])) == 0
+            and
+          sharpline_ws_connections_active > 0
+        for: 5m
+        labels:
+          severity: critical
+          slo: odds_staleness
+          service: stream
+        annotations:
+          summary: "Clients are connected but no prices are being fanned out"
+          description: >-
+            sharpline_ws_connections_active > 0 while the fanout rate is zero for
+            5 minutes. The staleness SLO reads as met only because nothing is
+            being measured.
+
+  # =====================================================================
+  # Pipeline health — the things that cause staleness
+  # =====================================================================
+  - name: sharpline.pipeline
+    interval: 15s
+    rules:
+      - alert: KafkaConsumerLagHigh
+        expr: sum by (group, topic) (sharpline_kafka_consumer_lag_records) > 10000
+        for: 10m
+        labels:
+          severity: warning
+          component: bus
+        annotations:
+          summary: "Consumer group {{ $labels.group }} lagging on {{ $labels.topic }}"
+          description: "{{ $value }} records behind for 10 minutes."
+
+      - alert: KafkaConsumerLagSecondsHigh
+        expr: max by (group, topic) (sharpline_kafka_consumer_lag_seconds) > 30
+        for: 5m
+        labels:
+          severity: warning
+          component: bus
+        annotations:
+          summary: "Consumer group {{ $labels.group }} is {{ $value | humanizeDuration }} behind on {{ $labels.topic }}"
+
+      - alert: PricingLatencyHigh
+        expr: sharpline:pricing_duration_seconds:p99 > 0.25
+        for: 10m
+        labels:
+          severity: warning
+          service: pricer
+        annotations:
+          summary: "Pricing p99 above 250ms"
+          description: "Devig/EV computation p99 is {{ $value | humanizeDuration }}."
+
+      - alert: ProviderQuotaLow
+        expr: |
+          sharpline_provider_quota_remaining
+            /
+          clamp_min(sharpline_provider_quota_limit, 1) < 0.10
+        for: 5m
+        labels:
+          severity: warning
+          service: ingest
+        annotations:
+          summary: "Provider {{ $labels.provider }} quota under 10%"
+          description: >-
+            {{ $value | humanizePercentage }} of the {{ $labels.provider }} request
+            budget remains. Adaptive polling should back off; if it has not,
+            ingest will start returning 429s and staleness will climb.
+
+      - alert: ProviderQuotaExhausted
+        expr: sharpline_provider_quota_remaining == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: ingest
+        annotations:
+          summary: "Provider {{ $labels.provider }} quota exhausted"
+          description: "No provider requests remain. The board is frozen at the last observation."
+
+  # =====================================================================
+  # Fanout health
+  # =====================================================================
+  - name: sharpline.fanout
+    interval: 15s
+    rules:
+      - alert: WebSocketClientsDropping
+        expr: sum by (reason) (rate(sharpline_ws_clients_dropped_total[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+          service: stream
+        annotations:
+          summary: "WebSocket clients dropping ({{ $labels.reason }})"
+          description: >-
+            {{ $value | printf "%.2f" }} drops/s with reason={{ $labels.reason }}.
+            reason="slow_consumer" means the per-client bounded send queue
+            overflowed — expected under load, a defect if it happens at idle.
+
+      - alert: WebSocketResyncStorm
+        expr: |
+          sum(rate(sharpline_ws_resyncs_total[5m]))
+            /
+          clamp_min(sum(rate(sharpline_ws_messages_sent_total{kind="delta"}[5m])), 1) > 0.01
+        for: 10m
+        labels:
+          severity: warning
+          service: stream
+        annotations:
+          summary: "More than 1% of delta traffic is triggering client resync"
+          description: "Sequence gaps at this rate mean the delta stream is losing messages."
+
+  # =====================================================================
+  # Correctness — the one alert that means "stop the demo"
+  # =====================================================================
+  - name: sharpline.correctness
+    interval: 15s
+    rules:
+      - alert: LedgerImbalanceDetected
+        expr: increase(sharpline_ledger_imbalance_detected_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          service: settle
+        annotations:
+          summary: "Double-entry ledger does not sum to zero"
+          description: >-
+            CLAUDE.md §4: every stake, payout, void and adjustment is two rows
+            that sum to zero. A non-zero counter here is a data-integrity defect,
+            not a performance one. Halt settlement.
+
+  # =====================================================================
+  # Target liveness
+  # =====================================================================
+  - name: sharpline.targets
+    interval: 15s
+    rules:
+      - alert: ServiceDown
+        expr: up{component="backend"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.service }} is not being scraped"
+          description: "Prometheus cannot reach {{ $labels.instance }} for 2 minutes."
+
+      - alert: TraceCollectorDroppingSpans
+        expr: rate(otelcol_processor_refused_spans_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: observability
+        annotations:
+          summary: "OTel collector is refusing spans"
+          description: >-
+            The memory_limiter is applying backpressure. End-to-end
+            ingest -> pricer -> stream traces will have holes.

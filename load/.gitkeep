@@ -1,0 +1,1 @@
+load — Locust WebSocket fanout tests. Filled in phase 11 (Locust to 10k connections), driving the phase 10 stream HPA (CLAUDE.md §11).

@@ -1,0 +1,615 @@
+# =============================================================================
+#  Sharpline — Caddy reverse proxy
+#
+#  CLAUDE.md §9: "The proxy is the only published port. Everything else talks
+#  over the internal network. This mirrors the Kubernetes Ingress topology
+#  exactly, so the compose stack and the cluster stack are not two different
+#  systems that drift apart."
+#
+#  This container is the ONLY one that publishes host ports (80, 443).
+#  Read this file as the compose-side twin of the Helm Ingress: every rule here
+#  must have a counterpart in deploy/helm, and vice versa.
+#
+#  Public route table (frozen topology — do not change without updating Helm):
+#
+#      /            ->  web:3000      Next.js App Router
+#      /api/*       ->  api:8080      REST + OpenAPI   (prefix PRESERVED)
+#      /ws          ->  stream:8081   WebSocket gateway, snapshot+delta
+#      /metrics     ->  404           never exposed publicly
+#      /debug/*     ->  404           never exposed publicly
+#
+#  Dev/obs tooling — reachable ONLY when SHARPLINE_ENV=dev, otherwise 404.
+#  These containers publish no host ports either, so this proxy is the only
+#  way a human opens them (see "Route 3" below for the guard):
+#
+#      /_kafka-ui   ->  kafka-ui:8080   (prefix PRESERVED)
+#      /grafana     ->  grafana:3000    (prefix PRESERVED)
+#      /prometheus  ->  prometheus:9090 (prefix STRIPPED)
+#      /jaeger      ->  jaeger:16686    (prefix PRESERVED)
+#
+#  Internal-only listener (NOT published to the host):
+#
+#      :2021/healthz             proxy liveness for the compose healthcheck
+#      127.0.0.1:2019            Caddy admin API (config reload), loopback only
+#
+#  Service-local /healthz, /readyz and /metrics (frozen topology: every Go
+#  service exposes all three on its own port) are deliberately NOT routed here.
+#  Prometheus scrapes them over the internal docker network, not through
+#  the proxy.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+#  Global options
+# -----------------------------------------------------------------------------
+{
+	# Admin API stays on container loopback. Not published, not reachable from
+	# the compose network. `docker compose exec proxy caddy reload` still works.
+	admin localhost:2019
+
+	# Structured JSON on stdout so proxy logs interleave cleanly with the Go
+	# services' log/slog JSON output and both land in the same collector.
+	log default {
+		output stdout
+		format json
+		level INFO
+	}
+
+	servers {
+		# HTTP/2 is on for every TLS connection.
+		#
+		# HTTP/3 is deliberately NOT enabled: it needs UDP/443 published as well
+		# as TCP/443, and advertising Alt-Svc for a port the compose stack does
+		# not publish produces slow, confusing connection fallbacks. Enable it
+		# only together with a `443:443/udp` publish in compose.
+		protocols h1 h2
+
+		# Bound the request line + headers. Generous enough for a JWT in a
+		# cookie, small enough to be a real limit.
+		max_header_size 64KB
+
+		# --- Timeouts -------------------------------------------------------
+		# These map onto Go's http.Server and are therefore PER LISTENER, not
+		# per route — Caddy has no per-route equivalent. The consequence is
+		# load-bearing for this project:
+		#
+		#   read_body / write set an absolute deadline on the whole connection
+		#   at the moment the request starts. A WebSocket carrying a live odds
+		#   stream is one request that stays open for hours, so any non-zero
+		#   value here reaps it mid-stream. Both are therefore 0 (= no limit).
+		#
+		# Losing the blanket read/write deadline is paid back three ways:
+		#   * read_header still bounds the header phase, which is the actual
+		#     slowloris surface.
+		#   * idle bounds keep-alive connections that are between requests.
+		#   * /api gets its real timeouts at the route level, on the upstream
+		#     transport (dial_timeout + response_header_timeout) plus a request
+		#     body size cap. See the /api handler below.
+		#
+		# idle does not apply to a hijacked (upgraded) connection, so it is safe
+		# to keep short here without affecting /ws.
+		timeouts {
+			read_body 0
+			read_header 15s
+			write 0
+			idle 5m
+		}
+	}
+
+	# NOTE ON trusted_proxies: deliberately unset. With nothing trusted, Caddy
+	# derives the client IP from the direct peer and appends it to
+	# X-Forwarded-For rather than believing a client-supplied value — which
+	# matters because the API rate-limits per IP (CLAUDE.md §6, Platform).
+	# When this stack later sits behind a real load balancer or a Kubernetes
+	# Ingress controller, add exactly that hop's CIDR here — never
+	# `private_ranges`, which on a docker bridge network would let any
+	# container spoof a client IP.
+}
+
+# -----------------------------------------------------------------------------
+#  Public site — the single entrypoint
+# -----------------------------------------------------------------------------
+#  Addresses: loopback names for local dev, plus one env-overridable hostname
+#  so the same file serves a real deployment unchanged.
+#  Set SHARPLINE_PROXY_HOST to the public hostname in prod.
+# -----------------------------------------------------------------------------
+localhost, 127.0.0.1, {$SHARPLINE_PROXY_HOST:sharpline.localhost} {
+	# =========================================================================
+	#  TLS
+	# =========================================================================
+	#  DEV (current): Caddy's internal CA issues a short-lived self-signed cert
+	#  on startup. Zero configuration, no ACME rate limits, works offline, and
+	#  works for the bare-IP address above. Browsers will warn until the root at
+	#  /data/caddy/pki/authorities/local/root.crt is trusted on the host.
+	tls internal
+
+	# ---- PRODUCTION: change the ONE line above to ONE of the two below ------
+	#
+	#   Managed certificates (Let's Encrypt / ZeroSSL, HTTP-01 + TLS-ALPN-01):
+	#       tls {$SHARPLINE_ACME_EMAIL}
+	#
+	#   Certificates you already hold (mounted read-only into the container):
+	#       tls /etc/caddy/tls/fullchain.pem /etc/caddy/tls/privkey.pem
+	#
+	#   Either way also set SHARPLINE_PROXY_HOST to the real public hostname,
+	#   because ACME cannot issue for `localhost` or for a bare IP.
+	# -------------------------------------------------------------------------
+
+	# =========================================================================
+	#  Security headers — applied to every response on this site
+	# =========================================================================
+	header {
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Cross-Origin-Opener-Policy "same-origin"
+		Cross-Origin-Resource-Policy "same-origin"
+		Permissions-Policy "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
+
+		# Do not advertise the proxy or the upstream stack. `Via` is added by
+		# reverse_proxy and otherwise reports "1.1 Caddy" on every response.
+		-Server
+		-Via
+		-X-Powered-By
+	}
+
+	# HSTS, but never on loopback: pinning HSTS for `localhost` poisons the
+	# browser for every other project on this machine, which is a genuinely
+	# painful thing to undo.
+	@public_host not host localhost 127.0.0.1
+	header @public_host Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+	# Content-Security-Policy is intentionally NOT set here. Next.js needs
+	# per-request nonces for its inline bootstrap scripts, so the policy has to
+	# be emitted by the app (middleware) where the nonce is generated. Setting a
+	# static CSP at the proxy would either break the frontend or be so loose it
+	# is theatre. Owner: the `web` agent.
+
+	# =========================================================================
+	#  Access log — JSON, correlated with the Go services
+	# =========================================================================
+	# request_id is echoed to the upstream as X-Request-Id on every route below,
+	# so a single line here joins to the slog records the Go services emit.
+	log_append request_id {http.request.uuid}
+
+	log {
+		output stdout
+		level INFO
+		format filter {
+			wrap json
+			fields {
+				request>headers>Authorization delete
+				request>headers>Cookie delete
+				request>headers>Proxy-Authorization delete
+				resp_headers>Set-Cookie delete
+			}
+		}
+	}
+
+	# Echo the id back so a browser network trace joins to the server logs too.
+	header X-Request-Id {http.request.uuid}
+
+	# =========================================================================
+	#  Route 0 — hard deny: never expose observability or debug surface
+	# =========================================================================
+	# Must precede every other handler. Prometheus scrapes each service
+	# directly over the internal network; nothing about /metrics is public.
+	handle /metrics* {
+		respond 404
+	}
+
+	handle /debug/* {
+		respond 404
+	}
+
+	# =========================================================================
+	#  Route 1 — /ws  ->  stream:8081   (WebSocket, long-lived)
+	# =========================================================================
+	#  Placed before /api and / because it is the most constrained route.
+	#
+	#  NO COMPRESSION HERE. `encode` is scoped inside the other handlers and is
+	#  deliberately absent from this one: the stream protocol is
+	#  snapshot-then-delta with per-message framing, and an HTTP-level encoder
+	#  in front of an upgraded connection either buffers frames (adding
+	#  staleness — the headline SLO, CLAUDE.md §9) or is simply dead weight.
+	#  permessage-deflate, if ever wanted, is negotiated by the stream service.
+	# =========================================================================
+	# Exactly /ws and anything beneath it — NOT /wsfoo, which a bare `/ws*`
+	# prefix match would silently capture.
+	@ws path /ws /ws/*
+	handle @ws {
+		reverse_proxy {
+			# --- NO SESSION AFFINITY -------------------------------------
+			# CLAUDE.md §9: "stream must be horizontally scalable, so no
+			# session affinity, which means subscription state lives in Redis
+			# rather than in a pod."
+			#
+			# round_robin is stated explicitly rather than left to default so
+			# that a future edit to `cookie`, `ip_hash` or `client_ip_hash`
+			# reads as what it is: a violation of the charter. Do not do it.
+			# If clients appear to need affinity, the bug is that subscription
+			# state escaped Redis — fix that, not this.
+			lb_policy round_robin
+			lb_retries 2
+
+			# Resolve the `stream` service name on an interval rather than
+			# once at startup, so `docker compose up --scale stream=N` and a
+			# Kubernetes HPA scale-up are both picked up without a reload.
+			# This is what makes sticky-free fanout actually load-balance.
+			dynamic a {
+				name stream
+				port 8081
+				refresh 5s
+			}
+
+			# Passive health checking: eject a replica that refuses
+			# connections, retry the next one.
+			fail_duration 10s
+			max_fails 3
+			unhealthy_status 5xx
+
+			# Stream frames straight through; never buffer.
+			flush_interval -1
+
+			# WebSocket upgrade is an HTTP/1.1 mechanism. Pinning the upstream
+			# leg to 1.1 keeps the Upgrade/Connection handshake intact
+			# regardless of what the browser negotiated on the front leg.
+			transport http {
+				versions 1.1
+				dial_timeout 5s
+
+				# Bounds only the 101 handshake, NOT the lifetime of the
+				# stream: once the connection is upgraded this no longer
+				# applies, which is exactly the asymmetry this route needs.
+				response_header_timeout 10s
+			}
+
+			header_up X-Request-Id {http.request.uuid}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# =========================================================================
+	#  Route 2 — /api/*  ->  api:8080
+	# =========================================================================
+	#  CONTRACT: the prefix is PRESERVED, not stripped. The api service must
+	#  mount its public routes under /api (e.g. GET /api/v1/events). Its
+	#  own /healthz, /readyz and /metrics stay at the root of :8080 and are
+	#  unreachable from here by design.
+	# =========================================================================
+	handle /api/* {
+		encode zstd gzip
+
+		# Normal request-shaped limits live here, at the route, because the
+		# listener-wide read/write deadlines had to be disabled for /ws.
+		request_body {
+			max_size 1MB
+		}
+
+		reverse_proxy {
+			lb_policy round_robin
+			lb_retries 2
+
+			dynamic a {
+				name api
+				port 8080
+				refresh 5s
+			}
+
+			fail_duration 10s
+			max_fails 3
+			unhealthy_status 5xx
+
+			transport http {
+				dial_timeout 5s
+
+				# The real per-route timeout: an API handler that has not
+				# produced response headers in 30s is broken, and saying so
+				# is better than holding the client open.
+				response_header_timeout 30s
+
+				keepalive 90s
+				keepalive_idle_conns_per_host 32
+			}
+
+			header_up X-Request-Id {http.request.uuid}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# =========================================================================
+	#  Route 3 — dev/obs tooling, DEFAULT-DENIED
+	# =========================================================================
+	#  kafka-ui, Grafana, Prometheus and Jaeger publish no host ports —
+	#  CLAUDE.md §12 allows exactly one container to do that, and it is this
+	#  one — so the proxy is the only way a human can ever open them. Without
+	#  the routes below, CLAUDE.md §9's "kafka-ui … non-negotiable while
+	#  learning Kafka" is a container nobody can look at, and the paths that
+	#  compose.dev.yaml, compose.obs.yaml and .env.example already advertise
+	#  (/_kafka-ui, /grafana, /prometheus, /jaeger) all 404.
+	#
+	#  ---- THE GUARD: why this cannot reach production -----------------------
+	#  One fail-closed matcher decides the whole block:
+	#
+	#        {$SHARPLINE_ENV:prod}  must equal exactly  "dev"
+	#
+	#  `{$VAR:default}` is substituted when the Caddyfile is ADAPTED, not per
+	#  request, so the decision is baked into the loaded config and is visible
+	#  in `caddy adapt` output. There is no header, cookie or query parameter
+	#  that can flip it at runtime.
+	#
+	#  Three properties, together, are what make accidental prod exposure
+	#  impossible rather than merely unlikely:
+	#
+	#   1. DEFAULT DENY. The default is `prod`. A proxy container or pod that
+	#      was never told which environment it is in serves 404 — so the
+	#      common mistake (forgetting to set the variable) fails safe. Note
+	#      the direction: the block is enabled by an explicit "dev", never
+	#      disabled by an explicit "prod".
+	#   2. NO PRIVATE SWITCH. It reuses SHARPLINE_ENV — the same variable
+	#      every Go service validates at startup (dev|test|staging|prod, an
+	#      unrecognised value is a hard failure), and the one .env.example
+	#      already documents as deciding "whether dev-only affordances
+	#      (kafka-ui, verbose errors, permissive CORS) are permitted". There
+	#      is no proxy-only flag anyone can flip "just this once" in prod, and
+	#      flipping this one to expose Grafana would simultaneously put the
+	#      whole stack into dev mode — loudly, everywhere.
+	#   3. EQUALITY, NOT NEGATION. staging, test, an empty value, `local`, or
+	#      a typo (`Dev`, `dveelop`) all fall to the deny branch. Only the
+	#      exact string "dev" opens it.
+	#
+	#  Denial is 404, not 403: a production deployment should not confirm that
+	#  these paths mean anything at all.
+	#
+	#  REQUIRED COUNTERPART (deploy/compose/*.yaml, owned by the compose
+	#  agent): the proxy service must receive SHARPLINE_ENV, e.g.
+	#      environment:
+	#        SHARPLINE_ENV: ${SHARPLINE_ENV:-dev}
+	#  Until it does, the proxy container has no SHARPLINE_ENV, the default
+	#  `prod` applies, and these four routes stay 404 — the safe direction,
+	#  but also a non-working kafka-ui. In Helm, the prod values file must
+	#  never set it to "dev".
+	#
+	#  ---- SUBPATH CONTRACT WITH THE CONTAINERS ------------------------------
+	#  Each app has to be told it lives under a subpath, and this side must
+	#  match what the container was told. Those settings live in the compose
+	#  files (not owned here); if either half moves, both move together:
+	#
+	#    kafka-ui    SERVER_SERVLET_CONTEXT_PATH=/_kafka-ui    PRESERVE prefix
+	#    grafana     GF_SERVER_ROOT_URL=…/grafana
+	#                GF_SERVER_SERVE_FROM_SUB_PATH=true        PRESERVE prefix
+	#    jaeger      QUERY_BASE_PATH=/jaeger                   PRESERVE prefix
+	#    prometheus  --web.external-url=…/prometheus
+	#                --web.route-prefix=/                      STRIP prefix
+	#
+	#  Prometheus is the deliberate odd one out: route-prefix is pinned to "/"
+	#  so its own /metrics stays at the root for the `job_name: prometheus`
+	#  self-scrape in deploy/observability/prometheus.yml. That is why this is
+	#  the one route that strips.
+	#
+	#  Host-based routing (grafana.sharpline.localhost &c.) was considered and
+	#  rejected: the compose files are already configured for subpaths, and a
+	#  Host header is a weaker guard than an adapt-time constant — anyone can
+	#  send `Host: grafana.sharpline.localhost` to a production IP.
+	#
+	#  Upstreams here are static single addresses, not `dynamic a` like /ws
+	#  and /api: these are single-replica developer tools that are never
+	#  scaled, so there is nothing to load-balance across and no reason to
+	#  keep re-resolving. Docker's embedded DNS is consulted on each dial, so
+	#  restarting one of them is still picked up. When the container is simply
+	#  not running (obs profile down), the dial fails and handle_errors below
+	#  renders a 502 — which is the honest answer.
+	#
+	#  ---- VERIFIED, not assumed --------------------------------------------
+	#  All four were run against the pinned images on this Caddy config and
+	#  fetched end-to-end through the proxy — UI document, hashed JS/CSS asset
+	#  AND JSON API for each, which is what catches a wrong prefix decision:
+	#
+	#    kafka-ui    /_kafka-ui/ 200, /_kafka-ui/assets/index-*.js 200,
+	#                /_kafka-ui/api/clusters 200   (absolute asset URLs already
+	#                carry the context path — stripping would 404 every one)
+	#    grafana     /grafana/login 200, public/build/*.css 200,
+	#                /grafana/api/health 200       (<base href="/grafana/">)
+	#    jaeger      /jaeger/ 200, /jaeger/static/index-*.js 200,
+	#                /jaeger/api/services 200      (<base href="/jaeger/">)
+	#    prometheus  /prometheus/ -> 302 /prometheus/query, assets 200,
+	#                /prometheus/api/v1/query 200  (relative "./assets/…" plus
+	#                route-prefix=/ is what makes the STRIP correct here)
+	#
+	#  And the gate itself, one proxy container per value:
+	#    unset/prod/staging/test/local -> 404 404 404 404 ; dev -> reachable.
+	# =========================================================================
+	@devtools_denied {
+		path /_kafka-ui /_kafka-ui/* /grafana /grafana/* /prometheus /prometheus/* /jaeger /jaeger/*
+		expression `"{$SHARPLINE_ENV:prod}" != "dev"`
+	}
+	handle @devtools_denied {
+		respond 404
+	}
+
+	# ---- kafka-ui  ->  kafka-ui:8080  (dev compose profile) -----------------
+	# Spring Boot serves the entire UI under its servlet context path, so the
+	# prefix is passed through untouched and the app itself redirects the
+	# bare /_kafka-ui to /_kafka-ui/. The leading underscore is deliberate:
+	# it cannot collide with a Next.js route, so the catch-all never has to
+	# know this path exists.
+	@kafka_ui path /_kafka-ui /_kafka-ui/*
+	handle @kafka_ui {
+		encode zstd gzip
+
+		reverse_proxy kafka-ui:8080 {
+			transport http {
+				dial_timeout 5s
+				# A cold JVM answering its first request is slow; this is not
+				# the API and does not deserve the API's 30s.
+				response_header_timeout 60s
+			}
+
+			header_up X-Request-Id {http.request.uuid}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# ---- Grafana  ->  grafana:3000  (obs compose profile) -------------------
+	# GF_SERVER_SERVE_FROM_SUB_PATH makes Grafana mount itself at the path
+	# component of GF_SERVER_ROOT_URL, so the prefix is PRESERVED. Stripping
+	# it here would break every generated asset URL.
+	#
+	# Grafana Live is a WebSocket at /grafana/api/live/ws. reverse_proxy
+	# upgrades it transparently; `encode` only matches text/json content
+	# types, so it never touches the 101 response.
+	@grafana path /grafana /grafana/*
+	handle @grafana {
+		encode zstd gzip
+
+		reverse_proxy grafana:3000 {
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 60s
+			}
+
+			header_up X-Request-Id {http.request.uuid}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# ---- Prometheus  ->  prometheus:9090  (obs compose profile) -------------
+	# THE ONE ROUTE THAT STRIPS. Paired with `--web.route-prefix=/` in
+	# compose.obs.yaml; the two are meaningless apart. handle_path is the
+	# prefix-stripping form of handle.
+	#
+	# /prometheus (no trailing slash) is redirected rather than proxied,
+	# because a bare prefix is not matched by `/prometheus/*` and would
+	# otherwise fall through to the Next.js catch-all.
+	#
+	# Note this also exposes Prometheus's own /metrics as /prometheus/metrics.
+	# That is not a leak worth closing: anyone who can open this UI can query
+	# every metric in the TSDB anyway. The public /metrics deny in Route 0
+	# still stands, and it is what Route 0 is actually about.
+	@prometheus path /prometheus /prometheus/*
+	handle @prometheus {
+		redir /prometheus /prometheus/ 308
+
+		handle_path /prometheus/* {
+			encode zstd gzip
+
+			reverse_proxy prometheus:9090 {
+				transport http {
+					dial_timeout 5s
+					response_header_timeout 60s
+				}
+
+				header_up X-Request-Id {http.request.uuid}
+				header_up X-Real-IP {remote_host}
+			}
+		}
+	}
+
+	# ---- Jaeger  ->  jaeger:16686  (obs compose profile) --------------------
+	# QUERY_BASE_PATH=/jaeger makes jaeger-query serve its UI and its assets
+	# under /jaeger, so the prefix is PRESERVED. Unlike Grafana and kafka-ui
+	# it does not redirect the bare prefix itself, so that redirect is done
+	# here.
+	@jaeger path /jaeger /jaeger/*
+	handle @jaeger {
+		redir /jaeger /jaeger/ 308
+
+		encode zstd gzip
+
+		reverse_proxy jaeger:16686 {
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 60s
+			}
+
+			header_up X-Request-Id {http.request.uuid}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# =========================================================================
+	#  Route 4 — everything else  ->  web:3000   (Next.js)
+	# =========================================================================
+	handle {
+		encode zstd gzip
+
+		reverse_proxy {
+			lb_policy round_robin
+			lb_retries 2
+
+			dynamic a {
+				name web
+				port 3000
+				refresh 5s
+			}
+
+			fail_duration 10s
+			max_fails 3
+			unhealthy_status 5xx
+
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 30s
+				keepalive 90s
+			}
+
+			header_up X-Request-Id {http.request.uuid}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# =========================================================================
+	#  Errors
+	# =========================================================================
+	#  JSON for API clients, plain text for everyone else. No stack traces, no
+	#  upstream identity, nothing that describes the internal topology.
+	# =========================================================================
+	handle_errors {
+		@api path /api/*
+		header @api Content-Type "application/json"
+		respond @api `{"error":{"status":{err.status_code},"message":"{err.status_text}"}}` {err.status_code}
+
+		header Content-Type "text/plain; charset=utf-8"
+		respond "{err.status_code} {err.status_text}" {err.status_code}
+	}
+}
+
+# -----------------------------------------------------------------------------
+#  Internal health listener — :2021
+# -----------------------------------------------------------------------------
+#  NOT published to the host. Exists so the compose healthcheck (and the
+#  Kubernetes liveness/readiness probes on the ingress pod) has a plain-HTTP
+#  target that does not have to negotiate the internal CA's certificate.
+#
+#  Strict: /healthz is the only path that exists. Everything else is 404,
+#  including anything that might otherwise leak through this listener.
+#
+#  Bound to all interfaces rather than 127.0.0.1 on purpose: a Kubernetes
+#  kubelet probe connects to the pod IP, not to loopback, so loopback-only
+#  would work in compose and silently fail in the cluster — exactly the
+#  compose/k8s drift CLAUDE.md §9 says this file exists to prevent. The body
+#  is a constant "ok", so exposing it on the internal network leaks nothing.
+#
+#  Compose healthcheck (proxy service, owned by the compose agent):
+#      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:2021/healthz"]
+#      interval: 10s
+#      timeout: 3s
+#      retries: 5
+#      start_period: 5s
+# -----------------------------------------------------------------------------
+:2021 {
+	# Probe traffic every 10s would otherwise drown the real access log.
+	log {
+		output discard
+	}
+
+	handle /healthz {
+		header Content-Type "text/plain; charset=utf-8"
+		header Cache-Control "no-store"
+		header -Server
+		respond "ok" 200
+	}
+
+	handle {
+		respond 404
+	}
+}

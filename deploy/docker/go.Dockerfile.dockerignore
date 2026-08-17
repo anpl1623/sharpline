@@ -1,0 +1,175 @@
+# =============================================================================
+#  Build-context exclusions for deploy/docker/go.Dockerfile — and ONLY for it.
+#
+#  THE FILENAME IS THE MECHANISM. Do not rename it.
+#  ------------------------------------------------
+#  BuildKit looks for the ignore file in exactly two places:
+#
+#      1. <dockerfile-path>.dockerignore   <- THIS FILE, and it wins outright
+#      2. <context-root>/.dockerignore     <- /.dockerignore, the fallback
+#
+#  Because every Go build passes the repository ROOT as its context while
+#  pointing --file at deploy/docker/go.Dockerfile, the only per-Dockerfile name
+#  BuildKit will read is `go.Dockerfile.dockerignore` sitting beside
+#  `go.Dockerfile`. A file named `deploy/docker/.dockerignore` is DEAD — it is
+#  never consulted for a root context, for any Dockerfile. That dead file
+#  previously existed here and has been removed; this is its live replacement.
+#
+#  "Wins outright" means REPLACES, not merges: when this file is present,
+#  /.dockerignore is not read at all for this build. So every exclusion the root
+#  file provides is repeated below. Keep the two in sync — a secret pattern
+#  dropped from here is not covered by the root file.
+#
+#  WHAT THE GO BUILD ACTUALLY NEEDS
+#  --------------------------------
+#  go.Dockerfile does `COPY go.mod go.su[m] ./` then `COPY . .`, and builds
+#  ./cmd/${SERVICE}. The compiler reads exactly:
+#
+#      go.mod  go.sum  cmd/  internal/  pkg/  migrations/
+#
+#  `migrations/` is in that list on purpose: the `migrate` binary embeds the
+#  goose SQL via go:embed, so excluding it turns a working build into a
+#  confusing embed error. Do not "optimize" it away.
+#
+#  Everything else in the tree is pure cost, and the expensive half of that cost
+#  is not transfer bytes — it is cache invalidation. `COPY . .` hashes the whole
+#  context, so without this file a one-character edit in web/src busts the Go
+#  layer cache and recompiles all six services. That is the bug this file fixes.
+# =============================================================================
+
+
+# ── Version control and CI metadata ──────────────────────────────────────────
+# .git changes on every commit and would re-key the context on every build.
+# Safe: go.Dockerfile passes -buildvcs=false, so the toolchain never reads it.
+.git
+.gitignore
+.gitattributes
+.github
+
+
+# ── Frontend — the single largest tree, and never compiled by Go ─────────────
+# This is the entry that stops a Next.js edit from recompiling the backend.
+web
+
+
+# ── Deployment and infra — read by docker/compose/helm/terraform, not by Go ──
+# Note this excludes go.Dockerfile itself and this very file. That is correct
+# and intentional: the Dockerfile reaches the builder over BuildKit's separate
+# dockerfile channel, not through the build context.
+deploy
+flink
+
+
+# ── Docs, notebooks, and the non-serving-path tiers ──────────────────────────
+# CLAUDE.md §2 keeps Python out of the serving path; §10 runs each test tier as
+# its own container against its own context. `test/` (testcontainers) and `e2e/`
+# (Playwright) reach the code through the /workspace bind mount in
+# compose.tools.yaml, never through a service image build context.
+docs
+analysis
+e2e
+load
+test
+*.md
+
+# ── Repo-root files the Go toolchain never opens ─────────────────────────────
+# The Makefile is ~30kB of docker invocations and changes often; leaving it in
+# the context means every Makefile edit re-keys `COPY . .` and recompiles all
+# six services for nothing. The ignore files are inputs to BuildKit, which reads
+# them over its own channel, not out of the context.
+Makefile
+.dockerignore
+*.dockerignore
+
+
+# ── Secrets ──────────────────────────────────────────────────────────────────
+# Anything in the context is readable by every build stage and can be baked into
+# a layer by an over-broad COPY — and `COPY . .` is exactly that.
+#
+# Note there is NO `!.env.example` re-include here, unlike /.dockerignore: the Go
+# build has no use for the template either, so the whole `.env*` family stays
+# out. Verified before this file existed, the unpruned context shipped the real
+# `.env` — with the Postgres password, the JWT signing key and ODDS_API_KEY in
+# it — into every one of the six service builds.
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+secrets/
+secrets.yaml
+*.dec.yaml
+kubeconfig
+kubeconfig.*
+
+
+# ── Host-produced build output ───────────────────────────────────────────────
+# Builds happen in containers (prime directive). None of this should exist on
+# the host; excluding it means a stray host `go build` cannot leak a host-arch
+# binary into a distroless image.
+bin/
+dist/
+build/
+out/
+vendor/
+**/node_modules
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+__debug_bin*
+coverage.out
+coverage.*
+cover.html
+*.prof
+*.pprof
+
+
+# ── Terraform state (belt and braces; deploy/ is already excluded above) ─────
+**/.terraform
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+crash.log
+crash.*.log
+
+
+# ── Python bytecode and virtualenvs ──────────────────────────────────────────
+**/__pycache__
+*.py[cod]
+.venv
+venv
+.ipynb_checkpoints
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+
+# ── Local runtime scratch ────────────────────────────────────────────────────
+*.log
+tmp/
+.tmp/
+.cache/
+
+
+# ── Editor and OS noise ──────────────────────────────────────────────────────
+.vscode
+.idea
+*.iml
+*.swp
+*.swo
+*~
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.AppleDouble
+.LSOverride
+ehthumbs.db
+Thumbs.db
+desktop.ini

@@ -1,1 +1,150 @@
-CLAUDE.md
+# ── Secrets ──────────────────────────────────────────────────────────────────
+# .env holds the real API key, DB password, and JWT signing key. Only the
+# committed template `.env.example` belongs in git.
+#
+# Order is load-bearing: `.env.*` matches `.env.example`, so the negation MUST
+# come after it. Reordering these three lines silently stops the template from
+# being committable.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!deploy/**/*.key.example
+secrets.yaml
+*.dec.yaml
+
+# ── Go ───────────────────────────────────────────────────────────────────────
+# Build output. Builds happen in a container; nothing here should ever exist on
+# the host, but a stray host `go build` must not be committable.
+/bin/
+/dist/
+/build/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+__debug_bin*
+vendor/
+
+# Coverage and profiling output
+*.out
+coverage.*
+cover.html
+*.prof
+*.pprof
+
+# ── Node / Next.js ───────────────────────────────────────────────────────────
+# node_modules and .next live on named Docker volumes, never on the host
+# (CLAUDE.md §7). If they appear on the host, someone ran npm outside a
+# container — that is the failure mode this repo exists to prevent.
+web/node_modules/
+web/.next/
+web/out/
+web/.turbo/
+web/next-env.d.ts
+node_modules/
+.next/
+.npm/
+.pnpm-store/
+*.tsbuildinfo
+
+# ── Playwright / e2e ─────────────────────────────────────────────────────────
+e2e/test-results/
+e2e/playwright-report/
+e2e/blob-report/
+e2e/.cache/
+playwright/.auth/
+
+# ── Terraform ────────────────────────────────────────────────────────────────
+# State can contain secrets in plaintext. Lockfiles ARE committed.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# ── Kubernetes / Helm ────────────────────────────────────────────────────────
+deploy/helm/charts/
+deploy/helm/*.tgz
+kubeconfig
+kubeconfig.*
+
+# ── Python (Locust load tests, analysis/ notebooks) ──────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+analysis/data/
+
+# ── Load test output ─────────────────────────────────────────────────────────
+load/reports/
+*_stats.csv
+*_stats_history.csv
+*_failures.csv
+
+# ── Local runtime scratch ────────────────────────────────────────────────────
+*.log
+tmp/
+.tmp/
+.cache/
+
+# ── Editors ──────────────────────────────────────────────────────────────────
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# ── OS junk ──────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.AppleDouble
+.LSOverride
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ── Deliberately NOT ignored (regression guard) ──────────────────────────────
+#
+# CLAUDE.md — the project charter — IS COMMITTED. An earlier revision of this
+# file ignored it on line 1. That was wrong; do not reinstate it. The charter is
+# referenced by README.md, by every ADR under docs/adr/, and by the
+# `org.opencontainers.image.documentation` OCI label that
+# deploy/docker/go.Dockerfile stamps into all six service images — that label
+# points at the file's GitHub URL, which would 404 forever if the file could
+# never be committed. If a charter revision ever contains something that must
+# not be public, redact the charter; do not hide it from git.
+#
+# .env.example — the committed, non-secret environment template. The `.env.*`
+# pattern in the Secrets block above matches it, so the `!.env.example` negation
+# must stay AFTER that pattern. Reordering those three lines silently stops the
+# template from being committable, which breaks the documented quickstart
+# (`cp .env.example .env`).
+#
+# .dockerignore (repo root) and deploy/docker/go.Dockerfile.dockerignore — both
+# are build inputs and both are committed. Nothing here should ever match them.
+#
+# Verify all four with:  git add --dry-run CLAUDE.md .env.example .dockerignore \
+#                            deploy/docker/go.Dockerfile.dockerignore
+# and confirm .env is still refused:  git check-ignore -v .env

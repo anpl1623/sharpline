@@ -1,0 +1,285 @@
+# Sharpline — observability stack. Layer ON TOP of compose.yaml, never alone.
+#
+#   docker compose --env-file .env --profile obs \
+#     -f deploy/compose/compose.yaml -f deploy/compose/compose.obs.yaml up
+#
+# CLAUDE.md §9 puts this behind "their own compose profile" and §8 puts it in its own
+# file — both are honoured, so it takes BOTH the extra -f AND `--profile obs` to start
+# anything here. Off by default: `docker compose up` on the base file alone brings up a
+# working system with no collector, no Prometheus, no Grafana, no Jaeger.
+#
+# Adding this overlay also points every Go service at the collector by setting
+# SHARPLINE_OTEL_ENDPOINT (empty in the base file = telemetry export disabled).
+#
+# No host ports here either. Grafana, Prometheus and Jaeger are reachable only through
+# the proxy, at /grafana, /prometheus and /jaeger.
+
+name: sharpline
+
+x-obs-logging: &obs-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  # ---- collector ----------------------------------------------------------------------
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest@sha256:c5918f78992ee73b0d6f0e599423ac5ec52dd5d9726733114d6eca53d5a32ed5
+    profiles:
+      - obs
+    restart: unless-stopped
+    command:
+      - --config=/etc/otelcol-contrib/config.yaml
+    environment:
+      # REQUIRED. deploy/observability/otel-collector.yaml sets the
+      # `deployment.environment` resource attribute to ${env:SHARPLINE_ENV}. If this is
+      # unset the value expands to empty, the resource processor rejects the attribute
+      # ("Either field value, from_attribute, from_context, or default_value must be
+      # specified") and the collector crash-loops on startup. Verified by observing
+      # exactly that failure before this line existed.
+      SHARPLINE_ENV: ${SHARPLINE_ENV:-local}
+    volumes:
+      # create_host_path: false — fail loudly if the config is missing rather than let
+      # Docker silently create a directory where a file belongs.
+      - type: bind
+        source: ../observability/otel-collector.yaml
+        target: /etc/otelcol-contrib/config.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+    # OTLP gRPC 4317 / OTLP HTTP 4318 — internal only.
+    #
+    # NO healthcheck, despite otel-collector.yaml exposing the health_check extension on
+    # :13133 and annotating it "compose healthcheck target". That is not reachable from
+    # here: this image is distroless — it contains no shell, no wget and no curl, so
+    # `docker run --entrypoint sh` fails with "executable file not found". A container
+    # healthcheck can only run a binary that exists inside the image. Same constraint as
+    # the Go services on distroless/static. :13133 is still useful from another
+    # container, and it becomes a real HTTP liveness/readiness probe under Kubernetes,
+    # where the kubelet performs the GET rather than the container itself.
+    depends_on:
+      jaeger:
+        condition: service_started
+    # CLAUDE.md §9 hardening, matching the six Go services. The collector's pipeline is
+    # receivers -> processors -> exporters entirely in memory: no queue is persisted to
+    # disk, no extension writes a file, and the config is mounted read-only. Nothing in
+    # it needs a writable filesystem, so this needs no tmpfs carve-out at all.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - sharpline
+    logging: *obs-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+
+  # ---- metrics ------------------------------------------------------------------------
+
+  prometheus:
+    image: prom/prometheus:latest@sha256:508729e0e2d18e11fd742a5a5ca70e557b940a93948c3c95fd0123a6fd538b69
+    profiles:
+      - obs
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}
+      - --web.enable-lifecycle
+      # external-url makes generated links/redirects absolute behind the proxy...
+      - --web.external-url=${PROMETHEUS_EXTERNAL_URL:-http://localhost/prometheus}
+      # ...but route-prefix is pinned back to "/" ON PURPOSE. It otherwise defaults to
+      # the PATH of external-url, which would move every endpoint under /prometheus —
+      # including /metrics, breaking the `job_name: prometheus` self-scrape in
+      # deploy/observability/prometheus.yml, which targets localhost:9090 with the
+      # default metrics_path. With route-prefix=/ the proxy must STRIP the prefix
+      # (Caddy `handle_path /prometheus/*`), which is the documented pairing.
+      - --web.route-prefix=/
+    volumes:
+      - type: bind
+        source: ../observability/prometheus.yml
+        target: /etc/prometheus/prometheus.yml
+        read_only: true
+        bind:
+          create_host_path: false
+      # deploy/observability/prometheus.yml declares `rule_files: /etc/prometheus/rules/*.yml`.
+      # Without this mount the glob matches nothing, Prometheus starts happily, and every
+      # alert rule in deploy/observability/rules/ is silently absent — including the
+      # odds-staleness SLO alert, which CLAUDE.md §9 calls the headline SLO.
+      - type: bind
+        source: ../observability/rules
+        target: /etc/prometheus/rules
+        read_only: true
+        bind:
+          create_host_path: false
+      - prometheus-data:/prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:9090/-/healthy || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    # All of Prometheus' writes go to the TSDB path, which is the named volume above;
+    # both config mounts are already read-only. The only other thing it touches is
+    # /tmp, hence the one carve-out.
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - sharpline
+    logging: *obs-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+
+  # ---- dashboards ---------------------------------------------------------------------
+
+  grafana:
+    image: grafana/grafana:latest@sha256:ab5cb380e3ff3172d6c8bd2e7cfd31cce977d2881b260e1f5bc089bf0b759b43
+    profiles:
+      - obs
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-sharpline-dev-grafana}
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost/grafana}
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+    volumes:
+      - grafana-data:/var/lib/grafana
+      # Datasources, dashboard providers and alert rules are provisioned from disk and
+      # owned by Terraform / the repo — never hand-clicked in the UI (CLAUDE.md §9).
+      - type: bind
+        source: ../observability/grafana/provisioning
+        target: /etc/grafana/provisioning
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../observability/grafana/dashboards
+        target: /var/lib/grafana/dashboards
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      # path is prefixed because GF_SERVER_SERVE_FROM_SUB_PATH is on; keep it in sync
+      # with the path component of GRAFANA_ROOT_URL.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3000/grafana/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    # Grafana's own state — the SQLite database, the plugin directory, the PNG render
+    # cache — all lives under /var/lib/grafana, which is the named volume above. The
+    # two paths outside it that it still writes are carved out as tmpfs rather than
+    # leaving the whole root filesystem writable.
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+      # GF_PATHS_LOGS defaults here. Logging is to console in a container, but Grafana
+      # creates the directory on startup regardless and fails if it cannot.
+      - /var/log/grafana:rw,noexec,nosuid,nodev,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - sharpline
+    logging: *obs-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+
+  # ---- traces -------------------------------------------------------------------------
+
+  jaeger:
+    # Jaeger v1 line (all-in-one, in-memory span store). Deliberately NOT
+    # jaegertracing/jaeger (v2) — different entrypoint and config format; swapping
+    # needs an ADR. CLAUDE.md §9 names all-in-one.
+    image: jaegertracing/all-in-one:latest@sha256:ab6f1a1f0fb49ea08bcd19f6b84f6081d0d44b364b6de148e1798eb5816bacac
+    profiles:
+      - obs
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      SPAN_STORAGE_TYPE: memory
+      MEMORY_MAX_TRACES: ${JAEGER_MAX_TRACES:-50000}
+      # served from behind the proxy at /jaeger
+      QUERY_BASE_PATH: /jaeger
+    # In-memory storage on purpose: nothing here is persistent state, so there is no
+    # named volume and no `docker compose down -v` obligation.
+    #
+    # That same property is what makes read_only trivially safe here: with
+    # SPAN_STORAGE_TYPE=memory the span store is a Go map, and all-in-one writes no
+    # badger files, no index and no config. /tmp is carved out only because the Go
+    # runtime and the query UI's static handler may reach for it.
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - sharpline
+    logging: *obs-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+
+  # ---- wire the application into the collector ----------------------------------------
+  #
+  # These are overrides of services defined in compose.yaml, not new services. They stay
+  # out of the `obs` profile on purpose: the application must keep running whether or not
+  # the observability stack is up.
+
+  api:
+    environment:
+      SHARPLINE_OTEL_ENDPOINT: ${SHARPLINE_OTEL_ENDPOINT:-otel-collector:4317}
+
+  ingest:
+    environment:
+      SHARPLINE_OTEL_ENDPOINT: ${SHARPLINE_OTEL_ENDPOINT:-otel-collector:4317}
+
+  pricer:
+    environment:
+      SHARPLINE_OTEL_ENDPOINT: ${SHARPLINE_OTEL_ENDPOINT:-otel-collector:4317}
+
+  stream:
+    environment:
+      SHARPLINE_OTEL_ENDPOINT: ${SHARPLINE_OTEL_ENDPOINT:-otel-collector:4317}
+
+  settle:
+    environment:
+      SHARPLINE_OTEL_ENDPOINT: ${SHARPLINE_OTEL_ENDPOINT:-otel-collector:4317}
+
+  migrate:
+    environment:
+      SHARPLINE_OTEL_ENDPOINT: ${SHARPLINE_OTEL_ENDPOINT:-otel-collector:4317}
+
+volumes:
+  prometheus-data:
+  grafana-data:
