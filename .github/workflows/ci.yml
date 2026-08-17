@@ -194,6 +194,8 @@ jobs:
             lint \
             test-race \
             cover \
+            tidy-check \
+            codegen-check \
             vuln \
             migrate-dry-run \
             buildx-multiarch \
@@ -370,6 +372,33 @@ jobs:
       - run: make cover
 
   # ---------------------------------------------------------------------------
+  # Generated-artefact drift  --  the two gates that fail on a COMMITTED file
+  # rather than on code, which is why they are a job and not a step of `lint`.
+  #
+  # `make tidy-check` runs `go mod tidy -diff`: it computes what tidy would change
+  # and exits non-zero on a non-empty diff, writing nothing.
+  #
+  # `make codegen-check` runs `sqlc diff`, which regenerates
+  # internal/platform/postgres/gen in memory and compares. Without this job,
+  # committed generated code can drift from migrations/ silently: `make check`
+  # catches it locally, but nothing stopped a PR that edited a migration and
+  # forgot `make codegen`. The OpenAPI half is a self-arming tripwire -- it passes
+  # while no spec exists and starts failing the moment phase 5 lands one outside
+  # this gate.
+  #
+  # Both are pure `docker run`, need no setup action, and take seconds.
+  # ---------------------------------------------------------------------------
+  generated:
+    name: tidy + codegen drift
+    needs: [directive]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: make tidy-check
+      - run: make codegen-check
+
+  # ---------------------------------------------------------------------------
   # govulncheck
   # ---------------------------------------------------------------------------
   vuln:
@@ -497,7 +526,7 @@ jobs:
   ci:
     name: ci
     if: always()
-    needs: [directive, lint, test, coverage, vuln, migrate-dry-run, build, scan]
+    needs: [directive, lint, test, coverage, generated, vuln, migrate-dry-run, build, scan]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

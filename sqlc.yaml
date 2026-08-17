@@ -1,0 +1,376 @@
+# =============================================================================
+# sqlc -- SQL -> typed Go, generated from the REAL migrations
+# =============================================================================
+#
+# CLAUDE.md section 8 lists sqlc in the `tools` image; section 9 lists codegen as
+# a make target. Run it with `make codegen-sqlc` (or `make codegen`), never with a
+# host `sqlc` -- the binary lives in deploy/docker/tools.Dockerfile, pinned to
+# v1.31.1, and the prime directive has no exception for code generators.
+#
+# The generated code is COMMITTED (internal/platform/postgres/gen). `make build`
+# therefore has no codegen step, and `make codegen-check` regenerates into a
+# throwaway copy and fails on any diff -- that pair is what keeps committed
+# generated code from silently drifting from the schema.
+#
+# -----------------------------------------------------------------------------
+# WHY `schema:` POINTS AT migrations/ AND NOT AT A HAND-KEPT schema.sql
+# -----------------------------------------------------------------------------
+# A separate schema file is a second definition of the same truth, and the two
+# only have to disagree once. Pointing sqlc at the migration set means the types
+# it emits are derived from the DDL that actually runs against Postgres, so a
+# column that changed in migration 00008 cannot keep its old Go type.
+#
+# sqlc strips each file's rollback half before parsing (it recognises goose's
+# `-- +goose Down` annotation), so the DROPs in these migrations do not undo the
+# CREATEs while the catalogue is being built. TimescaleDB's function calls --
+# `SELECT create_hypertable(...)`, `SELECT add_compression_policy(...)` -- are
+# plain SELECT statements, which sqlc's catalogue builder ignores; that is why
+# `prices` and `audit_log` are visible here as ordinary tables even though they
+# are hypertables in the database. Verified: `sqlc generate` parses all seven
+# migrations with no diagnostics.
+#
+# -----------------------------------------------------------------------------
+# TYPE OVERRIDES ARE THE POINT OF THIS FILE
+# -----------------------------------------------------------------------------
+# Phase 1 gave every entity its own identifier type -- MarketID, EventID,
+# SelectionID are distinct types over string, not aliases -- precisely so that
+#
+#     func priceKey(domain.EventID) string
+#     priceKey(someMarketID)   // does not compile
+#
+# is a compile error rather than a mis-keyed compacted Kafka record (phase 3) or
+# a WebSocket subscription routed to the wrong channel (phase 6). Both of those
+# call sites read their identifiers OUT OF THIS DATABASE. If codegen emitted raw
+# strings, the guarantee would die at exactly the boundary it exists to protect.
+#
+# So every identifier column is overridden to its domain type, every money column
+# to `domain.Money`, and every decimal-odds column to `odds.Decimal`.
+#
+# This works because pgx resolves a scan/encode plan through a named type's
+# UNDERLYING kind: `domain.SelectionID` is `string`, `domain.Money` is `int64`,
+# `odds.Decimal` is `float64`. No `sql.Scanner` or `driver.Valuer` is needed, so
+# internal/domain keeps its zero-dependency purity guard (its own test forbids a
+# non-stdlib import) and stays unaware that a database exists.
+#
+# Reading a value straight into a domain type bypasses that type's constructor,
+# and that is safe here rather than sloppy: the CHECK constraints in migrations
+# 00003 and 00006 are the SAME bounds the constructors enforce -- amount columns
+# are bounded to +/-9007199254740991, which is domain.MaxSafeMoney (2^53-1), and
+# decimal_odds to (1.0, 100000.0], which is domain.MinDecimalOdds exclusive and
+# MaxDecimalOdds inclusive. A row that could fail the constructor cannot be
+# stored in the first place.
+#
+# THE THREE PLACES A RAW TYPE SURVIVES, each deliberate:
+#
+#   1. Enum columns are `string`.
+#      Migration 00001 stores every enum as TEXT + a named CHECK rather than as a
+#      native PostgreSQL enum (for CLAUDE.md section 12 reversibility -- a native
+#      enum has no DROP VALUE), so there are zero user-defined types in the
+#      database and sqlc sees plain text.
+#      The domain enums are all `uint8` (MarketType, WagerStatus, AccountKind,
+#      ...), so pgx cannot map TEXT onto them: the underlying kind is numeric and
+#      the wire value is 'moneyline'. They are NOT overridden.
+#      THE BOUNDARY: convert with the domain's existing parsers --
+#      domain.ParseMarketType, ParseMarketStatus, ParseSelectionRole,
+#      ParseEventKind, ParseEventStatus, ParseBookKind, ParseWagerKind,
+#      ParseWagerStatus, ParseLegStatus, ParseAccountKind, ParseEntryKind -- each
+#      of which returns an error for an unrecognised value, so a schema/Go
+#      divergence surfaces as a wrapped error at the read, not as a silent
+#      zero value. Write the other direction with the enum's String().
+#      Note the one gap: `wagers.rounding` has no domain.ParseRounding. See the
+#      phase-2b handoff note.
+#
+#   2. `line` columns (markets.line, prices.line, legs.price_line,
+#      legs.teased_line) are `pgtype.Float8`, not `domain.Line`.
+#      domain.Line is a struct with UNEXPORTED fields {value, present}, so pgx
+#      cannot construct one. pgtype.Float8{Float64, Valid} is the same shape --
+#      Valid is Line.Present() -- which makes the conversion mechanical:
+#      absent -> domain.NoLine(), present -> domain.NewLine(v).
+#      This is also why `emit_pointers_for_null_types` is left FALSE: for a
+#      nullable scalar, pgtype's explicit Valid flag mirrors the domain's own
+#      presence flags better than a pointer does, and needs no nil check.
+#
+#   3. Array parameters (`= ANY($1::TEXT[])`) are `[]string`.
+#      sqlc attributes a SCALAR parameter to the column it is compared against and
+#      applies that column's override -- which is why every insert parameter below
+#      comes out domain-typed. An explicitly cast ARRAY parameter takes its type
+#      from the CAST instead, so no column override reaches it.
+#
+#      `sqlc.slice()` DOES pick up the column override and would emit
+#      []domain.SelectionID, and it is nevertheless unusable here. On engine
+#      postgresql + sql_package pgx/v5, v1.31.1 emits `WHERE selection_id IN ($1)`
+#      and binds the whole slice to that one placeholder, with none of the
+#      placeholder expansion the feature needs. Measured against a live server, the
+#      failure is client-side in pgx, before a round trip:
+#
+#          failed to encode args[0]: unable to encode []SelectionID{"a","b"}
+#          into text format for text (OID 25): cannot find encode plan
+#
+#      THE LIMITATION IS SQLC'S SIGNATURE, NOT PGX. Also measured: pgx encodes a
+#      []SelectionID into a text[] parameter without complaint, so
+#      `= ANY($1::TEXT[])` would accept the domain-typed slice if the generated
+#      signature asked for one. The []string is a signature adapter, not a
+#      semantic conversion.
+#
+#      THE BOUNDARY: two one-line adapters belong next to the pool, in
+#      internal/platform/postgres (the package, not this generated subpackage):
+#          func selectionIDArgs(ids []domain.SelectionID) []string
+#          func marketIDArgs(ids []domain.MarketID) []string
+#      Per-type rather than one generic `[T ~string]` helper, deliberately: a
+#      generic one would accept a []MarketID where selection ids are wanted, which
+#      is the exact substitution the distinct types exist to refuse. Nothing
+#      outside that package should build the []string itself.
+#
+# -----------------------------------------------------------------------------
+# ADDING A QUERY
+# -----------------------------------------------------------------------------
+# `queries:` is an explicit FILE LIST, not a directory glob. That is deliberate:
+# it makes the query set reviewable in one place, and a stray .sql file dropped
+# into the queries directory cannot silently become part of the compiled surface.
+# Adding a file means adding a line here. It is also what lets
+# queries/plans/explain.sql exist -- that file is an EXPLAIN harness for
+# `make query-plans`, not a sqlc input, and it must never be listed below.
+# =============================================================================
+
+version: "2"
+
+sql:
+  - engine: postgresql
+    schema: migrations
+
+    queries:
+      - internal/platform/postgres/queries/catalogue.sql
+      - internal/platform/postgres/queries/prices.sql
+      - internal/platform/postgres/queries/betting.sql
+
+    gen:
+      go:
+        package: gen
+        out: internal/platform/postgres/gen
+
+        # pgx v5, pure Go, no cgo. CLAUDE.md section 9 requires CGO_ENABLED=0 for
+        # the distroless image; the same constraint that forces franz-go over
+        # confluent-kafka-go forces pgx over anything binding libpq.
+        sql_package: pgx/v5
+
+        # CLAUDE.md section 12: "Interfaces are declared by the consumer, not the
+        # producer." A generated `Querier` interface in the producing package is
+        # exactly the inversion that forbids, and it would have to list every
+        # query whether a consumer wanted it or not. Consumers declare their own
+        # narrow interfaces over *gen.Queries.
+        emit_interface: false
+
+        # A :many with no rows returns an empty slice, never nil. The API layer
+        # serialises these; a nil slice becomes JSON `null` where `[]` is meant.
+        emit_empty_slices: true
+
+        # No JSON tags. The wire shape is the API layer's contract (phase 5,
+        # OpenAPI), not the table shape -- tagging generated row structs is how a
+        # column rename becomes a breaking API change.
+        emit_json_tags: false
+
+        # Only emit structs some query actually uses. Without this, sqlc emits a
+        # model struct for all 21 tables and both views, most of them dead code.
+        omit_unused_structs: true
+
+        emit_prepared_queries: false
+        emit_pointers_for_null_types: false
+
+        rename:
+          # sqlc's initialism list covers `id` -> ID but not the plural in a
+          # parameter name, which would otherwise be `SelectionIds`.
+          selection_ids: "SelectionIDs"
+          market_ids: "MarketIDs"
+
+        overrides:
+          # -------------------------------------------------------------------
+          # Timestamps. sqlc's pgx/v5 mapping sends even a NOT NULL timestamptz
+          # to pgtype.Timestamptz; for a column that cannot be null, the Valid
+          # and InfinityModifier fields are noise, and every domain constructor
+          # takes a time.Time. Nullable timestamptz keeps pgtype.Timestamptz --
+          # see note 2 above on why absence is a flag here and not a pointer.
+          # -------------------------------------------------------------------
+          - db_type: "timestamptz"
+            go_type: "time.Time"
+
+          # -------------------------------------------------------------------
+          # Identifiers. Every one of these is a distinct type over string in
+          # internal/domain, and that distinctness is the whole point (see the
+          # header). Nullable identifier columns become pointers, because there
+          # is no pgtype that can carry a domain type and the type matters more
+          # here than the presence-flag symmetry does.
+          # -------------------------------------------------------------------
+          - column: "sports.id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.SportID"
+          - column: "sports.slug"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.Slug"
+
+          - column: "leagues.id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.LeagueID"
+          - column: "leagues.sport_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.SportID"
+          # The `league:{slug}` subscription key of CLAUDE.md section 5. Typed so
+          # a channel cannot be built from an event name by accident.
+          - column: "leagues.slug"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.Slug"
+
+          - column: "books.id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.BookID"
+          - column: "books.slug"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.Slug"
+
+          - column: "events.id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.EventID"
+          - column: "events.league_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.LeagueID"
+          - column: "events.home_competitor_id"
+            nullable: true
+            go_type:
+              import: "github.com/anpl1623/sharpline/internal/domain"
+              type: "CompetitorID"
+              pointer: true
+          - column: "events.away_competitor_id"
+            nullable: true
+            go_type:
+              import: "github.com/anpl1623/sharpline/internal/domain"
+              type: "CompetitorID"
+              pointer: true
+
+          - column: "markets.id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.MarketID"
+          - column: "markets.event_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.EventID"
+
+          - column: "selections.id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.SelectionID"
+          - column: "selections.market_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.MarketID"
+
+          - column: "prices.selection_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.SelectionID"
+          - column: "prices.book_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.BookID"
+
+          - column: "users.id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.UserID"
+          - column: "user_totp.user_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.UserID"
+          - column: "refresh_token_families.user_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.UserID"
+          - column: "user_limits.user_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.UserID"
+
+          - column: "round_robins.id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.RoundRobinID"
+          - column: "round_robins.user_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.UserID"
+          - column: "round_robin_sizes.round_robin_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.RoundRobinID"
+
+          - column: "wagers.id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.WagerID"
+          - column: "wagers.user_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.UserID"
+          - column: "wagers.round_robin_id"
+            nullable: true
+            go_type:
+              import: "github.com/anpl1623/sharpline/internal/domain"
+              type: "RoundRobinID"
+              pointer: true
+
+          - column: "legs.id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.LegID"
+          - column: "legs.wager_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.WagerID"
+          - column: "legs.event_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.EventID"
+          - column: "legs.market_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.MarketID"
+          - column: "legs.selection_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.SelectionID"
+          - column: "legs.price_book_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.BookID"
+
+          - column: "ledger_transactions.id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.TransactionID"
+          - column: "ledger_transactions.wager_id"
+            nullable: true
+            go_type:
+              import: "github.com/anpl1623/sharpline/internal/domain"
+              type: "WagerID"
+              pointer: true
+
+          - column: "ledger_entries.transaction_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.TransactionID"
+          - column: "ledger_entries.account_user_id"
+            nullable: true
+            go_type:
+              import: "github.com/anpl1623/sharpline/internal/domain"
+              type: "UserID"
+              pointer: true
+
+          - column: "market_suspensions.market_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.MarketID"
+
+          # account_balances is a VIEW, and sqlc types a view's columns from its
+          # definition, so it needs its own entries. account_user_id is nullable
+          # there (the house and issuance singletons have no owner); it is a
+          # GROUP BY key, so it is never null for a customer account.
+          - column: "account_balances.account_user_id"
+            nullable: true
+            go_type:
+              import: "github.com/anpl1623/sharpline/internal/domain"
+              type: "UserID"
+              pointer: true
+
+          # -------------------------------------------------------------------
+          # Money. BIGINT minor units -> domain.Money, which is int64-underlying
+          # but a DISTINCT type: an int64 variable cannot be passed where a
+          # stake is wanted. CLAUDE.md section 12 -- "All money and stake values
+          # are integer minor units. Floating point never touches a balance."
+          # -------------------------------------------------------------------
+          - column: "ledger_entries.amount_minor"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.Money"
+          # The derived balance. The view casts sum(bigint) back to BIGINT for
+          # exactly this reason: numeric would arrive in Go as a decimal string
+          # and force a parse onto the balance path.
+          - column: "account_balances.balance_minor"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.Money"
+
+          - column: "wagers.stake_minor"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.Money"
+          - column: "wagers.potential_payout_minor"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.Money"
+          - column: "wagers.potential_profit_minor"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.Money"
+          # NULL exactly while the ticket is still running (wagers_return_iff_terminal).
+          - column: "wagers.returned_minor"
+            nullable: true
+            go_type:
+              import: "github.com/anpl1623/sharpline/internal/domain"
+              type: "Money"
+              pointer: true
+          - column: "wagers.net_return_minor"
+            nullable: true
+            go_type:
+              import: "github.com/anpl1623/sharpline/internal/domain"
+              type: "Money"
+              pointer: true
+
+          - column: "round_robins.stake_per_combination_minor"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.Money"
+          - column: "user_limits.amount_minor"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.Money"
+
+          # -------------------------------------------------------------------
+          # Odds. DOUBLE PRECISION -> odds.Decimal, the canonical price type
+          # (phase 1 handoff: American and Fractional are DISPLAY formats,
+          # converted at the edge and discarded). Distinct from float64, so a
+          # bare float cannot be stored as a price.
+          # -------------------------------------------------------------------
+          - column: "prices.decimal_odds"
+            go_type: "github.com/anpl1623/sharpline/internal/domain/odds.Decimal"
+          - column: "legs.price_decimal"
+            go_type: "github.com/anpl1623/sharpline/internal/domain/odds.Decimal"
+          - column: "wagers.accepted_decimal"
+            go_type: "github.com/anpl1623/sharpline/internal/domain/odds.Decimal"

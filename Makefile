@@ -260,6 +260,48 @@ MIGRATE_DRYRUN_USER     ?= sharpline
 MIGRATE_DRYRUN_PASSWORD ?= throwaway-dry-run
 MIGRATE_DRYRUN_DB       ?= sharpline_dryrun
 MIGRATE_DRYRUN_WAIT     ?= 90
+
+# Codegen inputs. sqlc's own config lives at sqlc.yaml in the repo root (it is
+# found by name, so it is not repeated here); these are the paths the *Makefile*
+# has to reason about.
+#
+# OPENAPI_SPEC does not exist yet -- internal/httpapi is empty until phase 5 --
+# which is why `codegen-openapi` tests for it and `codegen-check-openapi` arms a
+# tripwire on its appearance.
+SQLC_GEN_DIR           ?= internal/platform/postgres/gen
+OPENAPI_SPEC           ?= internal/httpapi/openapi.yaml
+OPENAPI_CODEGEN_CONFIG ?= internal/httpapi/oapi-codegen.yaml
+
+# `query-plans` scaffolding. Deliberately NOT sharing the MIGRATE_DRYRUN_* names or
+# container names, so the two targets can run concurrently and neither can destroy
+# the other's database. Same reasoning otherwise: the network and the container are
+# created and destroyed by the target, credentials are throwaway by construction,
+# and nothing here can reach a real data plane.
+EXPLAIN_SQL          ?= internal/platform/postgres/queries/plans/explain.sql
+QUERY_PLANS_NET      ?= $(PROJECT)-query-plans-net
+QUERY_PLANS_PG       ?= $(PROJECT)-query-plans-pg
+QUERY_PLANS_USER     ?= sharpline
+QUERY_PLANS_PASSWORD ?= throwaway-query-plans
+QUERY_PLANS_DB       ?= sharpline_plans
+QUERY_PLANS_WAIT     ?= 90
+
+# THE ONLY RELATIONS A QUERY PLAN IS ALLOWED TO SEQUENTIALLY SCAN. An awk ERE,
+# anchored by the verdict step, so anything not named here -- including a `prices`
+# hypertable chunk, which appears as `_hyper_<n>_<n>_chunk` -- fails the target.
+#
+# The list is an allowlist rather than a denylist on purpose: a table added by a
+# future migration defaults to "must not be scanned", which is the safe direction.
+#
+# Why exactly these three. Their row counts are bounded by the catalogue, not by
+# time or traffic: how many sports a provider covers, how many leagues inside them,
+# how many sportsbooks are ingested -- tens, occupying one or two heap pages. For a
+# single-page table a sequential scan IS the optimal plan and the planner is right
+# to choose it; an assertion that calls that a failure is an assertion someone will
+# switch off. The indexes on those tables still earn their place: they serve the FK
+# RESTRICT checks that keep the catalogue spine from being deleted out from under
+# the price history.
+QUERY_PLANS_SEQSCAN_OK ?= sports|leagues|books
+
 PLATFORMS  ?= linux/amd64,linux/arm64
 BUILDX_BUILDER ?= $(PROJECT)-builder
 BUILDX_OUTPUT ?=
@@ -568,6 +610,41 @@ migrate-status: ## Show migration status (ad-hoc goose control)
 .PHONY: migrate-down
 migrate-down: ## Roll back the most recent migration (ad-hoc goose control)
 	$(COMPOSE_TOOLS) run --rm goose goose down
+
+# The four targets below drive the migrate BINARY, not the goose CLI, and that is
+# the point of them. `migrate-status` / `migrate-down` above reach for the tools
+# image because they predate the binary; these do not, so the thing CI and the
+# Helm hook run in production is the thing a developer exercises locally. CLAUDE.md
+# section 9: migrations are "never a binary someone runs by hand" -- so every one of
+# these is a container invocation of the same image the compose stack and the k8s
+# Job use.
+#
+# `validate` is the pre-flight: it refuses to run when the database carries an
+# applied version this image does not embed, which is what deploying an older
+# image over a newer schema looks like. Without it that case reports "0 applied"
+# and exits 0. It mutates nothing, so it is safe against a live database.
+
+.PHONY: migrate-validate
+migrate-validate: ## Pre-flight the migrate image against the live database (mutates nothing)
+	$(COMPOSE) run --rm migrate validate
+
+.PHONY: migrate-version
+migrate-version: ## Print the schema version the database is on (takes no lock)
+	$(COMPOSE) run --rm migrate version
+
+# The target version is TO, not VERSION. `VERSION ?= dev` is already this
+# Makefile's image tag (line 70), so a target reading $(VERSION) would silently
+# receive "dev" and pass it to the binary as a schema version -- a guard on
+# emptiness could never fire, because the variable is never empty.
+.PHONY: migrate-up-to
+migrate-up-to: ## Apply migrations up to a version and stop (TO=3)
+	@if [ -z "$(TO)" ]; then printf "usage: make migrate-up-to TO=3\n"; exit 2; fi
+	$(COMPOSE) run --rm migrate up-to $(TO)
+
+.PHONY: migrate-down-to
+migrate-down-to: ## Roll back down to a version (TO=0 empties the schema)
+	@if [ -z "$(TO)" ]; then printf "usage: make migrate-down-to TO=0\n"; exit 2; fi
+	$(COMPOSE) run --rm migrate down-to $(TO)
 
 .PHONY: migrate-create
 migrate-create: ## Scaffold a new SQL migration (NAME=add_prices_hypertable)
@@ -878,7 +955,44 @@ scan-all: ## Trivy scan every built service image
 	done
 
 .PHONY: check
-check: verify-no-host-toolchain fmt-check vet lint test ## The full local gate CI mirrors
+check: verify-no-host-toolchain fmt-check vet lint tidy-check codegen-check test ## The full local gate CI mirrors
+
+# =============================================================================
+##@ Dependencies
+# =============================================================================
+
+# CLAUDE.md section 12: "Every developer action has a `make` target, and every
+# `make` target is a `docker` invocation. If a task requires typing `go`, `npm`,
+# `psql`, or `goose` directly, the Makefile is incomplete -- fix the Makefile."
+#
+# Dependency management was the gap. Adding a Go import used to require a host
+# `go mod tidy`, which is the exact coupling the prime directive forbids -- and it
+# fails on the CI runner, which has no Go at all.
+#
+# Both targets need NETWORK: resolving a new module means contacting the module
+# proxy and the checksum database. That is why the module cache is a named volume
+# (see DOCKER_GO_FLAGS) -- without it every run re-downloads the graph.
+
+.PHONY: tidy
+tidy: cache-init ## Reconcile go.mod/go.sum with the tree's imports (writes back through the mount)
+	docker run --rm $(DOCKER_AS_USER) $(DOCKER_GO_FLAGS) $(GO_IMAGE) \
+	  go mod tidy
+
+# `go mod tidy -diff` computes what tidy WOULD change, prints it as a unified diff,
+# and exits non-zero when that diff is non-empty -- without touching either file.
+# So it is already the gate; the wrapper exists only to say what to do about it,
+# because the raw diff on its own does not explain why CI went red.
+.PHONY: tidy-check
+tidy-check: cache-init ## Fail if go.mod/go.sum are not what `go mod tidy` would produce
+	@docker run --rm $(DOCKER_AS_USER) $(DOCKER_GO_FLAGS) $(GO_IMAGE) \
+	  sh -c 'if out=$$(go mod tidy -diff); then \
+	           printf "OK  go.mod/go.sum are tidy.\n"; \
+	         else \
+	           printf "%s\n" "$$out"; \
+	           printf "\nFAIL  go.mod/go.sum do not match the imports in the tree.\n"; \
+	           printf "      Run: make tidy   (then commit both files)\n"; \
+	           exit 1; \
+	         fi'
 
 # =============================================================================
 ##@ Codegen
@@ -892,13 +1006,198 @@ codegen-sqlc: cache-init build-tools ## Generate typed DB access from SQL (sqlc)
 	docker run --rm $(DOCKER_AS_USER) $(DOCKER_TOOLS_FLAGS) $(TOOLS_IMAGE) \
 	  sqlc generate
 
+# PHASE-GATED, and it reports zero work rather than faking success. internal/httpapi
+# holds nothing but a .gitkeep until phase 5 writes the OpenAPI spec; running
+# oapi-codegen against a file that does not exist would make `make codegen` fail on
+# a correct tree, and `make check` with it. The same shape as `migrate-dry-run` on
+# an empty migration set: do the real thing when there is something to do, and say
+# so plainly when there is not.
 .PHONY: codegen-openapi
 codegen-openapi: cache-init build-tools ## Generate server + client stubs from the OpenAPI spec
+	@if [ ! -f "$(OPENAPI_SPEC)" ]; then \
+	  printf 'SKIP openapi codegen: %s does not exist yet (CLAUDE.md section 11, phase 5).\n' '$(OPENAPI_SPEC)'; \
+	  printf '     Nothing was generated, and nothing needed to be.\n'; \
+	  exit 0; \
+	fi; \
 	docker run --rm $(DOCKER_AS_USER) $(DOCKER_TOOLS_FLAGS) $(TOOLS_IMAGE) \
-	  oapi-codegen -config internal/httpapi/oapi-codegen.yaml internal/httpapi/openapi.yaml
+	  oapi-codegen -config $(OPENAPI_CODEGEN_CONFIG) $(OPENAPI_SPEC)
 
 .PHONY: openapi
 openapi: codegen-openapi ## Regenerate the OpenAPI server/client artifacts
+
+# -----------------------------------------------------------------------------
+# The drift gate. CI runs this.
+# -----------------------------------------------------------------------------
+# Generated code is COMMITTED, which is what lets `make build` have no codegen
+# step and lets a reviewer read the SQL boundary in the diff. The cost of
+# committing generated code is that it can silently stop matching its inputs --
+# someone edits a query, or migration 00008 changes a column's type, and the
+# committed Go keeps compiling against the old shape. This target is the only
+# thing standing between that and a wrong answer at runtime.
+.PHONY: codegen-check
+codegen-check: codegen-check-sqlc codegen-check-openapi ## Fail if committed generated code differs from a fresh run
+
+# `sqlc diff` regenerates in memory and compares against the files on disk,
+# exiting non-zero on any difference. It WRITES NOTHING, so this is safe to run
+# against a clean tree and cannot leave the working copy dirty -- which a
+# "generate then git-diff" approach cannot promise.
+.PHONY: codegen-check-sqlc
+codegen-check-sqlc: cache-init build-tools ## Fail if internal/platform/postgres/gen is stale
+	@printf '==> codegen drift: committed output vs. a fresh generate\n'
+	@docker run --rm $(DOCKER_AS_USER) $(DOCKER_TOOLS_FLAGS) $(TOOLS_IMAGE) \
+	  sh -c 'if sqlc diff; then \
+	           printf "OK  sqlc: committed output matches migrations/ + queries/.\n"; \
+	         else \
+	           printf "\nFAIL  generated code is stale.\n"; \
+	           printf "      Run: make codegen-sqlc   (then commit internal/platform/postgres/gen/)\n"; \
+	           exit 1; \
+	         fi'
+
+# A SELF-ARMING TRIPWIRE, not a stub. There is no committed OpenAPI output to
+# compare against yet, so there is genuinely nothing to check -- but the moment
+# phase 5 lands a spec, this fails and names what has to be added, rather than
+# quietly leaving a second generator outside the drift gate forever.
+.PHONY: codegen-check-openapi
+codegen-check-openapi: ## Fail if the OpenAPI generator has landed but is not drift-checked
+	@if [ -f "$(OPENAPI_SPEC)" ]; then \
+	  printf 'FAIL  %s now exists, so the OpenAPI generator produces committed\n' '$(OPENAPI_SPEC)'; \
+	  printf '      output -- but codegen-check does not compare it yet.\n'; \
+	  printf '      Extend codegen-check-openapi: generate with -o pointed at a temporary\n'; \
+	  printf '      file inside the container, then `diff -u` it against the output path\n'; \
+	  printf '      %s names -- the same shape as codegen-check-sqlc.\n' '$(OPENAPI_CODEGEN_CONFIG)'; \
+	  exit 1; \
+	fi; \
+	printf 'OK  openapi: no spec yet (phase 5), so no committed output to drift.\n'
+
+# -----------------------------------------------------------------------------
+# Query plans -- proves each sqlc query uses an index, against a real database
+# -----------------------------------------------------------------------------
+# sqlc parses SQL with its own embedded parser and never contacts a server, so a
+# query it happily generates can still be rejected by Postgres, and it has no
+# opinion whatsoever about whether a query uses an index. This target closes both
+# gaps: it stands up a THROWAWAY TimescaleDB (same image and digest as the compose
+# stack, because a stock postgres has no hypertables), applies every migration with
+# goose, generates enough rows for the planner to make realistic choices, PREPAREs
+# every generated query, EXPLAIN ANALYZEs the reads, and fails if a plan that
+# should use an index contains a Seq Scan.
+#
+# The generated rows are NOT fixture data: they are computed by generate_series
+# inside a container that is destroyed when this target exits, they never reach the
+# compose stack, and nothing is written into the repository. An EXPLAIN over empty
+# tables is worthless -- the planner correctly prefers a sequential scan on zero
+# rows, so an index that IS used in production would be reported here as unused.
+#
+# Not wired into `check`: it costs a database boot plus ~240k inserts. Run it when
+# a query changes.
+.PHONY: query-plans
+query-plans: build-tools ## EXPLAIN every sqlc query on a THROWAWAY database; fail on an unexpected Seq Scan
+	@printf '\n==> query plans  (throwaway database; no real data plane is touched)\n'
+	@if [ ! -f '$(EXPLAIN_SQL)' ]; then \
+	  printf 'FAIL  %s is missing.\n' '$(EXPLAIN_SQL)'; exit 1; \
+	fi
+	@printf '    every generated query must have a PREPARE in the harness\n'
+	@missing=0; \
+	 for name in $$(awk 'match($$0, /-- name: [A-Za-z_][A-Za-z0-9_]*/) { \
+	                       s = substr($$0, RSTART + 9, RLENGTH - 9); print s }' \
+	                   $(SQLC_GEN_DIR)/*.sql.go | sort -u); do \
+	   if grep -q "PREPARE q_$$name" '$(EXPLAIN_SQL)'; then \
+	     printf '      ok       %s\n' "$$name"; \
+	   else \
+	     printf '      MISSING  %s  -- add `PREPARE q_%s ...` to %s\n' "$$name" "$$name" '$(EXPLAIN_SQL)'; \
+	     missing=1; \
+	   fi; \
+	 done; \
+	 if [ "$$missing" -ne 0 ]; then \
+	   printf 'FAIL  a generated query is not covered by the EXPLAIN harness.\n'; exit 1; \
+	 fi
+	@docker rm --force --volumes $(QUERY_PLANS_PG) >/dev/null 2>&1 || true; \
+	 docker network rm $(QUERY_PLANS_NET) >/dev/null 2>&1 || true; \
+	 cleanup() { \
+	   docker rm --force --volumes $(QUERY_PLANS_PG) >/dev/null 2>&1 || true; \
+	   docker network rm $(QUERY_PLANS_NET) >/dev/null 2>&1 || true; \
+	 }; \
+	 trap cleanup EXIT HUP INT TERM; \
+	 set -e; \
+	 docker network create $(QUERY_PLANS_NET) >/dev/null; \
+	 docker run --detach \
+	   --name $(QUERY_PLANS_PG) \
+	   --network $(QUERY_PLANS_NET) \
+	   --env POSTGRES_USER=$(QUERY_PLANS_USER) \
+	   --env POSTGRES_PASSWORD=$(QUERY_PLANS_PASSWORD) \
+	   --env POSTGRES_DB=$(QUERY_PLANS_DB) \
+	   $(POSTGRES_IMAGE) >/dev/null; \
+	 printf '    waiting for the throwaway database to accept TCP connections\n'; \
+	 waited=0; \
+	 until docker exec $(QUERY_PLANS_PG) pg_isready --quiet --host=127.0.0.1 --username=$(QUERY_PLANS_USER) --dbname=$(QUERY_PLANS_DB); do \
+	   waited=$$((waited + 1)); \
+	   if [ $$waited -ge $(QUERY_PLANS_WAIT) ]; then \
+	     printf 'FAIL  throwaway database never became ready in %ss. Last log lines:\n' '$(QUERY_PLANS_WAIT)'; \
+	     docker logs --tail 40 $(QUERY_PLANS_PG) || true; \
+	     exit 1; \
+	   fi; \
+	   sleep 1; \
+	 done; \
+	 printf '    ready after %ss\n' "$$waited"; \
+	 docker run --rm \
+	   --network $(QUERY_PLANS_NET) \
+	   --volume $(ROOT_DIR):/workspace:ro \
+	   --workdir /workspace \
+	   --env GOOSE_DRIVER=postgres \
+	   --env 'GOOSE_DBSTRING=postgres://$(QUERY_PLANS_USER):$(QUERY_PLANS_PASSWORD)@$(QUERY_PLANS_PG):5432/$(QUERY_PLANS_DB)?sslmode=disable' \
+	   --env PGHOST=$(QUERY_PLANS_PG) \
+	   --env PGUSER=$(QUERY_PLANS_USER) \
+	   --env PGPASSWORD=$(QUERY_PLANS_PASSWORD) \
+	   --env PGDATABASE=$(QUERY_PLANS_DB) \
+	   $(TOOLS_IMAGE) \
+	   sh -eu -c ' \
+	     mkdir -p /tmp/plans; \
+	     cp /workspace/migrations/*.sql /tmp/plans/; \
+	     printf "    -- applying migrations\n"; \
+	     goose -dir /tmp/plans up; \
+	     printf "    -- generating volume and explaining (this is the slow part)\n"; \
+	     psql --quiet --no-psqlrc --variable ON_ERROR_STOP=1 \
+	          --file /workspace/$(EXPLAIN_SQL) > /tmp/plans.out 2>&1 \
+	       || { printf "FAIL  the EXPLAIN harness errored:\n"; cat /tmp/plans.out; exit 1; }; \
+	     cat /tmp/plans.out; \
+	     grep -q "^@@@DONE" /tmp/plans.out \
+	       || { printf "\nFAIL  the harness did not reach its @@@DONE sentinel, so it did not\n"; \
+	            printf "      run to the end -- do not read the absence of failures as a pass.\n"; \
+	            exit 1; }; \
+	     printf "\n    -- verdict\n"; \
+	     awk -v okrel='"'"'$(QUERY_PLANS_SEQSCAN_OK)'"'"' '"'"' \
+	       function flush(   i, n, arr, rel, hits) { \
+	         if (name == "") return; \
+	         seen++; \
+	         hits = ""; \
+	         n = split(blk, arr, "\n"); \
+	         for (i = 1; i <= n; i++) { \
+	           if (arr[i] !~ /Seq Scan on /) continue; \
+	           rel = arr[i]; \
+	           sub(/.*Seq Scan on /, "", rel); \
+	           sub(/^public[.]/, "", rel); \
+	           sub(/ .*/, "", rel); \
+	           if (rel !~ "^(" okrel ")$$") hits = hits " " rel; \
+	         } \
+	         if (hits != "") { printf "      FAIL  %s: sequential scan on%s\n", name, hits; bad++ } \
+	         else if (blk ~ /Seq Scan on /) { printf "      ok    %s   (scans only a bounded relation)\n", name } \
+	         else                           { printf "      ok    %s\n", name } \
+	         name = ""; blk = ""; \
+	       } \
+	       /^@@@PLAN /   { flush(); name = $$2; next } \
+	       /^@@@NOTE/    { next } \
+	       /^@@@/        { flush(); next } \
+	                     { if (name != "") blk = blk $$0 "\n" } \
+	       END { flush(); \
+	             if (seen == 0) { printf "\nFAIL  the harness output contained no @@@PLAN blocks at all, so nothing\n"; \
+	                              printf "      was actually checked. An empty verdict is not a pass.\n"; exit 1 } \
+	             if (bad > 0) { printf "\nFAIL  %d plan(s) sequentially scanned an unbounded relation.\n", bad; \
+	                            printf "      A relation is allowed to be scanned only if it is listed in\n"; \
+	                            printf "      QUERY_PLANS_SEQSCAN_OK (currently: %s).\n", okrel; exit 1 } \
+	             printf "\nOK    %d plan(s) checked: every query PREPAREd against the real schema, and\n", seen; \
+	             printf "      none sequentially scanned a relation outside {%s}.\n", okrel; \
+	           }'"'"' /tmp/plans.out; \
+	   '; \
+	 printf 'OK  query plans verified; throwaway database destroyed.\n'
 
 # =============================================================================
 ##@ Data-plane shells (nothing is published to a host port)

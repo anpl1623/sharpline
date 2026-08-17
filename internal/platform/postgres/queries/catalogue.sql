@@ -1,0 +1,237 @@
+/*
+ * ============================================================================
+ * Catalogue reads -- the odds board and the event detail page
+ * ============================================================================
+ *
+ * FILE HEADERS IN THIS DIRECTORY ARE BLOCK COMMENTS ON PURPOSE. sqlc turns the
+ * `--` comment lines preceding a query into that query's Go doc comment, and
+ * everything between the top of the file and the first `-- name:` counts as
+ * "preceding" -- so a `--` file header becomes a thirty-line doc comment on
+ * whichever query happens to be written first. A block comment does not.
+ *
+ * Consumers: `api` (CLAUDE.md phase 5) and the Next.js board (phase 7). One
+ * query here -- ListOpenEventsStartingBefore -- is also `ingest`'s adaptive
+ * polling scheduler (CLAUDE.md section 5), the highest-frequency read in the
+ * system.
+ *
+ * Every query is named for the QUESTION IT ANSWERS, and every one either has a
+ * selective predicate that migration 00002 built an index for, or is an
+ * unfiltered read of a table bounded by the number of sports/sportsbooks that
+ * exist. The two unfiltered ones say so.
+ *
+ * Nothing here writes. Catalogue writes are `ingest`'s upsert path and belong to
+ * phase 3, whose ON CONFLICT ... WHERE excluded.observed_at >= events.observed_at
+ * monotonicity guard (see the comment on events.observed_at) is that phase's
+ * decision to make.
+ *
+ * The status literals in the two board queries are written out rather than
+ * parameterised on purpose: they must match the predicate of the PARTIAL indexes
+ * events_league_board_idx and events_open_start_idx exactly, or the planner
+ * cannot prove the index covers the query and falls back to a sequential scan.
+ * Passing the set as a parameter would silently lose both indexes.
+ * ============================================================================
+ */
+
+
+-- Every sport in the catalogue, for the board's navigation.
+--
+-- SEQUENTIAL SCAN BY DESIGN, and it is the optimal plan: there is no predicate to
+-- index and the row count is the number of sports a provider covers -- single
+-- digits. An index would be pure write amplification on ingest's upsert path.
+--
+-- name: ListSports :many
+SELECT id, slug, name
+  FROM sports
+ ORDER BY name;
+
+
+-- The leagues under one sport, in display order.
+--
+-- This is the query migration 00002 created leagues_sport_idx for: the board's
+-- navigation sidebar, grouped by sport, on every page load.
+--
+-- name: ListLeaguesInSport :many
+SELECT id, sport_id, slug, name
+  FROM leagues
+ WHERE sport_id = @sport_id
+ ORDER BY name;
+
+
+-- Resolve a league slug to a league.
+--
+-- Two callers, both of which need the slug to be a key rather than a label: the
+-- board's /league/{slug} route (phase 7), and the `league:{slug}` WebSocket
+-- subscription of CLAUDE.md section 5 (phase 6), which must turn a channel name
+-- back into a league id before it can select that league's events. Served by the
+-- UNIQUE constraint on leagues.slug -- which is global, not per-sport, precisely
+-- so this lookup cannot return two rows.
+--
+-- name: FindLeagueBySlug :one
+SELECT id, sport_id, slug, name
+  FROM leagues
+ WHERE slug = @slug;
+
+
+-- Every book whose lines are ingested, including the synthetic in-house one.
+--
+-- The board's multi-book comparison columns (CLAUDE.md section 6) need each
+-- book's display name and its kind -- a quote from the synthetic book is a
+-- statement about an RNG and the UI must be able to label it as such.
+--
+-- SEQUENTIAL SCAN BY DESIGN, same argument as ListSports: no predicate, and the
+-- row count is the number of sportsbooks being ingested. `kind` is returned so
+-- the caller never has to guess, and `is_reference` so the +EV baseline is
+-- identifiable without a second round trip.
+--
+-- name: ListBooks :many
+SELECT id, slug, name, kind, is_reference
+  FROM books
+ ORDER BY slug;
+
+
+-- The tradeable events of one league, soonest first -- the per-league board.
+--
+-- Served by events_league_board_idx (league_id, scheduled_start) WHERE status IN
+-- ('scheduled','live','suspended'): equality on the leading column then the
+-- index's own order, so no sort node. Settled, cancelled and postponed events are
+-- outside the index and outside the board.
+--
+-- name: ListOpenEventsInLeague :many
+SELECT id, league_id, kind, name,
+       home_competitor_id, home_competitor_name,
+       away_competitor_id, away_competitor_name,
+       scheduled_start, status,
+       clock_period, clock_elapsed_ns, clock_running,
+       score_home, score_away, observed_at
+  FROM events
+ WHERE league_id = @league_id
+   AND status IN ('scheduled', 'live', 'suspended')
+ ORDER BY scheduled_start
+ LIMIT @row_limit;
+
+
+-- The tradeable events starting before an instant, across every league.
+--
+-- TWO consumers, which is why this is not folded into the query above:
+--
+--   * the cross-league board (CLAUDE.md section 6 Core: "live odds board across
+--     leagues"), which has no league filter and therefore cannot use an index
+--     led by league_id;
+--   * `ingest`'s adaptive-polling scheduler (section 5: "high frequency for live
+--     and near-tip events, low for futures"), which asks this on every
+--     scheduling tick and is the most frequent read in the system.
+--
+-- Served by events_open_start_idx (scheduled_start) WHERE status IN (...): a
+-- range scan in index order, no sort. The caller supplies the horizon rather than
+-- the query hardcoding `now() + interval`, because the scheduler's horizon is a
+-- config value and the board's is "everything today".
+--
+-- name: ListOpenEventsStartingBefore :many
+SELECT id, league_id, kind, name,
+       home_competitor_id, home_competitor_name,
+       away_competitor_id, away_competitor_name,
+       scheduled_start, status,
+       clock_period, clock_elapsed_ns, clock_running,
+       score_home, score_away, observed_at
+  FROM events
+ WHERE status IN ('scheduled', 'live', 'suspended')
+   AND scheduled_start < @starting_before
+ ORDER BY scheduled_start
+ LIMIT @row_limit;
+
+
+-- One event with the league and sport it sits under -- the event detail header.
+--
+-- The league and sport are joined rather than fetched separately because the
+-- detail page always renders the breadcrumb, and three primary-key lookups in one
+-- round trip beat three round trips. `league_slug` is returned so the page can
+-- open the `league:{slug}` subscription without a second query.
+--
+-- name: GetEventWithLeague :one
+SELECT e.id, e.league_id, e.kind, e.name,
+       e.home_competitor_id, e.home_competitor_name,
+       e.away_competitor_id, e.away_competitor_name,
+       e.scheduled_start, e.status,
+       e.clock_period, e.clock_elapsed_ns, e.clock_running,
+       e.score_home, e.score_away, e.observed_at,
+       l.slug AS league_slug,
+       l.name AS league_name,
+       s.id   AS sport_id,
+       s.slug AS sport_slug,
+       s.name AS sport_name
+  FROM events  e
+  JOIN leagues l ON l.id = e.league_id
+  JOIN sports  s ON s.id = l.sport_id
+ WHERE e.id = @event_id;
+
+
+-- Every market on one event -- the full market tree of the event detail page.
+--
+-- Served by markets_event_type_idx (event_id, type). ORDER BY type comes free
+-- from the index; the trailing id only breaks ties deterministically so the tree
+-- does not reshuffle between renders.
+--
+-- name: ListMarketsForEvent :many
+SELECT id, event_id, type, line, subject, status, observed_at
+  FROM markets
+ WHERE event_id = @event_id
+ ORDER BY type, id;
+
+
+-- The selections of a set of markets -- the second level of the market tree, and
+-- the input to "which selections does the board need prices for".
+--
+-- Takes a set rather than one market because both callers have one: the detail
+-- page holds every market of an event, and the board holds the main markets of
+-- every event on screen. Served by selections_market_idx.
+--
+-- NO ORDER BY, deliberately. Render order is domain.SelectionRole.DisplayOrder()
+-- -- home, draw, away, over, under, outright -- which is not the lexicographic
+-- order of those strings, so no index and no SQL sort can produce it. The caller
+-- sorts the handful of rows a market has.
+--
+-- name: ListSelectionsForMarkets :many
+SELECT id, market_id, market_type, role, name
+  FROM selections
+ WHERE market_id = ANY(@market_ids::TEXT[]);
+
+
+-- Tradeable events whose home or away competitor name starts with a prefix --
+-- the search box (CLAUDE.md section 6 Core: "search and filtering").
+--
+-- Served by the two partial expression indexes events_home_competitor_search_idx
+-- and events_away_competitor_search_idx, both on lower(<col>) text_pattern_ops
+-- WHERE <col> IS NOT NULL. The `lower(...)` on both sides is what makes the match
+-- case-insensitive without a second stored column; text_pattern_ops is what makes
+-- a prefix LIKE indexable regardless of the database collation.
+--
+-- A competitor can appear on either side of a fixture and a user typing "celtics"
+-- means either, so this is a UNION of two index scans -- there is no single
+-- expression over both columns a prefix search could use. UNION rather than UNION
+-- ALL: an event whose two competitors both match must appear once.
+--
+-- PREFIX ONLY. Infix search ("lakers" finding "Los Angeles Lakers") needs a GIN
+-- trigram index, which needs the pg_trgm extension, which migration 00002
+-- deliberately does not create. A type-ahead box wants prefix matching anyway.
+--
+-- The caller passes the raw prefix with no wildcards; the `|| '%'` is here so a
+-- caller cannot turn the search into a leading-wildcard scan by passing "%x".
+-- (A literal `%` or `_` inside the prefix still matches as a wildcard -- escape
+-- it at the call site if that ever matters.)
+--
+-- name: SearchOpenEventsByCompetitorPrefix :many
+SELECT id, league_id, kind, name,
+       home_competitor_name, away_competitor_name,
+       scheduled_start, status
+  FROM events
+ WHERE home_competitor_name IS NOT NULL
+   AND lower(home_competitor_name) LIKE lower(@prefix::TEXT) || '%'
+UNION
+SELECT id, league_id, kind, name,
+       home_competitor_name, away_competitor_name,
+       scheduled_start, status
+  FROM events
+ WHERE away_competitor_name IS NOT NULL
+   AND lower(away_competitor_name) LIKE lower(@prefix::TEXT) || '%'
+ ORDER BY scheduled_start
+ LIMIT @row_limit;

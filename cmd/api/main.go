@@ -18,6 +18,7 @@ import (
 	"github.com/anpl1623/sharpline/internal/platform/config"
 	"github.com/anpl1623/sharpline/internal/platform/httpx"
 	"github.com/anpl1623/sharpline/internal/platform/logging"
+	"github.com/anpl1623/sharpline/internal/platform/postgres"
 )
 
 const service = "api"
@@ -59,10 +60,44 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	// The registry is built BEFORE the pool and handed to both, which is the
+	// only ordering that gets all three properties at once: the pool's
+	// collectors land on the same /metrics as the Go runtime collectors
+	// httpx.NewRegistry installs, the pool exists before NewServer so it can be
+	// passed as a Checker by value rather than through a mutable indirection,
+	// and no global registry is touched (CLAUDE.md §12: no global mutable
+	// state).
+	registry := httpx.NewRegistry()
+
+	// config.API declares RequirePostgres, which config.go defines as "the
+	// binary opens a Postgres connection pool" — so the DSN is already
+	// validated at startup and this is the code that keeps that promise.
+	// Connect blocks until the server answers or the retry budget is spent; it
+	// does NOT latch a boolean, and db.Check re-executes a statement on every
+	// /readyz.
+	db, err := postgres.Connect(ctx, postgres.Options{
+		DSN:      cfg.PostgresDSN,
+		Service:  service,
+		Logger:   log,
+		Registry: registry,
+	})
+	if err != nil {
+		return fmt.Errorf("%s: %w", service, err)
+	}
+	defer db.Close()
+
 	srv, err := httpx.NewServer(httpx.ServerOptions{
-		Service: service,
-		Addr:    cfg.HTTPAddr,
-		Logger:  log,
+		Service:  service,
+		Addr:     cfg.HTTPAddr,
+		Logger:   log,
+		Registry: registry,
+		// *postgres.DB satisfies httpx.Checker (Name/Check), so /readyz makes a
+		// real round trip through the pool on every probe. A readiness endpoint
+		// that stays green while the database is unreachable is worse than
+		// none: the orchestrator keeps routing to a replica that cannot serve.
+		// Liveness deliberately does NOT consult it — a database outage must
+		// not become a rolling restart (see internal/platform/postgres/health.go).
+		Checkers: []httpx.Checker{db},
 		// deploy/proxy/Caddyfile forwards /api/* here WITHOUT stripping the
 		// prefix, so this is what makes `curl https://<host>/api/healthz`
 		// answer. It mirrors /healthz and /readyz only — never /metrics, which

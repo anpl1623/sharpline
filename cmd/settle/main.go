@@ -17,6 +17,7 @@ import (
 	"github.com/anpl1623/sharpline/internal/platform/config"
 	"github.com/anpl1623/sharpline/internal/platform/httpx"
 	"github.com/anpl1623/sharpline/internal/platform/logging"
+	"github.com/anpl1623/sharpline/internal/platform/postgres"
 )
 
 const service = "settle"
@@ -46,10 +47,31 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	// config.Settle declares RequirePostgres, and the ledger this service
+	// writes is the one place in the system where a wrong balance is permanent
+	// (balances are derived, CLAUDE.md §4). The pool is opened here for the same
+	// reasons cmd/api opens one, and the comments there apply verbatim: one
+	// registry shared with the listener, and *postgres.DB as a real readiness
+	// Checker rather than a boolean latched at startup.
+	registry := httpx.NewRegistry()
+
+	db, err := postgres.Connect(ctx, postgres.Options{
+		DSN:      cfg.PostgresDSN,
+		Service:  service,
+		Logger:   log,
+		Registry: registry,
+	})
+	if err != nil {
+		return fmt.Errorf("%s: %w", service, err)
+	}
+	defer db.Close()
+
 	srv, err := httpx.NewServer(httpx.ServerOptions{
-		Service: service,
-		Addr:    cfg.HTTPAddr,
-		Logger:  log,
+		Service:  service,
+		Addr:     cfg.HTTPAddr,
+		Logger:   log,
+		Registry: registry,
+		Checkers: []httpx.Checker{db},
 	})
 	if err != nil {
 		return fmt.Errorf("%s: build operational listener: %w", service, err)

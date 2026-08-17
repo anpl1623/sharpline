@@ -95,18 +95,79 @@
 -- with no translation table in between.
 --
 --
--- NO updated_at TRIGGER, ANYWHERE IN THIS SCHEMA
--- -----------------------------------------------
--- `updated_at` defaults to now() on insert and is written by the application on
--- update. There is deliberately no BEFORE UPDATE trigger stamping now().
+-- NO TRIGGER ANYWHERE IN THIS SCHEMA EVER WRITES A DOMAIN INSTANT
+-- ---------------------------------------------------------------
+-- An earlier revision of this header claimed something stronger and different:
+-- "NO updated_at TRIGGER, ANYWHERE IN THIS SCHEMA". That claim was false about
+-- the schema it appeared in, and the falsehood was load-bearing -- 00001, 00002
+-- and 00006 each cite it, and 00001 declined to create a shared trigger
+-- function partly because of it. 00002 installs six `updated_at` triggers
+-- (sports, leagues, books, events, markets, selections), 00006 installs two
+-- (wagers, legs), and 00007 installs two (feature_flags, market_suspensions).
+-- Meanwhile this file's own five tables carried an `updated_at` column with no
+-- trigger, so one column name meant "server clock at last UPDATE" on ten tables
+-- and "whatever the application last wrote" on five. That is the actual defect,
+-- and it is resolved here rather than reported again.
 --
--- The domain's state transitions take the instant as an explicit parameter
+-- THE INVARIANT, stated so it is checkable:
+--
+--   A trigger may stamp `updated_at`, which is row bookkeeping and means
+--   nothing to the domain. No trigger may write a column that carries a
+--   DOMAIN instant -- an instant the application computed and must be able to
+--   reproduce.
+--
+-- THE REDELIVERY ARGUMENT IS UNCHANGED AND STILL BINDING. The domain's state
+-- transitions take the instant as an explicit parameter
 -- (Wager.Settle(status, amount, at), Leg.WithStatus(status, at)) precisely so
 -- that a redelivered Kafka message re-applies the ORIGINAL instant rather than
 -- the wall clock. A trigger overwriting that with now() would silently discard
--- the value the domain worked to preserve. The database is not the clock here.
+-- the value the domain worked to preserve. The database is not the clock for
+-- any of those columns. 00002 answered this by splitting the two meanings into
+-- two columns -- `observed_at` for the provider instant, `updated_at` for row
+-- bookkeeping -- and triggering only the bookkeeping one. 00006 adopted that
+-- resolution explicitly. This file now adopts it too, which is what makes the
+-- three cross-references coherent.
+--
+-- PHASE 3, THIS IS THE HALF THAT CONSTRAINS YOU: `auth_set_updated_at()` below
+-- touches `updated_at` and nothing else. Every domain instant in this file --
+-- `users.password_changed_at`, `user_totp.confirmed_at`,
+-- `refresh_token_families.started_at` / `revoked_at`, `refresh_tokens.issued_at`
+-- / `expires_at` / `used_at`, `user_limits.requested_at` / `effective_from` /
+-- `superseded_at` -- is written by the application from the value it was given,
+-- never by the database, and a redelivered message therefore re-applies the
+-- same instant and produces the same row. If a future trigger needs to touch
+-- one of those columns, the answer is a new column, not a wider trigger.
 --
 -- +goose Up
+
+-- -----------------------------------------------------------------------------
+-- Shared trigger function: maintain updated_at on this migration's tables.
+--
+-- Namespaced `auth_` for the reason 00007 spells out about
+-- `platform_set_updated_at()` and 00002 about `catalogue_set_updated_at()`: a
+-- bare `set_updated_at()` is the name every concurrently-authored migration
+-- reaches for, two of them collide on the way up, and the first Down to run
+-- drops a function another migration's triggers still need. The prefix makes
+-- the blast radius of this file's Down exactly this file. This file neither
+-- creates nor drops any sibling's function.
+--
+-- It stamps `updated_at` and nothing else, and it must never be extended. Every
+-- other timestamp in this file carries a domain instant the application must be
+-- able to reproduce on a Kafka redelivery -- see the header block above.
+-- -----------------------------------------------------------------------------
+-- +goose StatementBegin
+CREATE FUNCTION auth_set_updated_at() RETURNS trigger
+    LANGUAGE plpgsql
+AS $auth_set_updated_at$
+BEGIN
+    NEW.updated_at := now();
+    RETURN NEW;
+END;
+$auth_set_updated_at$;
+-- +goose StatementEnd
+
+COMMENT ON FUNCTION auth_set_updated_at() IS
+    'BEFORE UPDATE trigger: stamps updated_at from the server clock. Never touches a domain instant (password_changed_at, confirmed_at, started_at, revoked_at, issued_at, expires_at, used_at, requested_at, effective_from, superseded_at). Namespaced to this migration so its Down cannot orphan another migration''s triggers.';
 
 -- -----------------------------------------------------------------------------
 -- users
@@ -194,6 +255,15 @@ COMMENT ON COLUMN users.email IS
 COMMENT ON COLUMN users.password_hash IS
     'Full PHC-format argon2id hash. Never a plaintext or reversibly-encrypted password; the CHECK makes anything but argon2id unstorable.';
 
+-- `users` is mutable: status changes, and a credential change rewrites
+-- password_hash and password_changed_at. The trigger stamps `updated_at` only;
+-- `password_changed_at` is the application's value and stays untouched, because
+-- "every refresh-token family issued before this instant is invalid" has to be
+-- comparable against the instant the credential actually changed.
+CREATE TRIGGER users_set_updated_at
+    BEFORE UPDATE ON users
+    FOR EACH ROW EXECUTE FUNCTION auth_set_updated_at();
+
 -- -----------------------------------------------------------------------------
 -- user_totp -- CREDENTIAL MATERIAL. HANDLE ACCORDINGLY.
 -- -----------------------------------------------------------------------------
@@ -264,6 +334,11 @@ COMMENT ON TABLE  user_totp IS
 COMMENT ON COLUMN user_totp.secret_ciphertext IS
     'AEAD ciphertext of the shared secret. Storing the raw secret here would make one SELECT leak a permanent full 2FA bypass for every enrolled user.';
 
+-- Mutable: enrolment is confirmed, and the secret is re-minted on re-enrolment.
+CREATE TRIGGER user_totp_set_updated_at
+    BEFORE UPDATE ON user_totp
+    FOR EACH ROW EXECUTE FUNCTION auth_set_updated_at();
+
 -- ON DELETE CASCADE is correct here and nowhere else in this file: the TOTP row
 -- is a property OF the user, has no independent meaning, and must not outlive
 -- them. Every other reference to users below uses RESTRICT, because auth history
@@ -328,6 +403,13 @@ CREATE TABLE refresh_token_families (
 
 COMMENT ON TABLE refresh_token_families IS
     'One login lineage. Reuse of any already-redeemed token in the lineage revokes the entire family, because the legitimate client and the thief cannot be distinguished.';
+
+-- Mutable exactly once, when the family is revoked. `revoked_at` is the domain's
+-- instant -- the moment reuse was detected, which a redelivered detection event
+-- must re-apply identically -- so the trigger stamps `updated_at` and leaves it.
+CREATE TRIGGER refresh_token_families_set_updated_at
+    BEFORE UPDATE ON refresh_token_families
+    FOR EACH ROW EXECUTE FUNCTION auth_set_updated_at();
 
 -- -----------------------------------------------------------------------------
 -- refresh_tokens
@@ -422,6 +504,21 @@ COMMENT ON COLUMN refresh_tokens.used_at IS
     'Set once, at redemption. A presented token with used_at already set is a reuse and must revoke the entire family.';
 COMMENT ON COLUMN refresh_tokens.parent_id IS
     'The token this one replaced. NULL only on a family root. At most one child per parent -- see refresh_tokens_one_successor.';
+
+-- The one legal mutation on this table is the once-only NULL -> non-NULL
+-- transition on used_at, "plus updated_at" -- which is what this trigger writes,
+-- and the only reason `updated_at` moves here at all.
+--
+-- Trigger firing order is deliberate and not accidental: PostgreSQL fires
+-- same-event row triggers in name order, and `refresh_tokens_append_only` sorts
+-- before `refresh_tokens_set_updated_at`, so an illegal edit is refused before
+-- anything is stamped. The order does not actually matter for correctness --
+-- refresh_tokens_assert_append_only() compares an explicit column list that
+-- excludes updated_at, so it neither sees nor cares about the stamp -- but the
+-- names should not be changed in a way that makes the stamp run first.
+CREATE TRIGGER refresh_tokens_set_updated_at
+    BEFORE UPDATE ON refresh_tokens
+    FOR EACH ROW EXECUTE FUNCTION auth_set_updated_at();
 
 -- THE structural half of reuse detection. A token may be rotated at most once,
 -- enforced by the database rather than by a read-then-write in the application,
@@ -606,6 +703,16 @@ COMMENT ON TABLE user_limits IS
 COMMENT ON COLUMN user_limits.effective_from IS
     'When the limit binds. Equal to requested_at for a tightening; later for a loosening serving its cooling-off period.';
 
+-- Mutable exactly once, when the row is superseded. `superseded_at`,
+-- `requested_at` and `effective_from` are all domain instants -- a customer must
+-- be able to show what they set and when -- so the trigger stamps `updated_at`
+-- and nothing else. As with refresh_tokens, `user_limits_append_only` sorts
+-- before this trigger's name and compares a column list that excludes
+-- updated_at.
+CREATE TRIGGER user_limits_set_updated_at
+    BEFORE UPDATE ON user_limits
+    FOR EACH ROW EXECUTE FUNCTION auth_set_updated_at();
+
 -- Exactly one current limit per (user, kind, period). Superseded rows are
 -- unconstrained, which is what makes the history a history.
 CREATE UNIQUE INDEX user_limits_current_key
@@ -687,6 +794,12 @@ CREATE INDEX users_status_idx
 -- Reverse creation order, so every dependent object is gone before the thing it
 -- depends on. Triggers are dropped implicitly with their table; the functions
 -- they call are not, so they are dropped explicitly.
+DROP TRIGGER IF EXISTS user_limits_set_updated_at ON user_limits;
+DROP TRIGGER IF EXISTS refresh_tokens_set_updated_at ON refresh_tokens;
+DROP TRIGGER IF EXISTS refresh_token_families_set_updated_at ON refresh_token_families;
+DROP TRIGGER IF EXISTS user_totp_set_updated_at ON user_totp;
+DROP TRIGGER IF EXISTS users_set_updated_at ON users;
+
 DROP TRIGGER IF EXISTS user_limits_no_truncate ON user_limits;
 DROP TRIGGER IF EXISTS user_limits_append_only ON user_limits;
 DROP TRIGGER IF EXISTS refresh_tokens_append_only ON refresh_tokens;
@@ -710,3 +823,8 @@ DROP TABLE IF EXISTS users;
 DROP FUNCTION IF EXISTS user_limits_reject_truncate();
 DROP FUNCTION IF EXISTS user_limits_assert_append_only();
 DROP FUNCTION IF EXISTS refresh_tokens_assert_append_only();
+
+-- Namespaced `auth_`, so this drop cannot orphan catalogue_set_updated_at(),
+-- betting_set_updated_at() or platform_set_updated_at() -- or the triggers in
+-- 00002, 00006 and 00007 that depend on them.
+DROP FUNCTION IF EXISTS auth_set_updated_at();

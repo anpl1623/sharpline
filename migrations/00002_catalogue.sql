@@ -131,13 +131,20 @@
 -- `updated_at` stays what it is everywhere else in this schema: when the row
 -- last changed.
 --
--- 00005 refuses an `updated_at` trigger for exactly this reason ("A trigger
--- overwriting that with now() would silently discard the value the domain
--- worked to preserve. The database is not the clock here."). That objection is
--- answered by the column split, not ignored: `catalogue_set_updated_at()` below
--- stamps `updated_at` and never touches `observed_at`, so no domain value is
--- discarded. 00007 established the same trigger pattern in this directory, and
--- this file follows it with the same `_`-prefixed namespacing 00007 asks for.
+-- 00005 raised exactly this objection ("A trigger overwriting that with now()
+-- would silently discard the value the domain worked to preserve. The database
+-- is not the clock here."). That objection is answered by the column split, not
+-- ignored: `catalogue_set_updated_at()` below stamps `updated_at` and never
+-- touches `observed_at`, so no domain value is discarded. 00007 established the
+-- same trigger pattern in this directory, and this file follows it with the same
+-- `_`-prefixed namespacing 00007 asks for.
+--
+-- THIS IS NOW THE SETTLED SCHEMA-WIDE CONVENTION, and 00005 states it as the
+-- checkable invariant it always should have been: a trigger may stamp
+-- `updated_at`; no trigger may write a column carrying a domain instant. 00005
+-- installs its own `auth_set_updated_at()` on the same terms, 00006 adopted the
+-- resolution explicitly, and 00001 records why the four namespaced functions
+-- were not collapsed into one shared one.
 --
 -- PHASE 3, THIS IS YOUR CONTRACT: the ingest writer must guard `observed_at`
 -- itself, because a CHECK constraint cannot compare NEW to OLD:

@@ -280,15 +280,19 @@ $preflight$;
 -- need. 00002 namespaced its own as `catalogue_set_updated_at()`. This file
 -- neither creates nor drops either of theirs.
 --
--- ON THE 00005-vs-00002 DISAGREEMENT ABOUT updated_at TRIGGERS, and which side
--- this file takes and why:
+-- ON THE FORMER 00005-vs-00002 DISAGREEMENT ABOUT updated_at TRIGGERS, and
+-- which side this file takes and why. THE DISAGREEMENT IS NOW SETTLED, in the
+-- direction this file already chose -- 00005 states the invariant as "a trigger
+-- may stamp updated_at; no trigger may write a column carrying a domain
+-- instant" and installs `auth_set_updated_at()` on its own mutable tables. The
+-- history is kept because the reasoning is what binds phase 3, not the outcome:
 --
---   00005 refuses triggers outright -- "The domain's state transitions take the
---   instant as an explicit parameter (Wager.Settle(status, amount, at),
---   Leg.WithStatus(status, at)) precisely so that a redelivered Kafka message
---   re-applies the ORIGINAL instant rather than the wall clock. A trigger
---   overwriting that with now() would silently discard the value the domain
---   worked to preserve."
+--   00005 originally refused triggers outright -- "The domain's state
+--   transitions take the instant as an explicit parameter
+--   (Wager.Settle(status, amount, at), Leg.WithStatus(status, at)) precisely so
+--   that a redelivered Kafka message re-applies the ORIGINAL instant rather
+--   than the wall clock. A trigger overwriting that with now() would silently
+--   discard the value the domain worked to preserve."
 --
 --   00002 splits the two meanings into two columns and triggers only the
 --   bookkeeping one.

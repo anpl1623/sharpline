@@ -100,24 +100,38 @@
 -- later introduced in the bootstrap migration, this one collapses into it in a
 -- follow-up migration."
 --
--- The invitation is declined, for two reasons.
+-- The invitation is declined, and the reason it is declined has changed since
+-- this block was first written -- read the history, because the first reason no
+-- longer applies and only the second one is doing the work now.
 --
--- First, 00005_accounts_and_auth.sql takes the opposite position outright --
--- "NO updated_at TRIGGER, ANYWHERE IN THIS SCHEMA" -- on the ground that the
--- domain's state transitions take the instant as an explicit parameter
+-- ORIGINALLY, the first reason was a live disagreement: 00005 claimed "NO
+-- updated_at TRIGGER, ANYWHERE IN THIS SCHEMA", on the ground that the domain's
+-- state transitions take the instant as an explicit parameter
 -- (`Wager.Settle(status, amount, at)`, `Leg.WithStatus(status, at)`) precisely
 -- so that a redelivered Kafka message re-applies the ORIGINAL instant rather
 -- than the wall clock, and a trigger stamping `now()` would silently discard
--- the value the domain worked to preserve. Those two files disagree, and the
--- disagreement is reported rather than resolved unilaterally here.
+-- the value the domain worked to preserve.
 --
--- Second, and independently sufficient: a shared function created here would
--- be used by whichever sibling migrations happened to know about it. A function
+-- THAT DISAGREEMENT IS SETTLED. It was settled in 00005's favour on the
+-- substance and against it on the mechanism: no trigger anywhere in this schema
+-- writes a DOMAIN instant, and 00002's resolution -- split the provider instant
+-- into its own `observed_at` column and trigger only the row-bookkeeping
+-- `updated_at` -- is now the schema-wide convention. 00002, 00005, 00006 and
+-- 00007 each install `updated_at` triggers on their own mutable tables through
+-- their own namespaced function (`catalogue_`, `auth_`, `betting_`,
+-- `platform_`). The redelivery argument survives intact and still forbids the
+-- thing it was raised to forbid.
+--
+-- The remaining reason, which was always independently sufficient: a shared
+-- function created here would be used by whichever sibling migrations happened
+-- to know about it. A function
 -- that some tables' triggers depend on and others do not is precisely the
 -- cross-migration coupling 00007 warns about -- its Down would be unable to
 -- drop it, and this file's Down would be able to orphan every trigger that
--- referenced it. Introducing it is a deliberate follow-up migration once the
--- disagreement above is settled, not a bootstrap side effect.
+-- referenced it. Four two-line functions with four independent Downs are
+-- cheaper than one function four Downs must coordinate around. Collapsing them
+-- is a deliberate follow-up migration if it is ever worth doing, not a
+-- bootstrap side effect.
 --
 --
 -- WHY THERE ARE NO ROWS
