@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"math"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -79,6 +81,39 @@ func ts(offset time.Duration) time.Time {
 // The dependency guard
 // ---------------------------------------------------------------------------
 
+// testOnlyImportAllowlist is the complete set of non-stdlib imports permitted in
+// this directory, and only inside a _test.go file.
+//
+// It is two entries and it is meant to stay two entries. Adding a third is a
+// decision, not a convenience, and it should be argued for in review rather than
+// slipped in — which is the whole reason the set is written out here instead of
+// being expressed as a pattern.
+//
+//   - pgregory.net/rapid is the property-based testing library CLAUDE.md §4 names
+//     by name ("property-based tests (pgregory.net/rapid) asserting invariants").
+//     It is a test dependency: it appears in no build of any binary, so it does not
+//     weaken the zero-dependency property the production code has to hold to.
+//
+//   - github.com/anpl1623/sharpline/internal/domain is this package itself, imported
+//     by the external test package `domain_test` that ledger_property_test.go
+//     declares. A package importing itself from its own external test package is not
+//     a dependency in any sense the charter cares about; it is how Go spells "test
+//     this from the outside, against the exported surface only".
+//
+// Nothing else. In particular NOT the rest of this module: internal/platform pulls
+// in Prometheus and OpenTelemetry, and a test file here reaching for it would drag
+// exactly the coupling this guard exists to prevent into the one package that must
+// not have it.
+// domainImportPath is this package's own module path. A production file anywhere
+// in this subtree may import it or anything under it — see the walk below for why
+// that concedes nothing — and nothing else outside the standard library.
+const domainImportPath = "github.com/anpl1623/sharpline/internal/domain"
+
+var testOnlyImportAllowlist = map[string]string{
+	"pgregory.net/rapid": "property-based testing, named in CLAUDE.md §4",
+	domainImportPath:     "this package, from its own external test package",
+}
+
 // TestPackageHasNoExternalDependencies parses every Go file in this directory
 // and asserts that no import reaches outside the standard library.
 //
@@ -90,36 +125,116 @@ func ts(offset time.Duration) time.Time {
 //
 // The stdlib test is that the first path element carries no dot: every module
 // path outside the standard library begins with a hostname.
+//
+// # The one exception, and why it is narrow
+//
+// A _test.go file may additionally import anything in testOnlyImportAllowlist, and
+// nothing else. Production files are held to the original rule with no exception at
+// all: a non-stdlib import in a non-test file fails whether or not it is on the
+// allowlist, because the allowlist is about test tooling and says nothing about what
+// the shipped binary is allowed to link.
+//
+// The distinction is enforced by filename rather than by package clause on purpose.
+// Grouping by package would let a file declare `package domain` and be judged by
+// where its neighbours sit; the suffix is what the Go toolchain itself uses to
+// decide whether a file is compiled into the binary, so it is the honest boundary.
 func TestPackageHasNoExternalDependencies(t *testing.T) {
+	// parser.ParseFile per source file rather than parser.ParseDir: ParseDir is
+	// deprecated because it ignores build tags when grouping files into
+	// packages. That grouping is exactly the part this guard does not need — it
+	// inspects every .go file it finds regardless of which package or build
+	// configuration claims it, which is the stricter reading anyway.
+	//
+	// The walk descends into subdirectories. It used to read this directory only,
+	// which left internal/domain/odds — the package that holds the odds math the
+	// charter annotates in the same breath, and the one with far more scope for a
+	// tempting third-party import (a decimal library, a stats library) — entirely
+	// unguarded. The test still passed, and passed vacuously with respect to the
+	// subpackage.
 	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, ".", nil, parser.ImportsOnly)
+	checked, files, production, allowed, dirs := 0, 0, 0, 0, map[string]bool{}
+	err := filepath.WalkDir(".", func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			// testdata is not compiled and may legitimately hold anything.
+			if entry.Name() == "testdata" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		filename := entry.Name()
+		if !strings.HasSuffix(filename, ".go") {
+			return nil
+		}
+		file, parseErr := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
+		if parseErr != nil {
+			return fmt.Errorf("parse %s: %w", path, parseErr)
+		}
+		files++
+		dirs[filepath.Dir(path)] = true
+		isTest := strings.HasSuffix(filename, "_test.go")
+		if !isTest {
+			production++
+		}
+		for _, imp := range file.Imports {
+			importPath := strings.Trim(imp.Path.Value, `"`)
+			checked++
+			first := importPath
+			if i := strings.Index(importPath, "/"); i >= 0 {
+				first = importPath[:i]
+			}
+			if !strings.Contains(first, ".") {
+				continue // Standard library, permitted everywhere.
+			}
+			if isTest {
+				reason, onList := testOnlyImportAllowlist[importPath]
+				if !onList {
+					t.Errorf("%s imports %q, which is outside the standard library and is not on the test-only allowlist",
+						path, importPath)
+					continue
+				}
+				allowed++
+				t.Logf("%s imports %q (allowed: %s)", path, importPath, reason)
+				continue
+			}
+			// Production files: stdlib, or somewhere inside this same subtree.
+			// The subtree exception is what lets internal/domain/odds name a
+			// MarketID without inventing a parallel identifier type, and it
+			// concedes nothing — every package it can reach is held to this
+			// same rule by this same walk.
+			if importPath == domainImportPath || strings.HasPrefix(importPath, domainImportPath+"/") {
+				allowed++
+				t.Logf("%s imports %q (allowed: within internal/domain, itself guarded here)", path, importPath)
+				continue
+			}
+			t.Errorf("%s imports %q, which is outside the standard library and outside internal/domain",
+				path, importPath)
+		}
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("parse package directory: %v", err)
-	}
-	if len(pkgs) == 0 {
-		t.Fatal("parsed no packages; the guard would pass vacuously")
+		t.Fatalf("walk the package tree: %v", err)
 	}
 
-	checked := 0
-	for _, pkg := range pkgs {
-		for filename, file := range pkg.Files {
-			for _, imp := range file.Imports {
-				path := strings.Trim(imp.Path.Value, `"`)
-				first := path
-				if i := strings.Index(path, "/"); i >= 0 {
-					first = path[:i]
-				}
-				if strings.Contains(first, ".") {
-					t.Errorf("%s imports %q, which is outside the standard library", filename, path)
-				}
-				checked++
-			}
-		}
+	if files == 0 {
+		t.Fatal("parsed no source files; the guard would pass vacuously")
+	}
+	if production == 0 {
+		t.Fatal("parsed no non-test source files; the strict half of the guard would pass vacuously")
 	}
 	if checked == 0 {
 		t.Fatal("inspected no imports; the guard would pass vacuously")
 	}
-	t.Logf("checked %d imports across %d package(s), all stdlib", checked, len(pkgs))
+	// The subpackage must actually have been reached. Without this, a future
+	// refactor that moved the odds math or broke the walk would restore the
+	// original silent gap and nothing would say so.
+	if !dirs[filepath.Join(".", "odds")] {
+		t.Fatalf("the walk never reached ./odds; it visited %v", dirs)
+	}
+	t.Logf("checked %d imports across %d file(s) in %d director(ies) (%d non-test); %d allowed, the rest stdlib",
+		checked, files, len(dirs), production, allowed)
 }
 
 // TestNoConstructorProducesAZeroValue asserts the invariant the whole

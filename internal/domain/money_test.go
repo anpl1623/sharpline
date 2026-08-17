@@ -96,12 +96,12 @@ func TestMoneyAddSubDetectOverflow(t *testing.T) {
 
 func TestMoneyNegAndAbs(t *testing.T) {
 	tests := []struct {
-		name    string
-		in      Money
-		neg     Money
-		negErr  error
-		abs     Money
-		absErr  error
+		name   string
+		in     Money
+		neg    Money
+		negErr error
+		abs    Money
+		absErr error
 	}{
 		{name: "zero", in: 0, neg: 0, abs: 0},
 		{name: "positive", in: 1234, neg: -1234, abs: 1234},
@@ -454,7 +454,12 @@ func TestParseMoney(t *testing.T) {
 func TestMoneyStringParseRoundTrip(t *testing.T) {
 	rng := rand.New(rand.NewPCG(0x5341, 0x5250))
 	for i := 0; i < 20000; i++ {
-		v := Money(rng.Int64N(int64(MaxSafeMoney))+1) - Money(rng.Int64N(int64(MaxSafeMoney))+1)
+		// Two independent draws, held in named variables: written inline the two
+		// calls are syntactically identical and staticcheck (SA4000) reads the
+		// subtraction as a value minus itself.
+		lo := Money(rng.Int64N(int64(MaxSafeMoney)) + 1)
+		hi := Money(rng.Int64N(int64(MaxSafeMoney)) + 1)
+		v := lo - hi
 		s := v.String()
 		back, err := ParseMoney(s)
 		if err != nil {

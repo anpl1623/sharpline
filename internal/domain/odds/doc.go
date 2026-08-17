@@ -1,9 +1,17 @@
 // Package odds implements the value types and format conversions that sit at the
 // centre of Sharpline's pricing (CLAUDE.md §4).
 //
-// The package is pure. It has zero non-standard-library dependencies, performs no
-// I/O, reads no clock, holds no package-level mutable state beyond the sentinel
-// error values, and never panics. Every function is deterministic: the same inputs
+// The package is pure. It performs no I/O, reads no clock, holds no package-level
+// mutable state beyond the sentinel error values, and never panics.
+//
+// Its only import outside the standard library is its own parent,
+// internal/domain — clv.go needs MarketID, BookID, SelectionID and Line to say which
+// market a closing line belongs to, and inventing a second set of identifiers here
+// would be worse than depending on the first. internal/domain is itself stdlib-only
+// and is mechanically held that way (see its doc_test.go), so the dependency
+// introduces nothing third-party and cannot cycle: the parent is forbidden from
+// importing this package. Nothing else outside the standard library may be added
+// here, and the same guard enforces it. Every function is deterministic: the same inputs
 // always produce the same outputs. Anything that can fail returns an error; nothing
 // silently returns NaN, ±Inf, or a half-computed answer.
 //

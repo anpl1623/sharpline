@@ -55,3 +55,29 @@ var (
 	// ErrUnknownFormat reports an unrecognised odds display format.
 	ErrUnknownFormat = errors.New("unknown odds display format")
 )
+
+// unprefixed returns the sentinel err wraps, so that a caller adding its own
+// context can re-wrap it under a single leading "odds:" prefix.
+//
+// The convention it serves is stated in doc.go: every error this package returns
+// carries the prefix exactly once, no matter how deep the wrapping goes. Without
+// this, a failure two calls down reads as
+//
+//	odds: parlay leg 1: odds: decimal 0.9: decimal odds must be strictly greater than 1
+//
+// which is not a formatting nit — the prefix is what tells a reader where an error
+// crossed a package boundary, and a message that claims two crossings for one call
+// is a message that lies about the call stack. The caller supplies the value that
+// was rejected, so nothing is lost by dropping the inner frame's copy of it.
+//
+// errors.Is is unaffected either way: it walks to the same sentinel.
+//
+// An error that wraps nothing is returned as it stands rather than discarded. No
+// validator in this package does that today, but a doubled prefix is a cosmetic
+// problem and a lost cause is not.
+func unprefixed(err error) error {
+	if sentinel := errors.Unwrap(err); sentinel != nil {
+		return sentinel
+	}
+	return err
+}

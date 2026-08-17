@@ -83,9 +83,9 @@ func assertClose(t *testing.T, what string, got, want, relTol float64) {
 // to the representable ceiling. None of it is invented market data — these are
 // format identities, not quotes attributed to any event.
 type price struct {
-	name    string
-	stake   float64 // units risked
-	profit  float64 // units won, on top of the returned stake
+	name     string
+	stake    float64 // units risked
+	profit   float64 // units won, on top of the returned stake
 	american int64
 	fracNum  int64
 	fracDen  int64
@@ -536,10 +536,10 @@ func TestLossyFractionalToAmerican(t *testing.T) {
 		exactAmerican float64
 		want          int64
 	}{
-		{num: 8, den: 13, exactAmerican: -162.5, want: -163},  // ties round away from zero
-		{num: 8, den: 15, exactAmerican: -187.5, want: -188},  // ties round away from zero
-		{num: 13, den: 8, exactAmerican: 162.5, want: 163},    // and symmetrically on the dog side
-		{num: 15, den: 8, exactAmerican: 187.5, want: 188},    //
+		{num: 8, den: 13, exactAmerican: -162.5, want: -163}, // ties round away from zero
+		{num: 8, den: 15, exactAmerican: -187.5, want: -188}, // ties round away from zero
+		{num: 13, den: 8, exactAmerican: 162.5, want: 163},   // and symmetrically on the dog side
+		{num: 15, den: 8, exactAmerican: 187.5, want: 188},   //
 		{num: 10, den: 3, exactAmerican: 1000.0 / 3, want: 333},
 		{num: 3, den: 10, exactAmerican: -1000.0 / 3, want: -333},
 	}
@@ -711,11 +711,21 @@ func TestProbabilityEdgeCases(t *testing.T) {
 		{name: "exactly zero is a valid probability but not a price", in: 0, priceErr: ErrProbabilityNotPriceable},
 		{name: "exactly one is a valid probability but not a price", in: 1, priceErr: ErrProbabilityNotPriceable},
 		{
-			name:     "one ulp below one rounds to decimal 1.0, so it is not priceable",
-			in:       math.Nextafter(1, 0),
+			// 1/(1-2⁻⁵³) = 1 + 2⁻⁵³ + 2⁻¹⁰⁶ + …, which sits just ABOVE the midpoint
+			// between 1.0 and the next double up, so it rounds to 1+2⁻⁵² rather than
+			// onto 1.0. Priceable, if only barely: the thinnest price the type can
+			// express. No double below 1 has a reciprocal of exactly 1.0.
+			name: "one ulp below one is priceable, at the thinnest representable price",
+			in:   math.Nextafter(1, 0),
+		},
+		{
+			// The reciprocal overflows: 1/5e-324 is +Inf, so there is no
+			// representable price. The low end of (0,1) is the only end that can
+			// fail this way — anything under ~5.6e-309 (1/math.MaxFloat64) does.
+			name:     "smallest positive subnormal is a valid probability but overflows to an unrepresentable price",
+			in:       math.SmallestNonzeroFloat64,
 			priceErr: ErrProbabilityNotPriceable,
 		},
-		{name: "smallest positive subnormal is priceable, if absurdly", in: math.SmallestNonzeroFloat64},
 		{name: "even money", in: 0.5},
 	}
 	for _, c := range cases {
@@ -799,14 +809,14 @@ func TestFractionalTooShortToBeADecimal(t *testing.T) {
 
 func TestReduceAndCanonicalise(t *testing.T) {
 	cases := []struct {
-		inNum, inDen   int64
+		inNum, inDen     int64
 		wantNum, wantDen int64
 	}{
-		{6, 4, 3, 2},        // the traditional 6/4 is stored as 3/2
-		{4, 6, 2, 3},        // and 4/6 as 2/3
-		{100, 275, 4, 11},   // -275
-		{2000, 2100, 20, 21},// -105
-		{10, 11, 10, 11},    // already reduced
+		{6, 4, 3, 2},         // the traditional 6/4 is stored as 3/2
+		{4, 6, 2, 3},         // and 4/6 as 2/3
+		{100, 275, 4, 11},    // -275
+		{2000, 2100, 20, 21}, // -105
+		{10, 11, 10, 11},     // already reduced
 		{1, 1, 1, 1},
 		{300, 100, 3, 1},
 	}
@@ -863,7 +873,10 @@ func TestNoConversionEverReturnsNonFinite(t *testing.T) {
 	}
 
 	probabilities := []float64{
-		math.NaN(), math.Inf(1), math.Inf(-1), -1, -0.0, 0, math.SmallestNonzeroFloat64,
+		// math.Copysign(0, -1) rather than the literal -0.0: in Go the literal is
+		// constant-folded to positive zero (staticcheck SA4026), so it would not
+		// actually exercise the negative-zero case this table exists to cover.
+		math.NaN(), math.Inf(1), math.Inf(-1), -1, math.Copysign(0, -1), 0, math.SmallestNonzeroFloat64,
 		1e-300, 0.0001, 0.5, 0.9999, math.Nextafter(1, 0), 1, 1.5,
 	}
 	for _, v := range probabilities {

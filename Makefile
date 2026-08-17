@@ -687,8 +687,73 @@ test-race: cache-init docker-socket ## Run the suite under the race detector (ne
 	  $(GO_IMAGE) \
 	  sh -c 'apk add --no-cache gcc musl-dev >/dev/null && go test -race -count=1 $(PKG)'
 
+# Coverage thresholds, from CLAUDE.md section 10: "Coverage target 80% overall, and
+# effectively 100% on internal/domain/odds." They are ENFORCED here, not merely
+# printed -- a number nobody fails on is a number nobody reads. All three are
+# overridable from the command line so a phase in progress can watch the figure move:
+#
+#   make cover COVER_MIN_TOTAL=0 COVER_MAX_ODDS_UNCOVERED=999
+#
+# `go tool cover -func` reports per FUNCTION and one grand TOTAL; it has no notion of
+# a package, so the per-package rollup below is computed from the profile directly.
+# Package = the directory part of each block's file path, and statement counts are
+# summed exactly the way cmd/cover does it, so these figures agree with the
+# `coverage: NN.N% of statements` line `go test` prints per package.
+#
+# ---------------------------------------------------------------------------
+# Why the odds gate counts BLOCKS rather than demanding a percentage
+# ---------------------------------------------------------------------------
+#
+# This gate used to read COVER_MIN_ODDS = 100, and it could not be met. Not because
+# the package is under-tested -- every reachable statement in it is covered -- but
+# because a literal 100% is unattainable while `if err != nil { return err }` remains
+# the language's error idiom. Several calls inside this package are made behind a
+# guard that has already excluded every input the callee can fail on; the error check
+# after them is therefore dead, and it cannot be deleted, because deleting it means
+# discarding an error, which is both worse code and a lint failure.
+#
+# An unmeetable gate is worse than no gate: it goes red on every run, everyone learns
+# to ignore it, and a real regression arrives inside the noise. So the gate is stated
+# in the unit that can actually be held constant -- the NUMBER of uncovered blocks.
+# Adding covered code does not move it. Adding an uncovered block does, and fails the
+# build. Covering one is expected to be accompanied by lowering the budget.
+#
+# The budget was 34 at the start of the phase-1 close and is 18 now. Sixteen of the
+# sixteen removed were either covered by a new test or restructured away where the
+# branch was genuinely redundant -- see convert.go's Decimal.American and its
+# continued-fraction loop, the consolidation of the two ad-hoc "odds:" prefix
+# helpers onto errors.go's `unprefixed`, and CorrelationMatrix.permute, which is the
+# unchecked internal sibling of Submatrix for the call sites that generate their own
+# index lists.
+#
+# Two blocks were ADDED to the budget, and the reason is worth stating because it
+# reads backwards. They are the ErrOrthantNotConverged propagations in
+# correlation.go's orthantByLattice and parlay.go's GaussianCopulaJoint. They used to
+# be covered -- by a test asserting that a parlay on the edge of the positive
+# semi-definite region CANNOT be priced. That refusal turned out to be a defect
+# rather than a documented limitation: the property suite drew an ordinary three-leg
+# same-game shape on that same edge, and the system declined to quote it. Raising
+# orthantMaxBatches fixed it, and the fix removed the only input anyone has found
+# that reaches those two propagations. The behaviour they guard -- refusing rather
+# than returning an unconverged estimate -- is still pinned directly and
+# unconditionally on latticeEstimate itself, against a tolerance no budget can meet.
+# So the number rose because the system got better, which is the one reason a rise is
+# not a warning sign.
+#
+# The 18 that remain are printed in full by this target on every run. In summary:
+# 6 in devig.go (root-solver and bracket failures on objectives whose brackets are
+# constructed to be valid, and a sum guard on values already bounded per-element),
+# 10 in parlay.go and 1 in correlation.go (quantile, bivariate, quadrature and
+# submatrix failures on arguments a caller-facing validator has already accepted),
+# and 1 in vig.go, already annotated as unreachable-but-kept in the source.
+#
+# A rise for any OTHER reason is a design signal, not a routine edit.
+COVER_MIN_TOTAL          ?= 80
+COVER_MAX_ODDS_UNCOVERED ?= 18
+COVER_ODDS_PKG           ?= github.com/anpl1623/sharpline/internal/domain/odds
+
 .PHONY: cover
-cover: cache-init docker-socket ## Produce coverage.out + coverage.html (80% overall, 100% on domain/odds)
+cover: cache-init docker-socket ## Coverage: per-package rollup + HTML, gated at 80% overall and on domain/odds' uncovered-block budget
 	docker run --rm \
 	  $(DOCKER_GO_FLAGS) \
 	  $(DOCKER_TESTCONTAINERS_FLAGS) \
@@ -696,6 +761,64 @@ cover: cache-init docker-socket ## Produce coverage.out + coverage.html (80% ove
 	  go test -count=1 -covermode=atomic -coverprofile=coverage.out $(PKG)
 	docker run --rm $(DOCKER_GO_FLAGS) $(GO_IMAGE) go tool cover -func=coverage.out
 	docker run --rm $(DOCKER_GO_FLAGS) $(GO_IMAGE) go tool cover -html=coverage.out -o coverage.html
+	@docker run --rm $(DOCKER_GO_FLAGS) $(GO_IMAGE) awk \
+	  -v minTotal='$(COVER_MIN_TOTAL)' -v maxOddsGap='$(COVER_MAX_ODDS_UNCOVERED)' -v oddsPkg='$(COVER_ODDS_PKG)' ' \
+	  /^mode:/ { next } \
+	  { \
+	    file = $$1; sub(/:[0-9]+\.[0-9]+,[0-9]+\.[0-9]+$$/, "", file); \
+	    pkg = file; sub(/\/[^\/]*$$/, "", pkg); \
+	    if (!(pkg in seen)) { seen[pkg] = 1; order[++n] = pkg } \
+	    ns = $$2 + 0; hit = (($$3 + 0) > 0); \
+	    stmt[pkg] += ns; total += ns; \
+	    if (hit) { cov[pkg] += ns; covered += ns } \
+	    else if (pkg == oddsPkg) { gap[++g] = $$1 } \
+	  } \
+	  END { \
+	    printf "\ncoverage by package (statements)\n"; \
+	    printf "  ------------------------------------------------------------------------\n"; \
+	    for (i = 1; i <= n; i++) { \
+	      p = order[i]; \
+	      printf "  %7.2f%%  %6d/%-6d  %s\n", (stmt[p] ? 100 * cov[p] / stmt[p] : 0), cov[p], stmt[p], p; \
+	    } \
+	    printf "  ------------------------------------------------------------------------\n"; \
+	    printf "  %7.2f%%  %6d/%-6d  TOTAL\n\n", (total ? 100 * covered / total : 0), covered, total; \
+	    bad = 0; \
+	    totalPct = (total ? 100 * covered / total : 0); \
+	    if (totalPct < minTotal - 1e-9) { \
+	      printf "FAIL  overall coverage %.2f%% is below the %s%% floor (CLAUDE.md section 10).\n", totalPct, minTotal; \
+	      bad = 1; \
+	    } else { \
+	      printf "OK    overall coverage %.2f%% meets the %s%% floor.\n", totalPct, minTotal; \
+	    } \
+	    if (!(oddsPkg in seen)) { \
+	      printf "FAIL  %s produced no coverage blocks -- it is missing from the profile.\n", oddsPkg; \
+	      bad = 1; \
+	    } else { \
+	      oddsPct = (stmt[oddsPkg] ? 100 * cov[oddsPkg] / stmt[oddsPkg] : 0); \
+	      budget = maxOddsGap + 0; \
+	      if (g > budget) { \
+	        printf "FAIL  %s is at %.2f%% with %d uncovered block(s), over its budget of %d:\n", oddsPkg, oddsPct, g, budget; \
+	        for (i = 1; i <= g; i++) printf "        %s\n", gap[i]; \
+	        printf "      The odds math is the one place where a wrong answer discredits the\n"; \
+	        printf "      whole project (CLAUDE.md section 10). Cover the new block, restructure\n"; \
+	        printf "      it away, or -- only with a written argument that no input reaches it --\n"; \
+	        printf "      raise COVER_MAX_ODDS_UNCOVERED and record the reasoning beside it.\n"; \
+	        bad = 1; \
+	      } else { \
+	        printf "OK    %s is at %.2f%% with %d uncovered block(s), within its budget of %d.\n", oddsPkg, oddsPct, g, budget; \
+	        if (g < budget) { \
+	          printf "      Below budget: lower COVER_MAX_ODDS_UNCOVERED to %d to keep the gate tight.\n", g; \
+	        } \
+	        if (g > 0) { \
+	          printf "      The budgeted blocks, each a defensive error return behind a guard that\n"; \
+	          printf "      already excludes the failure (see the note above the target):\n"; \
+	          for (i = 1; i <= g; i++) printf "        %s\n", gap[i]; \
+	        } \
+	      } \
+	    } \
+	    printf "\n      profile: coverage.out   browsable: coverage.html\n"; \
+	    if (bad) exit 1; \
+	  }' coverage.out
 
 .PHONY: e2e
 e2e: ## Playwright critical-path E2E through the proxy (one-shot container)

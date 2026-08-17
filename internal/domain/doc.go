@@ -6,19 +6,19 @@
 //
 // CLAUDE.md §4 fixes the vocabulary:
 //
-//	Sport → League → Event → Market → Selection → Price
+//		Sport → League → Event → Market → Selection → Price
 //
-//   - [Sport] is the top of the tree ("basketball").
-//   - [League] is a competition within a sport ("nba").
-//   - [Event] is a contest: two [Competitor]s, a scheduled start, an optional
-//     live [GameClock] and [Score], and an [EventStatus] lifecycle.
-//   - [Market] is a question about an event — moneyline, spread, total, player
-//     prop, futures — carrying a [MarketType] and a [Line] where applicable.
-//   - [Selection] is an answer to that question: a side, an over/under, or a
-//     named outright runner.
-//   - [Price] is the odds for a selection at a [Book] at an instant. It is
-//     immutable; a new quote is a new value, never an edit. This is the type
-//     that becomes the TimescaleDB hypertable.
+//	  - [Sport] is the top of the tree ("basketball").
+//	  - [League] is a competition within a sport ("nba").
+//	  - [Event] is a contest: two [Competitor]s, a scheduled start, an optional
+//	    live [GameClock] and [Score], and an [EventStatus] lifecycle.
+//	  - [Market] is a question about an event — moneyline, spread, total, player
+//	    prop, futures — carrying a [MarketType] and a [Line] where applicable.
+//	  - [Selection] is an answer to that question: a side, an over/under, or a
+//	    named outright runner.
+//	  - [Price] is the odds for a selection at a [Book] at an instant. It is
+//	    immutable; a new quote is a new value, never an edit. This is the type
+//	    that becomes the TimescaleDB hypertable.
 //
 // # Purity
 //

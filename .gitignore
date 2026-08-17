@@ -35,6 +35,22 @@ cover.html
 *.prof
 *.pprof
 
+# pgregory.net/rapid failure artifacts. When a property test fails, rapid writes
+# the shrunk counterexample to <pkg>/testdata/rapid/<Test>/<Test>-<stamp>.fail and
+# REPLAYS it automatically on every subsequent run of that test.
+#
+# That replay is the reason these must not be committed. While triaging it is
+# exactly what is wanted — a probabilistic failure becomes a deterministic one. Once
+# the bug is fixed the file is stale, and a committed stale failfile pins every
+# future run of that property to one historical input instead of exploring: the test
+# still passes, and it has quietly stopped being a property test. A committed
+# failfile should be treated as a review blocker, not merely as noise.
+#
+# Reproduce a recorded failure from its seed instead — rapid prints the
+# -rapid.seed= value alongside the failfile path — or record the counterexample as
+# an ordinary table-driven case, which is where a found bug belongs permanently.
+testdata/rapid/
+
 # ── Node / Next.js ───────────────────────────────────────────────────────────
 # node_modules and .next live on named Docker volumes, never on the host
 # (CLAUDE.md §7). If they appear on the host, someone ran npm outside a
@@ -148,3 +164,8 @@ desktop.ini
 # Verify all four with:  git add --dry-run CLAUDE.md .env.example .dockerignore \
 #                            deploy/docker/go.Dockerfile.dockerignore
 # and confirm .env is still refused:  git check-ignore -v .env
+
+# Personal infrastructure scripts. provision_oracle_vm.sh carries real Oracle Cloud
+# tenancy/subnet OCIDs, which identify the account and must not reach a public repo
+# (CLAUDE.md §12: secrets never in git). Delete this line if you want it tracked.
+provision_oracle_vm.sh

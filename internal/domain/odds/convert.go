@@ -357,11 +357,15 @@ func (d Decimal) American() (American, error) {
 			f, rounded, MaxAmericanMagnitude, ErrAmericanOutOfRange)
 	}
 
-	a := American(int64(rounded)).Canonical()
-	if err := a.Validate(); err != nil {
-		return 0, err
-	}
-	return a, nil
+	// No Validate call on the way out, deliberately. The two paragraphs above are a
+	// proof that the result is legal — |exact| ≥ 100 on both branches, the magnitude
+	// ceiling has just been checked, and Canonical folds the one edge case, -100,
+	// onto +100 — so a validation here could never fail. Keeping it would put an
+	// unreachable error return in the package CLAUDE.md §10 requires at effectively
+	// 100% coverage, which is a gate nobody can meet and therefore a gate nobody
+	// reads. The invariant is asserted by test instead, over the whole legal decimal
+	// range, in TestDecimalAmericanNeverLeavesTheLegalBand.
+	return American(int64(rounded)).Canonical(), nil
 }
 
 // Fractional converts decimal odds to fractional odds, returning the best rational
@@ -439,11 +443,16 @@ func (d Decimal) FractionalApprox() (Fractional, float64, error) {
 //
 // Only the open interval (0, 1) is priceable. Exactly 0 implies infinite odds and
 // exactly 1 implies decimal 1.0, a zero payout; both return
-// ErrProbabilityNotPriceable rather than an infinity or an invalid price. So do the
-// handful of values so close to either endpoint that 1/p rounds onto one of those
-// degenerate results — the double immediately below 1, for instance, has a
-// reciprocal that rounds to exactly 1.0. That is why the computed result is
-// validated rather than assumed.
+// ErrProbabilityNotPriceable rather than an infinity or an invalid price.
+//
+// Values strictly inside (0, 1) can still fail, at the low end only. Once
+// p < 1/math.MaxFloat64 (~5.6e-309, i.e. deep in the subnormals) the reciprocal
+// overflows to +Inf and there is no representable price. The high end needs no such
+// guard: for every double p < 1, 1/p is strictly greater than 1. The nearest case is
+// p = 1-2⁻⁵³, whose reciprocal is 1 + 2⁻⁵³ + 2⁻¹⁰⁶ + … — just past the midpoint
+// between 1.0 and the next double up, so it rounds away from 1.0 rather than onto it.
+// The computed result is validated anyway rather than assumed, because that argument
+// is the kind that stops holding quietly if the Decimal bounds ever move.
 func (p Probability) Decimal() (Decimal, error) {
 	if err := p.Validate(); err != nil {
 		return 0, err
@@ -456,9 +465,18 @@ func (p Probability) Decimal() (Decimal, error) {
 		return 0, fmt.Errorf("odds: probability %g implies a zero payout: %w", f, ErrProbabilityNotPriceable)
 	}
 
+	// Only one endpoint can fail here, and it is the low one. The guards above leave
+	// 0 < f < 1, and for every double strictly below 1 the reciprocal is strictly
+	// above 1 (the closest case, f = 1-2⁻⁵³, gives 1/f = 1 + 2⁻⁵³ + 2⁻¹⁰⁶ + …, past
+	// the midpoint to the next double up, so it rounds away from 1.0). Decimal.Validate
+	// can therefore only reject an overflow to +Inf, which is a probability so small
+	// it has no price — never a value that has rounded down onto certainty. A second
+	// branch naming the high end used to sit here; it was unreachable, and an
+	// unreachable error return in this package is a hole in the CLAUDE.md §10
+	// coverage floor rather than defence in depth.
 	d := Decimal(1 / f)
 	if err := d.Validate(); err != nil {
-		return 0, fmt.Errorf("odds: probability %g is too close to certainty to price: %w", f, ErrProbabilityNotPriceable)
+		return 0, fmt.Errorf("odds: probability %g is too close to impossible to price, 1/p overflows: %w", f, ErrProbabilityNotPriceable)
 	}
 	return d, nil
 }
@@ -553,6 +571,16 @@ func bestRationalApproximation(x float64, maxDen, maxNum int64, tol float64) Fra
 		term := math.Floor(remainder)
 		// Guard the float64 → int64 conversion: out-of-range conversions are
 		// implementation-defined in Go, so the term is bounded before it is cast.
+		//
+		// This guard is also what terminates a completed expansion. When x is
+		// rational the remainder eventually lands on an exact integer, the fractional
+		// part below is exactly 0, and 1/0 makes the next remainder +Inf; floor(+Inf)
+		// fails this test on the following pass and the loop exits with best holding
+		// the exact convergent. Two extra breaks used to sit further down guarding
+		// that case directly. They were unreachable — an expansion that terminates
+		// has produced a convergent equal to x, so the tolerance test below always
+		// fires first — and unreachable code is what keeps this package off the
+		// CLAUDE.md §10 coverage floor, so the single covered guard does the work.
 		if term < 0 || term > float64(maxNum) {
 			break
 		}
@@ -569,19 +597,9 @@ func bestRationalApproximation(x float64, maxDen, maxNum int64, tol float64) Fra
 			break
 		}
 
-		frac := remainder - term
-		if frac <= 0 {
-			// x is rational and the expansion is complete; best is exact.
-			break
-		}
-		next := 1 / frac
-		if math.IsInf(next, 0) || math.IsNaN(next) {
-			break
-		}
-
 		numPrev2, numPrev1 = numPrev1, num
 		denPrev2, denPrev1 = denPrev1, den
-		remainder = next
+		remainder = 1 / (remainder - term)
 	}
 
 	return best

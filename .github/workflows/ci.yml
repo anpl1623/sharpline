@@ -193,6 +193,7 @@ jobs:
             verify-no-host-toolchain \
             lint \
             test-race \
+            cover \
             vuln \
             migrate-dry-run \
             buildx-multiarch \
@@ -346,6 +347,29 @@ jobs:
       - run: make test-race
 
   # ---------------------------------------------------------------------------
+  # Coverage floors (CLAUDE.md §10: 80% overall, effectively 100% on
+  # internal/domain/odds).
+  #
+  # It runs as its own job rather than as a step of `test`, for two reasons: the
+  # race build and the coverage build instrument the binary differently and there is
+  # no reason to serialise them, and a coverage regression should be legible in the
+  # checks list as a coverage failure rather than as "go test -race failed".
+  #
+  # `make cover` exits non-zero on its own when a floor is missed and prints the
+  # offending packages and, for the odds package, every uncovered block. There is
+  # deliberately no threshold duplicated here: the numbers live beside the target in
+  # the Makefile so that a local run and CI cannot disagree about what passing means.
+  # ---------------------------------------------------------------------------
+  coverage:
+    name: coverage floors
+    needs: [directive]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: make cover
+
+  # ---------------------------------------------------------------------------
   # govulncheck
   # ---------------------------------------------------------------------------
   vuln:
@@ -473,7 +497,7 @@ jobs:
   ci:
     name: ci
     if: always()
-    needs: [directive, lint, test, vuln, migrate-dry-run, build, scan]
+    needs: [directive, lint, test, coverage, vuln, migrate-dry-run, build, scan]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
