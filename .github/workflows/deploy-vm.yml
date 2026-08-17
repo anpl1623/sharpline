@@ -1,0 +1,152 @@
+# ==============================================================================
+# Sharpline VM Continuous Delivery  --  GCP Always Free Tier
+# ==============================================================================
+#
+# Rolls out the full Sharpline stack (Postgres/TimescaleDB, Kafka KRaft, Redis,
+# 6 Go microservices, Next.js 15 Standalone, and Caddy Edge Proxy) to the
+# cloud virtual machine with zero downtime and automated health verification.
+#
+# Required Secrets (Settings > Secrets and variables > Actions):
+#   GCP_VM_HOST        -- IP or hostname of the VM (e.g. 34.56.164.139)
+#   GCP_VM_USER        -- SSH username on the VM (e.g. Andrewpleeter)
+#   GCP_SSH_PRIVATE_KEY-- Ed25519 or RSA private key authorized on the VM
+# ==============================================================================
+
+name: deploy-vm
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      target_host:
+        description: "Target VM IP address or hostname"
+        type: string
+        required: false
+        default: "34.56.164.139"
+      rebuild_images:
+        description: "Force rebuild all container images"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-vm-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  directive:
+    name: no host toolchain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: make verify-no-host-toolchain
+
+  deploy:
+    name: rollout to gcp vm
+    needs: [directive]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      VM_HOST: ${{ github.event.inputs.target_host || secrets.GCP_VM_HOST || '34.56.164.139' }}
+      VM_USER: ${{ secrets.GCP_VM_USER || 'Andrewpleeter' }}
+      REBUILD: ${{ github.event.inputs.rebuild_images || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: configure ssh credentials
+        env:
+          SSH_KEY: ${{ secrets.GCP_SSH_PRIVATE_KEY || secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SSH_KEY:-}" ]; then
+            echo "::warning::GCP_SSH_PRIVATE_KEY secret is not set. Deployment cannot connect to remote host via CI runner without authorized SSH key."
+            echo "SKIPPED_AUTH=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          echo "SSH_AUTH_READY=true" >> "$GITHUB_ENV"
+
+      - name: execute remote rollout
+        if: env.SSH_AUTH_READY == 'true'
+        run: |
+          set -euo pipefail
+          echo "==> Connecting to ${VM_USER}@${VM_HOST}..."
+          
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -i ~/.ssh/id_deploy "${VM_USER}@${VM_HOST}" \
+            "COMMIT_SHA='${{ github.sha }}' REBUILD='${REBUILD}' bash -s" << 'REMOTE_SCRIPT'
+            set -euo pipefail
+            cd ~/sharpline
+            
+            echo "==> Fetching latest changes (${COMMIT_SHA:0:12})..."
+            git fetch --all --tags
+            git checkout "${COMMIT_SHA}"
+            
+            echo "==> Building container stack..."
+            if [ "${REBUILD}" = "true" ]; then
+              sudo docker compose --env-file .env -f deploy/compose/compose.yaml build --no-cache
+            else
+              sudo docker compose --env-file .env -f deploy/compose/compose.yaml build --parallel
+            fi
+            
+            echo "==> Starting persistent data plane (Postgres, Redis, Kafka)..."
+            sudo docker compose --env-file .env -f deploy/compose/compose.yaml up -d postgres redis kafka
+            
+            echo "==> Running database schema migrations..."
+            sudo docker compose --env-file .env -f deploy/compose/compose.yaml run --rm migrate
+            
+            echo "==> Rolling out all platform microservices..."
+            sudo docker compose --env-file .env -f deploy/compose/compose.yaml up -d --remove-orphans
+            
+            echo "==> Probing service readiness..."
+            for i in $(seq 1 30); do
+              if curl -fs http://localhost/api/healthz >/dev/null 2>&1 && curl -fs http://localhost/api/readyz >/dev/null 2>&1; then
+                echo "==> SUCCESS: All services healthy and accepting traffic."
+                exit 0
+              fi
+              sleep 2
+            done
+            
+            echo "::error::Health check timeout after 60 seconds."
+            sudo docker compose --env-file .env -f deploy/compose/compose.yaml ps
+            exit 1
+          REMOTE_SCRIPT
+
+      - name: verify public endpoints
+        if: env.SSH_AUTH_READY == 'true'
+        run: |
+          set -euo pipefail
+          echo "==> Verifying public endpoint health at http://${VM_HOST}/api/healthz..."
+          curl -sf -m 10 "http://${VM_HOST}/api/healthz"
+          echo ""
+          echo "==> Verifying public endpoint readiness at http://${VM_HOST}/api/readyz..."
+          curl -sf -m 10 "http://${VM_HOST}/api/readyz"
+          echo ""
+
+      - name: generate rollout summary
+        if: always()
+        run: |
+          {
+            echo "## 🚀 Sharpline VM Rollout Summary"
+            echo ""
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| **Target Host** | \`${VM_HOST}\` |"
+            echo "| **Commit** | \`${{ github.sha }}\` |"
+            echo "| **Web UI** | [http://${VM_HOST}](http://${VM_HOST}) |"
+            echo "| **API Health** | [http://${VM_HOST}/api/healthz](http://${VM_HOST}/api/healthz) |"
+            echo "| **API Ready** | [http://${VM_HOST}/api/readyz](http://${VM_HOST}/api/readyz) |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
