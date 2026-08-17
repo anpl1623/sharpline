@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/anpl1623/sharpline/internal/platform/buildinfo"
 	"github.com/anpl1623/sharpline/internal/platform/config"
 	"github.com/anpl1623/sharpline/internal/platform/httpx"
 	"github.com/anpl1623/sharpline/internal/platform/logging"
@@ -42,15 +43,32 @@ func run() error {
 	}
 
 	log := logging.New(os.Stdout, cfg.LogLevel, service, cfg.Env)
-	log.Info("starting", slog.Any("config", cfg))
+	// Build identity on the first line; see cmd/api/main.go for why.
+	log.Info("starting",
+		slog.Any("build", buildinfo.Read()),
+		slog.Any("config", cfg),
+	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	// Built here so a collector lands on it before the listener exists; see
+	// cmd/ingest/main.go.
+	registry := httpx.NewRegistry()
+
+	// sharpline_build_info; see cmd/api/main.go. This service is the one scaled
+	// by a custom-metric HPA on active WebSocket connections (CLAUDE.md §9), so
+	// its replica set is the most volatile in the cluster and identifying which
+	// build a given pod is serving is correspondingly harder without this.
+	if err := buildinfo.Register(registry, service); err != nil {
+		return fmt.Errorf("%s: %w", service, err)
+	}
+
 	srv, err := httpx.NewServer(httpx.ServerOptions{
-		Service: service,
-		Addr:    cfg.HTTPAddr,
-		Logger:  log,
+		Service:  service,
+		Addr:     cfg.HTTPAddr,
+		Logger:   log,
+		Registry: registry,
 		// Read and write deadlines would sever a long-lived WebSocket
 		// connection, so this listener runs without them. ReadHeaderTimeout
 		// keeps its default, which still bounds a slowloris handshake. Idle

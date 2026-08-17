@@ -2,40 +2,195 @@
 #
 # CLAUDE.md §9: "Odds staleness is the headline SLO — define it, alert on it,
 # put it on the dashboard." This file is the "alert on it" half. The dashboard
-# half is ../grafana/dashboards/sharpline-overview.json, and the definition is
-# written verbatim into that dashboard's top text panel.
+# half is ../grafana/dashboards/sharpline-overview.json, and the definition below
+# is reproduced verbatim in that dashboard's top text panel.
 #
-# ODDS STALENESS — THE DEFINITION (one place, copied everywhere else):
+# EVERYTHING HERE WAS VERIFIED AGAINST A RUNNING STACK, NOT ONLY PARSED.
+# `make up-obs` on 2026-08-17 (first ever boot of the obs profile — phase 0 wrote
+# it but never started it). All 6 rule groups load with health=ok and zero
+# evaluation errors; all 8 scrape targets report up. The series that do not exist
+# yet are named below exactly as the phase that emits them must emit them.
 #
-#   staleness = (wall-clock instant the price is written to the client socket)
-#             - (provider observation timestamp carried on that price)
 #
-#   Measured by `stream`, at the moment of fanout, and recorded as
-#   sharpline_odds_staleness_seconds{stage="fanout"}. The provider observation
-#   timestamp is the provider's own `last_update` for the market, propagated
-#   unchanged through ingest -> Kafka -> pricer -> stream. It is NOT the time
-#   ingest received the payload, and NOT a timestamp re-stamped at any hop.
+# =============================================================================
+# THE TWO SLOs, AND WHY THERE ARE TWO
+# =============================================================================
 #
-#   The intermediate stages record the same histogram under stage="received",
-#   stage="normalized", stage="priced" so the pipeline segment responsible for
-#   a regression is identifiable. Only stage="fanout" is the SLO.
+# There are two staleness numbers, they answer different questions, and phase 0
+# conflated them. ADR 0003 ("Accepted", supersedes CLAUDE.md §13.1) is explicit:
 #
-# SLO TARGETS (objective, not a hard limit):
-#   p50 <= 0.5s   p99 <= 2.0s   over a rolling 30d window, 99% of the time.
-#   Page-worthy breach: p99 > 5s.
+#   "The staleness SLO is now provider-bound, not architecture-bound. At the
+#    recommended tier the system can price and fan out an update in single-digit
+#    milliseconds and still show a 90-second-old line, because that is when it
+#    was last fetched. The Grafana dashboard must distinguish provider staleness
+#    from pipeline staleness or it will measure the wrong thing and flatter the
+#    wrong component."
 #
-# Loaded by prometheus.yml via `rule_files: /etc/prometheus/rules/*.yml`, so
-# the compose/Helm owner must mount deploy/observability/rules at
-# /etc/prometheus/rules.
+#   "Sharpline's staleness SLO must be set against *this* number, not against an
+#    aspirational one: a p99 odds-staleness target of ~95 seconds is honest at
+#    this tier, and a dashboard claiming sub-10-second freshness while running
+#    here would be lying."
+#
+# Phase 0 wrote p50 ≤ 0.5s / p99 ≤ 2s / page at 5s for the end-to-end number.
+# Against ADR 0003's 90-second live polling cadence those thresholds fire
+# PERMANENTLY and correctly — the line really is ~90s old — which would leave the
+# headline SLO alert red forever and therefore ignored. CLAUDE.md §9 never
+# specified numbers; the numbers were an unreviewed phase-0 guess made before the
+# provider was chosen. They are corrected here. See the ledger return value.
+#
+# ---------------------------------------------------------------------------
+# SLO 1 — ODDS FRESHNESS.  User-visible. Provider-bound.  THE HEADLINE.
+# ---------------------------------------------------------------------------
+#
+#   freshness = (instant the price is written to the client socket)
+#             - (observed_at carried on that price)
+#
+#   `observed_at` is the PROVIDER'S OWN observation instant — The Odds API's
+#   `last_update` for the market — propagated UNCHANGED through
+#   ingest → Kafka → pricer → stream. No hop re-stamps it. It is the same value
+#   stored in the `prices.observed_at` column, which migrations/00003 calls "the
+#   subtrahend in every staleness measurement".
+#
+#   IT IS NOT `ingested_at` (when ingest received the payload), NOT `created_at`
+#   (when the row committed), and NOT `updated_at` (row-write metadata, which the
+#   phase-2 handoff warns "is NOT an event time"). Those three are different
+#   clocks answering different questions.
+#
+#   Series: sharpline_odds_staleness_seconds{stage,league,provider}   (histogram)
+#   SLO stage: "fanout".  Stages "received" | "normalized" | "priced" exist so a
+#   regression is attributable to a pipeline segment. Only "fanout" is the SLO.
+#
+#   OBJECTIVE IS CADENCE-RELATIVE, NOT A CONSTANT. This is the only honest
+#   formulation, because ADR 0003 §"Consequences" requires the polling budget to
+#   be a config value ("the token-bucket budget must be a config value so the
+#   cadence can be retuned"), and because the synthetic provider ticks far faster
+#   than the real one. A constant would be wrong under one of the two providers
+#   no matter which constant is chosen. So the threshold is derived from the
+#   configured cadence at evaluation time:
+#
+#       objective_p99 = max(live poll interval) × 1.25 + 2s
+#
+#   One full poll interval (a price is at worst one interval old the instant
+#   before the next poll lands) + 25% for scheduler jitter and backoff + the 2s
+#   pipeline budget from SLO 2's page threshold. At ADR 0003's recommended 100K
+#   tier (90s live cadence) that evaluates to 114.5s, which is the same order as
+#   the ADR's own "~95 seconds is honest" figure.
+#
+# ---------------------------------------------------------------------------
+# SLO 2 — PIPELINE LATENCY.  Architecture-bound.  THE ONE WE CONTROL.
+# ---------------------------------------------------------------------------
+#
+#   pipeline = (instant the price is written to the client socket)
+#            - (ingested_at carried on that price)
+#
+#   Series: sharpline_pipeline_latency_seconds{stage,league}   (histogram)
+#
+#   This is the number a regression in the normalizer, the bus, the pricer or the
+#   fanout hub actually moves, and it is where sub-second targets belong.
+#   CLAUDE.md §2 justifies Go on precisely this metric ("a 200ms GC pause is a
+#   visible defect in a live line ticker"), so this is the SLO that defends the
+#   language choice.
+#
+#   It is NOT derivable from SLO 1. Subtracting two histograms' quantiles is not
+#   valid arithmetic — q(A−B) ≠ q(A) − q(B) — so the difference must be measured
+#   directly at the point of fanout. Both histograms are required.
+#
+#   PROVIDER-ATTRIBUTABLE staleness is the third quantity and it needs no new
+#   series: it is sharpline_odds_staleness_seconds{stage="received"}, which
+#   migrations/00003 defines as exactly (ingested_at − observed_at). Together the
+#   three satisfy the ADR's "distinguish provider staleness from pipeline
+#   staleness" requirement.
+#
+# ---------------------------------------------------------------------------
+# OBJECTIVES
+# ---------------------------------------------------------------------------
+#
+#   | SLO                | p50      | p99                      | page          |
+#   |--------------------|----------|--------------------------|---------------|
+#   | 1 Odds freshness   | ≤ ½ cad. | ≤ cadence×1.25 + 2s      | > 300s        |
+#   | 2 Pipeline latency | ≤ 25 ms  | ≤ 250 ms                 | > 2s          |
+#
+#   Compliance: 99% of fanned-out prices under 120s (SLO 1) and under 0.5s
+#   (SLO 2), over a rolling 1h window.
+#
+# ---------------------------------------------------------------------------
+# NEGATIVE STALENESS IS A REAL STATE AND MUST NOT BE SWALLOWED
+# ---------------------------------------------------------------------------
+#
+# migrations/00003 declines a `CHECK (ingested_at >= observed_at)` on purpose,
+# because a provider may stamp `last_update` slightly in the future and the
+# domain requires the skewed value to be storable. `domain.Price.Age()` returns a
+# NEGATIVE duration in that case, and price.go says why: "returning it rather
+# than clamping to zero is what lets a monitor detect the skew instead of
+# silently reporting healthy staleness."
+#
+# A Prometheus histogram destroys that signal: a negative observation lands in
+# the lowest bucket and reads as EXCELLENT freshness. The observability layer
+# would therefore throw away precisely the signal the schema and the domain went
+# out of their way to preserve.
+#
+# Hence the contract: the emitter CLAMPS the histogram observation at 0 (so the
+# quantiles stay interpretable) AND increments
+# sharpline_odds_clock_skew_total{provider,stage} whenever the raw difference was
+# negative. Clamping is then never silent. ProviderClockSkewDetected alerts on it.
+#
+#
+# =============================================================================
+# HISTOGRAM BUCKET BOUNDARIES ARE PART OF THE CONTRACT
+# =============================================================================
+#
+# Several rules below select a single bucket by an exact `le` literal, e.g.
+# `{le="120"}`. If the emitted histogram has no boundary at that value the
+# selector matches NOTHING, the rule silently evaluates to empty, and the SLI
+# reads as absent rather than as broken. That is unrecoverable at query time, so
+# the boundaries are specified here and the emitting phase must use them exactly.
+#
+# Prometheus renders integral bounds without a decimal point — verified on the
+# live stack against sharpline_db_ping_duration_seconds, whose le labels are
+# "1", "2", "3" and not "1.0". So `le="120"` is correct and `le="120.0"` is not.
+#
+#   sharpline_odds_staleness_seconds   — spans a 90s cadence, so it must reach 300:
+#     0.05 0.1 0.25 0.5 1 2.5 5 10 20 30 45 60 90 120 180 300
+#     REQUIRED exact boundary: 120   (the SLO-1 compliance bucket)
+#
+#   sharpline_pipeline_latency_seconds — sub-second, ours:
+#     0.001 0.0025 0.005 0.01 0.025 0.05 0.1 0.25 0.5 1 2.5 5 10
+#     REQUIRED exact boundary: 0.5   (the SLO-2 compliance bucket)
+#
+#   sharpline_pricing_duration_seconds — must carry 0.25 so PricingLatencyHigh's
+#     p99 threshold sits on a boundary rather than being interpolated across one:
+#     0.0005 0.001 0.0025 0.005 0.01 0.025 0.05 0.1 0.25 0.5 1 2.5
+#
+#   sharpline_db_query_duration_seconds — ALREADY SHIPPED (phase 2), and its 0.25
+#     boundary was read off the live endpoint, not assumed. DatabaseSlowQueries
+#     depends on it. deploy/postgres/postgresql.conf sets
+#     log_min_duration_statement = 250ms, so the bucket and the server's
+#     slow-query log agree on where "slow" starts.
+#
+#
+# Loaded by prometheus.yml via `rule_files: /etc/prometheus/rules/*.yml`, so the
+# compose/Helm owner must mount deploy/observability/rules at
+# /etc/prometheus/rules. compose.obs.yaml does; verified by the rule groups
+# actually appearing in the running Prometheus' /api/v1/rules.
+#
+# Alertmanager is deliberately NOT in the container inventory (CLAUDE.md §9 names
+# prometheus / grafana / jaeger / otel-collector and nothing else). Rules still
+# evaluate and fire — they surface in Prometheus /alerts and in the dashboard's
+# annotation queries. Adding Alertmanager is an inventory change and needs an ADR.
 
 groups:
   # =====================================================================
   # Recording rules — precompute the SLO series so the dashboard, the alerts
   # and any future prometheus-adapter HPA all read the identical number.
+  #
+  # Every quantile here fixes [5m] rather than $__rate_interval: a recording
+  # rule has no dashboard to inherit an interval from, and the alert thresholds
+  # were chosen against a 5-minute window.
   # =====================================================================
   - name: sharpline.slo.recording
     interval: 15s
     rules:
+      # ---- SLO 1: odds freshness (from observed_at) --------------------
       - record: sharpline:odds_staleness_seconds:p50
         expr: |
           histogram_quantile(
@@ -50,20 +205,63 @@ groups:
             sum by (le) (rate(sharpline_odds_staleness_seconds_bucket{stage="fanout"}[5m]))
           )
 
-      # Fraction of fanned-out prices that met the 2s objective. This is the
-      # SLI; 1 - this is the error budget burn.
-      - record: sharpline:odds_staleness_slo_ratio:5m
+      # Provider-attributable share: (ingested_at − observed_at), which is what
+      # stage="received" measures. This is the number that is ~90s at ADR 0003's
+      # tier and that no amount of engineering here can lower.
+      - record: sharpline:odds_staleness_seconds:provider_p99
         expr: |
-          sum(rate(sharpline_odds_staleness_seconds_bucket{stage="fanout",le="2"}[5m]))
-            /
-          sum(rate(sharpline_odds_staleness_seconds_count{stage="fanout"}[5m]))
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(sharpline_odds_staleness_seconds_bucket{stage="received"}[5m]))
+          )
 
-      - record: sharpline:odds_staleness_slo_ratio:1h
+      # The cadence-relative objective, computed from the configured poll
+      # interval rather than hardcoded. `window="live"` is the binding window —
+      # ADR 0003's assumptions table also defines pregame (15 min) and
+      # futures (60 min) windows, whose staleness is uninteresting.
+      #
+      # max() rather than avg(): the SLO must be met for the slowest-polled
+      # league, not on average across leagues.
+      - record: sharpline:odds_staleness_objective_seconds:p99
+        expr: max(sharpline_ingest_poll_interval_seconds{window="live"}) * 1.25 + 2
+
+      # SLI for SLO 1. le="120" MUST exist in the histogram — see the bucket
+      # contract in the header.
+      - record: sharpline:odds_freshness_slo_ratio:1h
         expr: |
-          sum(rate(sharpline_odds_staleness_seconds_bucket{stage="fanout",le="2"}[1h]))
+          sum(rate(sharpline_odds_staleness_seconds_bucket{stage="fanout",le="120"}[1h]))
             /
           sum(rate(sharpline_odds_staleness_seconds_count{stage="fanout"}[1h]))
 
+      # ---- SLO 2: pipeline latency (from ingested_at) ------------------
+      - record: sharpline:pipeline_latency_seconds:p50
+        expr: |
+          histogram_quantile(
+            0.50,
+            sum by (le) (rate(sharpline_pipeline_latency_seconds_bucket{stage="fanout"}[5m]))
+          )
+
+      - record: sharpline:pipeline_latency_seconds:p99
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(sharpline_pipeline_latency_seconds_bucket{stage="fanout"}[5m]))
+          )
+
+      # SLI for SLO 2. le="0.5" MUST exist in the histogram.
+      - record: sharpline:pipeline_latency_slo_ratio:5m
+        expr: |
+          sum(rate(sharpline_pipeline_latency_seconds_bucket{stage="fanout",le="0.5"}[5m]))
+            /
+          sum(rate(sharpline_pipeline_latency_seconds_count{stage="fanout"}[5m]))
+
+      - record: sharpline:pipeline_latency_slo_ratio:1h
+        expr: |
+          sum(rate(sharpline_pipeline_latency_seconds_bucket{stage="fanout",le="0.5"}[1h]))
+            /
+          sum(rate(sharpline_pipeline_latency_seconds_count{stage="fanout"}[1h]))
+
+      # ---- supporting ---------------------------------------------------
       - record: sharpline:pricing_duration_seconds:p99
         expr: |
           histogram_quantile(
@@ -71,73 +269,190 @@ groups:
             sum by (le) (rate(sharpline_pricing_duration_seconds_bucket[5m]))
           )
 
+      # Pool utilisation, precomputed so DatabasePoolSaturated and the Grafana
+      # panel cannot disagree.
+      #
+      # Both sides are reduced with the SAME `sum by` label set so the division
+      # matches on identical labels and needs no on()/group_left. The left-hand
+      # selector's `state` label is dropped by the aggregation, which is what
+      # makes that possible — an earlier form used
+      # `/ on(job,instance) group_left()` and carried a meaningless
+      # state="acquired" label onto a utilisation ratio.
+      - record: sharpline:db_pool_utilisation:ratio
+        expr: |
+          sum by (service, instance) (sharpline_db_pool_connections{state="acquired"})
+            /
+          sum by (service, instance) (sharpline_db_pool_connections_max)
+
   # =====================================================================
-  # Headline SLO alerts
+  # SLO 1 — odds freshness. Provider-bound; thresholds derived from cadence.
   # =====================================================================
-  - name: sharpline.slo.odds_staleness
+  - name: sharpline.slo.odds_freshness
     interval: 15s
     rules:
-      - alert: OddsStalenessP99Degraded
-        expr: sharpline:odds_staleness_seconds:p99 > 2
-        for: 5m
+      - alert: OddsFreshnessBeyondCadence
+        # Both sides are label-free single-element vectors (max() strips all
+        # labels, and the p99 recording rule aggregates `by (le)` then
+        # histogram_quantile drops le), so the comparison matches on the empty
+        # label set. If either side is absent the expression is empty and the
+        # alert stays inactive — which is why OddsPollCadenceUnknown exists.
+        expr: sharpline:odds_staleness_seconds:p99 > sharpline:odds_staleness_objective_seconds:p99
+        for: 10m
         labels:
           severity: warning
-          slo: odds_staleness
+          slo: odds_freshness
           service: stream
         annotations:
-          summary: "Odds staleness p99 above the 2s objective"
+          summary: "Odds freshness p99 exceeds the configured polling cadence"
           description: >-
-            p99 staleness at fanout is {{ $value | humanizeDuration }}, above the
-            2s objective, for 5 minutes. Staleness = fanout instant minus the
-            provider observation timestamp on the price. Compare the per-stage
-            breakdown (stage=received|normalized|priced|fanout) to find which
-            pipeline segment added the delay.
-          runbook: "Check consumer lag on odds.normalized and price.computed, then pricer CPU."
+            p99 age at fanout is {{ $value | humanizeDuration }}, beyond
+            (live poll interval × 1.25 + 2s). Freshness = fanout instant minus the
+            provider's observed_at. Because the objective already contains the
+            polling cadence, breaching it means the delay is NOT the provider's
+            cadence — compare sharpline:pipeline_latency_seconds:p99 (ours) against
+            sharpline:odds_staleness_seconds:provider_p99 (theirs) to attribute it.
+          runbook: >-
+            Check consumer lag on odds.normalized and price.computed first, then
+            pricer CPU, then whether ingest's adaptive polling has backed off
+            because provider quota is draining.
 
-      - alert: OddsStalenessP99Critical
-        expr: sharpline:odds_staleness_seconds:p99 > 5
+      # Absolute backstop, independent of any config-derived threshold. No tier
+      # in ADR 0003 justifies a five-minute-old line reaching a browser.
+      - alert: OddsFreshnessCritical
+        expr: sharpline:odds_staleness_seconds:p99 > 300
         for: 2m
         labels:
           severity: critical
-          slo: odds_staleness
+          slo: odds_freshness
           service: stream
         annotations:
-          summary: "Odds staleness p99 above 5s — the live board is visibly wrong"
+          summary: "Odds freshness p99 above 5 minutes — the board is visibly wrong"
           description: >-
-            p99 staleness at fanout is {{ $value | humanizeDuration }}. At this
-            level a user is being shown prices that no longer exist. Suspend
-            affected markets before anything else.
+            p99 age at fanout is {{ $value | humanizeDuration }}. At this level a
+            user is being shown prices that no longer exist. Suspend affected
+            markets before anything else.
 
-      - alert: OddsStalenessSLOBudgetBurn
-        expr: sharpline:odds_staleness_slo_ratio:1h < 0.99
+      - alert: OddsFreshnessSLOBudgetBurn
+        expr: sharpline:odds_freshness_slo_ratio:1h < 0.99
         for: 15m
         labels:
           severity: warning
-          slo: odds_staleness
+          slo: odds_freshness
         annotations:
-          summary: "Odds staleness error budget burning"
+          summary: "Odds freshness error budget burning"
           description: >-
             Only {{ $value | humanizePercentage }} of prices reached the browser
-            within 2s over the last hour; the objective is 99%.
+            within 120s over the last hour; the objective is 99%.
+
+      # The cadence gauge is half of SLO 1's contract. Without it the objective
+      # recording rule is empty and OddsFreshnessBeyondCadence can never fire —
+      # a silently unguarded headline SLO.
+      #
+      # Guarded so it stays quiet until the histogram exists: it fires only when
+      # staleness IS being measured but the cadence is not published. It is
+      # therefore inactive today (nothing emits either series yet) and becomes
+      # active the moment a phase ships the histogram without the gauge.
+      - alert: OddsPollCadenceUnknown
+        expr: |
+          absent(sharpline_ingest_poll_interval_seconds{window="live"})
+            and on ()
+          (sum(rate(sharpline_odds_staleness_seconds_count{stage="fanout"}[10m])) > 0)
+        for: 10m
+        labels:
+          severity: warning
+          slo: odds_freshness
+          service: ingest
+        annotations:
+          summary: "Prices are being fanned out but the polling cadence is not published"
+          description: >-
+            sharpline_ingest_poll_interval_seconds{window="live"} is absent, so
+            sharpline:odds_staleness_objective_seconds:p99 is empty and the
+            headline freshness SLO has no threshold to compare against. ingest
+            must export its configured live poll interval as a gauge.
+
+      # A provider stamping observed_at in the future makes the raw difference
+      # negative. The emitter clamps the histogram at 0 so quantiles stay
+      # interpretable, and counts the clamp here so it is never silent. See the
+      # header, migrations/00003, and domain.Price.Age().
+      - alert: ProviderClockSkewDetected
+        expr: sum by (provider, stage) (increase(sharpline_odds_clock_skew_total[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: ingest
+        annotations:
+          summary: "Provider {{ $labels.provider }} observed_at is ahead of our clock at stage={{ $labels.stage }}"
+          description: >-
+            {{ $value | printf "%.0f" }} prices in 15m carried an observed_at in the
+            future, so their true staleness is negative and was clamped to 0 for the
+            histogram. Freshness is being UNDER-reported by the amount of the skew.
+            Either the provider's last_update is wrong or a container clock has drifted.
 
       # The SLO is unmeasurable if nothing is fanning out. That is a distinct
       # failure from "slow", and it must not read as "healthy".
       - alert: OddsFanoutStopped
         expr: |
           sum(rate(sharpline_odds_staleness_seconds_count{stage="fanout"}[5m])) == 0
-            and
-          sharpline_ws_connections_active > 0
+            and on ()
+          (sum(sharpline_ws_connections_active) > 0)
         for: 5m
         labels:
           severity: critical
-          slo: odds_staleness
+          slo: odds_freshness
           service: stream
         annotations:
           summary: "Clients are connected but no prices are being fanned out"
           description: >-
-            sharpline_ws_connections_active > 0 while the fanout rate is zero for
-            5 minutes. The staleness SLO reads as met only because nothing is
-            being measured.
+            Connections are active while the fanout rate is zero for 5 minutes. The
+            freshness SLO reads as met only because nothing is being measured.
+
+  # =====================================================================
+  # SLO 2 — pipeline latency. Architecture-bound; tight, absolute thresholds.
+  # These inherit the sub-second numbers phase 0 wrongly applied end-to-end.
+  # =====================================================================
+  - name: sharpline.slo.pipeline_latency
+    interval: 15s
+    rules:
+      - alert: PipelineLatencyP99Degraded
+        expr: sharpline:pipeline_latency_seconds:p99 > 0.25
+        for: 5m
+        labels:
+          severity: warning
+          slo: pipeline_latency
+          service: stream
+        annotations:
+          summary: "Pipeline latency p99 above the 250ms objective"
+          description: >-
+            {{ $value | humanizeDuration }} from ingested_at to the client socket.
+            This is the segment Sharpline owns — normalize, bus, price, fan out —
+            and it excludes the provider's polling cadence entirely. Compare the
+            per-stage breakdown (stage=normalized|priced|fanout) to localise it.
+
+      - alert: PipelineLatencyP99Critical
+        expr: sharpline:pipeline_latency_seconds:p99 > 2
+        for: 2m
+        labels:
+          severity: critical
+          slo: pipeline_latency
+          service: stream
+        annotations:
+          summary: "Pipeline latency p99 above 2s — our own pipeline is the bottleneck"
+          description: >-
+            {{ $value | humanizeDuration }} of delay is being added after the payload
+            arrived. CLAUDE.md §2 chose Go on the promise of sub-millisecond pauses at
+            this heap size; two orders of magnitude above that is a defect, not load.
+
+      - alert: PipelineLatencySLOBudgetBurn
+        expr: sharpline:pipeline_latency_slo_ratio:1h < 0.99
+        for: 15m
+        labels:
+          severity: warning
+          slo: pipeline_latency
+        annotations:
+          summary: "Pipeline latency error budget burning"
+          description: >-
+            Only {{ $value | humanizePercentage }} of prices traversed our pipeline
+            within 500ms over the last hour; the objective is 99%.
 
   # =====================================================================
   # Pipeline health — the things that cause staleness
@@ -201,6 +516,59 @@ groups:
           description: "No provider requests remain. The board is frozen at the last observation."
 
   # =====================================================================
+  # Bus — the producer and offset-commit side of the franz-go layer.
+  #
+  # CLAUDE.md §3 pays for Kafka's complexity deliberately: "partitions,
+  # consumer groups, offset management, and rebalancing are genuine concepts to
+  # learn". These are the alerts that make the parts it names observable rather
+  # than only the consumer lag.
+  # =====================================================================
+  - name: sharpline.bus
+    interval: 15s
+    rules:
+      - alert: KafkaProduceErrors
+        expr: sum by (topic) (rate(sharpline_kafka_produce_records_total{outcome="error"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+          component: bus
+        annotations:
+          summary: "Producing to {{ $labels.topic }} is failing"
+          description: >-
+            {{ $value | printf "%.2f" }} failed produces/s. On odds.normalized this
+            drops line movement on the floor: the topic is compacted and keyed by
+            market, so a lost record is a market whose snapshot is now stale until
+            the next change to that same key.
+
+      - alert: KafkaOffsetCommitErrors
+        expr: sum by (group) (rate(sharpline_kafka_offset_commits_total{outcome="error"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: bus
+        annotations:
+          summary: "Consumer group {{ $labels.group }} cannot commit offsets"
+          description: >-
+            Offsets are not being persisted, so a restart or rebalance will
+            reprocess from the last successful commit. Duplicate delivery is
+            expected and must be idempotent; unbounded reprocessing is not.
+
+      # A rebalance storm shows up as a lag sawtooth and is the failure mode
+      # §3 warns about by name.
+      - alert: KafkaRebalanceStorm
+        expr: sum by (group) (rate(sharpline_kafka_consumer_group_rebalances_total[10m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          component: bus
+        annotations:
+          summary: "Consumer group {{ $labels.group }} is rebalancing repeatedly"
+          description: >-
+            More than one rebalance every 20s sustained over 10 minutes. Partitions
+            are being reassigned faster than useful work is being done — usually a
+            consumer exceeding max.poll.interval, or a liveness probe restarting it.
+
+  # =====================================================================
   # Fanout health
   # =====================================================================
   - name: sharpline.fanout
@@ -231,6 +599,210 @@ groups:
         annotations:
           summary: "More than 1% of delta traffic is triggering client resync"
           description: "Sequence gaps at this rate mean the delta stream is losing messages."
+
+  # =====================================================================
+  # Database — closes the gap phase 2 opened.
+  #
+  # Phase 2 shipped 15 sharpline_db_* metric families on api:8080 and
+  # settle:8084 and the dashboard alerted on none of them. Every series named
+  # below was read off the LIVE /metrics endpoints of those two containers on
+  # 2026-08-17, not inferred from source.
+  #
+  # Scope note: only `api` and `settle` open a pool, so these alerts naturally
+  # apply to those two and no others — the series simply do not exist on
+  # ingest/pricer/stream. Which is why none of them uses absent(): an absent()
+  # guard here would fire permanently for the three services that legitimately
+  # have no database. (Phase 2 carryover item 8 asks whether `ingest` should
+  # gain a pool for the Timescale writer; if it does, these alerts start
+  # covering it with no edit here.)
+  # =====================================================================
+  - name: sharpline.database
+    interval: 15s
+    rules:
+      # THE alert phase 2's gate asked for. It is not a duplicate of ServiceDown:
+      # ServiceDown watches `up`, which is Prometheus' own reachability of the
+      # /metrics endpoint. This watches the service's own readiness round trip to
+      # Postgres. The two are independent, and the combination
+      # (up == 1 AND sharpline_db_up == 0) is exactly the state in which
+      # /api/readyz used to return 200 with Postgres stopped.
+      #
+      # Detection latency: the container healthcheck GETs /readyz every 10s
+      # (verified live: rate(sharpline_db_ping_duration_seconds_count[2m]) ≈ 0.105/s),
+      # Prometheus scrapes every 15s, so `for: 1m` detects inside ~85s.
+      #
+      # If the SERVICE dies instead, this stays inactive rather than
+      # double-firing: the series goes stale at its last value (1) rather than
+      # dropping to 0, and ServiceDown is the alert that covers that case.
+      - alert: DatabaseUnreachable
+        expr: sharpline_db_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: data-plane
+        annotations:
+          summary: "{{ $labels.service }} is running but cannot reach Postgres"
+          description: >-
+            The most recent readiness round trip from {{ $labels.service }} failed.
+            The process is alive and being scraped, so this is NOT ServiceDown —
+            it is the service-up/database-down case. /readyz is already failing, so
+            the replica should be out of rotation; if traffic is still arriving, the
+            probe wiring is wrong. Distinguish saturation from an unreachable server
+            using sharpline_db_pool_empty_acquires_total: rising means the pool is
+            saturated, flat means the server is gone.
+
+      # Saturation, not merely busy. Both halves are required: high utilisation
+      # alone is a correctly-sized pool doing its job, and empty acquires alone
+      # is a transient burst. Together they are the latency cliff — callers are
+      # queueing for a connection that does not exist.
+      - alert: DatabasePoolSaturated
+        expr: |
+          sharpline:db_pool_utilisation:ratio >= 0.9
+            and on (service, instance)
+          (rate(sharpline_db_pool_empty_acquires_total[5m]) > 0)
+        for: 5m
+        labels:
+          severity: warning
+          component: data-plane
+        annotations:
+          summary: "{{ $labels.service }} Postgres pool is saturated"
+          description: >-
+            {{ $value | humanizePercentage }} of connections checked out with
+            acquisitions still queueing. Every request now pays pool-wait latency
+            on top of query latency. Mean wait is
+            rate(sharpline_db_pool_acquire_wait_seconds_total[5m]) /
+            rate(sharpline_db_pool_acquires_total[5m]). Raising max conns is only
+            safe against the max_connections arithmetic in postgres.go — the sum
+            across every replica of every service has to stay under the server's
+            ceiling.
+
+      # The cliff, realised: callers are no longer waiting, they are giving up.
+      # This is strictly worse than saturation and is a separate severity because
+      # requests are now failing rather than merely slow.
+      - alert: DatabasePoolExhausted
+        expr: sum by (service, instance) (rate(sharpline_db_pool_canceled_acquires_total[5m])) > 0
+        for: 2m
+        labels:
+          severity: critical
+          component: data-plane
+        annotations:
+          summary: "{{ $labels.service }} requests are timing out waiting for a connection"
+          description: >-
+            {{ $value | printf "%.2f" }} acquisitions/s abandoned because the
+            caller's context expired. These requests are failing ON THE POOL, not on
+            the database — the server may be completely healthy. Readiness fails on
+            this by design (see postgres/health.go), so a saturated replica sheds
+            load toward ones that can serve.
+
+      # Requested verbatim by phase 2's own test suite: test/integration/metrics_test.go
+      # says a rejected ledger commit must land on
+      # sharpline_db_transactions_total{outcome="commit_failed"} "so an alert can
+      # fire on it". This is that alert.
+      #
+      # It is a data-integrity signal, not a performance one: the zero-sum ledger
+      # trigger is DEFERRABLE INITIALLY DEFERRED, so an unbalanced double-entry
+      # movement passes every INSERT and is rejected by COMMIT — which is precisely
+      # this outcome label and nowhere else.
+      - alert: DatabaseCommitFailures
+        expr: sum by (service) (increase(sharpline_db_transactions_total{outcome="commit_failed"}[5m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: data-plane
+        annotations:
+          summary: "{{ $labels.service }} transactions are being rejected at COMMIT"
+          description: >-
+            {{ $value | printf "%.0f" }} transactions in 5m ran every statement
+            successfully and were then refused by COMMIT. On this schema that is
+            almost always a DEFERRABLE constraint firing — most importantly the
+            double-entry ledger's zero-sum trigger. Cross-check
+            sharpline_db_query_errors_total{code="23514"} and halt settlement before
+            investigating.
+
+      # The other half of what phase 2's tests asked for: retryable connect
+      # attempts exist "so a slow rollout is distinguishable from a broken one".
+      # These two alerts are that distinction.
+      - alert: DatabaseConnectRetrying
+        expr: sum by (service) (increase(sharpline_db_connect_attempts_total{outcome="retryable"}[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: data-plane
+        annotations:
+          summary: "{{ $labels.service }} is still retrying its initial Postgres connection"
+          description: >-
+            {{ $value | printf "%.0f" }} transient connect failures in 10m. A few at
+            startup are normal — the service is waiting on Postgres. Sustained for
+            ten minutes is a rollout that is not converging.
+
+      - alert: DatabaseConnectFatal
+        expr: sum by (service) (increase(sharpline_db_connect_attempts_total{outcome="fatal"}[5m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: data-plane
+        annotations:
+          summary: "{{ $labels.service }} cannot connect to Postgres and will not retry"
+          description: >-
+            A non-transient connect failure — bad credentials, a missing database, or
+            a protocol violation. Retrying would not help and the pool deliberately
+            does not, so the service fails fast at startup. This is broken, not slow.
+
+      # More than 1% of statements slower than 250ms. The boundary is deliberate:
+      # deploy/postgres/postgresql.conf sets log_min_duration_statement = 250ms
+      # and internal/platform/postgres puts a bucket edge at exactly 0.25 for
+      # this reason, so a firing alert must be accompanied by lines in the
+      # Postgres log. If it is not, one of the two is lying.
+      #
+      # On an idle system the divisor's rate is 0, the expression is NaN, and the
+      # comparison is false — so this cannot fire for lack of traffic.
+      - alert: DatabaseSlowQueries
+        expr: |
+          (
+            sum by (service) (rate(sharpline_db_query_duration_seconds_bucket{le="0.25"}[5m]))
+              /
+            sum by (service) (rate(sharpline_db_query_duration_seconds_count[5m]))
+          ) < 0.99
+        for: 10m
+        labels:
+          severity: warning
+          component: data-plane
+        annotations:
+          summary: "{{ $labels.service }}: over 1% of statements slower than 250ms"
+          description: >-
+            {{ $value | humanizePercentage }} of statements completed under 250ms;
+            the objective is 99%. Break it down by statement with
+            histogram_quantile(0.99, sum by (le, operation)
+            (rate(sharpline_db_query_duration_seconds_bucket[5m]))) — `operation` is
+            the sqlc query name, so it names the query directly.
+
+      # Infrastructure-class SQLSTATEs only. The `code` label vocabulary was read
+      # out of internal/platform/postgres (sqlStateOrClass): a 5-character
+      # SQLSTATE, or one of canceled | deadline_exceeded | no_rows | tx_closed |
+      # pool_closed | connection | unknown.
+      #
+      # The exclusions are the point. Integrity classes (23xxx) are the schema
+      # correctly refusing bad data — an invalid wager must not page anyone — and
+      # `no_rows` is the ordinary outcome of a sqlc :one query that matched
+      # nothing, which is counted as an error by the tracer and would otherwise
+      # make this alert fire in normal operation.
+      #   08xxx connection exception   53xxx insufficient resources
+      #   57xxx operator intervention  58xxx external/system error
+      - alert: DatabaseInfrastructureErrors
+        expr: |
+          sum by (service, code) (
+            rate(sharpline_db_query_errors_total{code=~"08...|53...|57...|58...|connection|pool_closed"}[5m])
+          ) > 0
+        for: 5m
+        labels:
+          severity: critical
+          component: data-plane
+        annotations:
+          summary: "{{ $labels.service }}: Postgres infrastructure errors (code={{ $labels.code }})"
+          description: >-
+            {{ $value | printf "%.2f" }} errors/s in an infrastructure SQLSTATE class
+            — connection loss, resource exhaustion, operator intervention or a
+            server-side system error. These are never application logic. Integrity
+            violations (23xxx) and no_rows are deliberately excluded.
 
   # =====================================================================
   # Correctness — the one alert that means "stop the demo"
@@ -264,10 +836,32 @@ groups:
           severity: critical
         annotations:
           summary: "{{ $labels.service }} is not being scraped"
-          description: "Prometheus cannot reach {{ $labels.instance }} for 2 minutes."
+          description: >-
+            Prometheus cannot reach {{ $labels.instance }} for 2 minutes. This is
+            the process being gone or unreachable. For "the process is fine and its
+            database is not", see DatabaseUnreachable.
 
+      # NAME VERIFIED AGAINST THE RUNNING COLLECTOR, and corrected.
+      #
+      # This alert previously read `otelcol_processor_refused_spans_total`. That
+      # series can never exist on the pinned image: every counter this build
+      # exposes on :8888 is WITHOUT the Prometheus `_total` suffix —
+      # otelcol_process_cpu_seconds, otelcol_process_uptime and
+      # otelcol_process_runtime_total_alloc_bytes are all declared `# TYPE ...
+      # counter` and all lack it. So the alert was permanently unfirable and read
+      # as healthy, which is the exact failure mode a scrape config nobody
+      # verified produces.
+      #
+      # Both spellings are listed rather than only the observed one, because the
+      # suffix is a collector-telemetry setting that a version bump can flip. If
+      # neither exists the expression is empty and the alert is inactive — which
+      # is today's state, since the processor counters are created lazily and no
+      # span has yet traversed the pipeline (phase 3+ produces the first ones).
       - alert: TraceCollectorDroppingSpans
-        expr: rate(otelcol_processor_refused_spans_total[5m]) > 0
+        expr: |
+          sum(rate(otelcol_processor_refused_spans[5m])) > 0
+            or
+          sum(rate(otelcol_processor_refused_spans_total[5m])) > 0
         for: 5m
         labels:
           severity: warning
@@ -276,4 +870,27 @@ groups:
           summary: "OTel collector is refusing spans"
           description: >-
             The memory_limiter is applying backpressure. End-to-end
-            ingest -> pricer -> stream traces will have holes.
+            ingest → pricer → stream traces will have holes.
+
+      # Verifiable TODAY, unlike the span counters above: these two gauges are
+      # live on the collector right now with labels {data_type, exporter}
+      # (observed: exporter="otlp_grpc/jaeger", capacity=1000, size=0). A queue
+      # at capacity is about to start dropping, which is a better signal than
+      # counting the drops after the fact.
+      - alert: TraceExporterQueueFilling
+        expr: |
+          (
+            sum by (exporter, data_type) (otelcol_exporter_queue_size)
+              /
+            clamp_min(sum by (exporter, data_type) (otelcol_exporter_queue_capacity), 1)
+          ) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          component: observability
+        annotations:
+          summary: "OTel exporter queue for {{ $labels.exporter }} is {{ $value | humanizePercentage }} full"
+          description: >-
+            The collector cannot hand {{ $labels.data_type }} to
+            {{ $labels.exporter }} as fast as they arrive. At 100% it drops, and the
+            single-odds-update trace CLAUDE.md §9 asks for loses hops.

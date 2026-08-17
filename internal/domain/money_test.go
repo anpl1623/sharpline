@@ -570,6 +570,125 @@ func TestRoundingString(t *testing.T) {
 	}
 }
 
+// TestParseRounding pins the accepted set to exactly what String emits.
+//
+// The rejected cases are the ones a forgiving parser would have let through, and
+// each is deliberate: `wagers.rounding` is TEXT with a CHECK admitting three
+// spellings, so any spelling this function accepts and the CHECK does not is a
+// wager that can be constructed in Go and never stored.
+func TestParseRounding(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		want    Rounding
+		wantErr error
+	}{
+		{name: "half away from zero", in: "half_away_from_zero", want: RoundHalfAwayFromZero},
+		{name: "half to even", in: "half_to_even", want: RoundHalfToEven},
+		{name: "toward zero", in: "toward_zero", want: RoundTowardZero},
+
+		// "unknown" is String's rendering of the invalid zero value. It is not a
+		// storable state and must not parse, or callers get a Rounding that
+		// every float-consuming operation then rejects.
+		{name: "the invalid zero value's own spelling", in: "unknown", wantErr: ErrUnknownRounding},
+
+		{name: "empty", in: "", wantErr: ErrUnknownRounding},
+		{name: "uppercase", in: "HALF_TO_EVEN", wantErr: ErrUnknownRounding},
+		{name: "mixed case", in: "Half_To_Even", wantErr: ErrUnknownRounding},
+		{name: "hyphenated", in: "half-to-even", wantErr: ErrUnknownRounding},
+		{name: "leading space", in: " half_to_even", wantErr: ErrUnknownRounding},
+		{name: "trailing space", in: "half_to_even ", wantErr: ErrUnknownRounding},
+		{name: "alias nobody promised", in: "bankers", wantErr: ErrUnknownRounding},
+		{name: "alias nobody promised either", in: "truncate", wantErr: ErrUnknownRounding},
+		{name: "numeric form", in: "2", wantErr: ErrUnknownRounding},
+		{name: "long garbage is sampled into the message", in: strings.Repeat("x", 200), wantErr: ErrUnknownRounding},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseRounding(tc.in)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("ParseRounding(%q) error = %v, want %v", tc.in, err, tc.wantErr)
+			}
+			if got != tc.want {
+				t.Errorf("ParseRounding(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+			if tc.wantErr != nil && got != RoundingUnknown {
+				t.Errorf("ParseRounding(%q) failed but returned %v, want the invalid zero value", tc.in, got)
+			}
+		})
+	}
+}
+
+// TestRoundingStringParseRoundTrip walks EVERY defined mode, which is what makes
+// this a total inverse assertion rather than a spot check: adding a fourth mode
+// without teaching ParseRounding about it fails here.
+func TestRoundingStringParseRoundTrip(t *testing.T) {
+	all := []Rounding{RoundHalfAwayFromZero, RoundHalfToEven, RoundTowardZero}
+
+	// The loop covers every VALID value only if the valid values are exactly
+	// these three, so that is asserted over the whole uint8 domain rather than
+	// assumed.
+	var valid []Rounding
+	for i := 0; i <= 255; i++ {
+		if r := Rounding(uint8(i)); r.Valid() {
+			valid = append(valid, r)
+		}
+	}
+	if len(valid) != len(all) {
+		t.Fatalf("Valid() admits %d values %v, but the round trip covers %d %v",
+			len(valid), valid, len(all), all)
+	}
+
+	for _, r := range all {
+		s := r.String()
+		back, err := ParseRounding(s)
+		if err != nil {
+			t.Fatalf("ParseRounding(%q) from Rounding(%d).String(): unexpected error %v", s, uint8(r), err)
+		}
+		if back != r {
+			t.Errorf("round trip Rounding(%d) → %q → Rounding(%d)", uint8(r), s, uint8(back))
+		}
+
+		text, err := r.MarshalText()
+		if err != nil {
+			t.Fatalf("Rounding(%d).MarshalText(): unexpected error %v", uint8(r), err)
+		}
+		if string(text) != s {
+			t.Errorf("Rounding(%d).MarshalText() = %q, want %q (String)", uint8(r), text, s)
+		}
+
+		var decoded Rounding
+		if err := decoded.UnmarshalText(text); err != nil {
+			t.Fatalf("UnmarshalText(%q): unexpected error %v", text, err)
+		}
+		if decoded != r {
+			t.Errorf("text round trip Rounding(%d) → %q → Rounding(%d)", uint8(r), text, uint8(decoded))
+		}
+	}
+}
+
+// TestRoundingTextCodecRejectsInvalid keeps the codec from becoming the back
+// door the constructor closed: MulFloat refuses RoundingUnknown, so a decoder
+// that accepted it would only move the failure later.
+func TestRoundingTextCodecRejectsInvalid(t *testing.T) {
+	for _, r := range []Rounding{RoundingUnknown, Rounding(200)} {
+		if _, err := r.MarshalText(); !errors.Is(err, ErrUnknownRounding) {
+			t.Errorf("Rounding(%d).MarshalText() error = %v, want ErrUnknownRounding", uint8(r), err)
+		}
+	}
+
+	// A failed decode must leave the receiver untouched, so a partially applied
+	// JSON object cannot silently switch a wager's rounding policy.
+	decoded := RoundHalfToEven
+	if err := decoded.UnmarshalText([]byte("nonsense")); !errors.Is(err, ErrUnknownRounding) {
+		t.Fatalf("UnmarshalText(\"nonsense\") error = %v, want ErrUnknownRounding", err)
+	}
+	if decoded != RoundHalfToEven {
+		t.Errorf("a failed UnmarshalText mutated the receiver to %v", decoded)
+	}
+}
+
 func TestAbsUint64(t *testing.T) {
 	tests := []struct {
 		in   int64

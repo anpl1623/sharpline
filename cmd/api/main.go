@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/anpl1623/sharpline/internal/platform/buildinfo"
 	"github.com/anpl1623/sharpline/internal/platform/config"
 	"github.com/anpl1623/sharpline/internal/platform/httpx"
 	"github.com/anpl1623/sharpline/internal/platform/logging"
@@ -54,7 +55,15 @@ func run() error {
 	}
 
 	log := logging.New(os.Stdout, cfg.LogLevel, service, cfg.Env)
-	log.Info("starting", slog.Any("config", cfg))
+	// The build identity goes on the FIRST line this process writes, beside the
+	// config, because it answers the question every other line depends on:
+	// which code produced them. The runtime image is distroless — no shell —
+	// so there is no `sharpline --version` an operator can run against a
+	// container to find out afterwards.
+	log.Info("starting",
+		slog.Any("build", buildinfo.Read()),
+		slog.Any("config", cfg),
+	)
 
 	// SIGTERM is what Kubernetes and `docker stop` send; SIGINT is Ctrl-C.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -68,6 +77,14 @@ func run() error {
 	// and no global registry is touched (CLAUDE.md §12: no global mutable
 	// state).
 	registry := httpx.NewRegistry()
+
+	// sharpline_build_info: the same three facts as the log line above, as
+	// labels on a constant 1, so "which build is this replica on" is answerable
+	// from Prometheus during a rolling deploy rather than only from whichever
+	// log lines are still in the retention window.
+	if err := buildinfo.Register(registry, service); err != nil {
+		return fmt.Errorf("%s: %w", service, err)
+	}
 
 	// config.API declares RequirePostgres, which config.go defines as "the
 	// binary opens a Postgres connection pool" — so the DSN is already

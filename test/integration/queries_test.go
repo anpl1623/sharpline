@@ -515,37 +515,53 @@ func TestEveryGeneratedQueryRunsAgainstTheRealSchema(t *testing.T) {
 			t.Errorf("the away competitor's name matched %d events, want 1", len(away))
 		}
 
-		// DOCUMENTED BEHAVIOUR, NOT AN ENDORSEMENT: the query is named
-		// SearchOpenEventsByCompetitorPrefix and its comment says "Tradeable
-		// events", but its SQL carries NO status predicate — unlike
-		// ListOpenEventsInLeague and ListOpenEventsStartingBefore, which both
-		// spell out status IN ('scheduled','live','suspended') to match their
-		// partial indexes. A cancelled event therefore still appears in a
-		// type-ahead. Asserted so the behaviour is recorded rather than assumed,
-		// and reported as a finding.
-		if _, err := conn.Exec(ctx,
-			`UPDATE events SET status = 'cancelled' WHERE id = $1`, cat.EventID); err != nil {
-			t.Fatalf("cancel the event: %v", err)
-		}
-		t.Cleanup(func() {
-			_, _ = conn.Exec(context.Background(),
-				`UPDATE events SET status = 'scheduled' WHERE id = $1`, cat.EventID)
-		})
+		// STATUS PREDICATE — the phase-2 tripwire, now inverted.
+		//
+		// Phase 2 recorded that this query carried NO status predicate despite its
+		// name, and left an assertion saying "If that was a deliberate fix, delete
+		// this assertion." Phase 3 made the deliberate fix: queries/catalogue.sql
+		// now spells out `status IN ('scheduled', 'live')` on both arms of the
+		// UNION, and its own comment states that this assertion inverts — a
+		// cancelled event must return ZERO rows.
+		//
+		// The set is deliberately NARROWER than ListOpenEventsInLeague's
+		// ('scheduled','live','suspended'). Those queries populate the board, which
+		// shows a suspended market greyed out; this one answers "what can I bet on",
+		// and Market.AcceptsWagers refuses a suspended market at the slip. Both
+		// halves of that decision are asserted below so a later widening of either
+		// literal has to come here and say so.
+		for _, tc := range []struct {
+			status string
+			want   int
+			why    string
+		}{
+			{"cancelled", 0, "a cancelled event can never be bet on"},
+			{"suspended", 0, "a suspended market is refused at the slip by Market.AcceptsWagers"},
+			{"settled", 0, "a settled event is over"},
+			{"live", 1, "a live event is tradeable and must stay searchable"},
+		} {
+			if _, err := conn.Exec(ctx,
+				`UPDATE events SET status = $2 WHERE id = $1`, cat.EventID, tc.status); err != nil {
+				t.Fatalf("set event status to %q: %v", tc.status, err)
+			}
 
-		cancelled, err := q.SearchOpenEventsByCompetitorPrefix(ctx, gen.SearchOpenEventsByCompetitorPrefixParams{
-			Prefix:   prefix,
-			RowLimit: 50,
-		})
-		if err != nil {
-			t.Fatalf("SearchOpenEventsByCompetitorPrefix (cancelled): %v", err)
+			got, err := q.SearchOpenEventsByCompetitorPrefix(ctx, gen.SearchOpenEventsByCompetitorPrefixParams{
+				Prefix:   prefix,
+				RowLimit: 50,
+			})
+			if err != nil {
+				t.Fatalf("SearchOpenEventsByCompetitorPrefix (%s): %v", tc.status, err)
+			}
+			if len(got) != tc.want {
+				t.Errorf("a %q event matched %d rows, want %d — %s. The status predicate in "+
+					"queries/catalogue.sql and this table disagree; change both together.",
+					tc.status, len(got), tc.want, tc.why)
+			}
 		}
-		if len(cancelled) != 1 {
-			t.Errorf("a cancelled event was excluded, so the query now filters on status: "+
-				"%d rows. If that was a deliberate fix, delete this assertion.", len(cancelled))
-		} else {
-			t.Logf("FINDING: SearchOpenEventsByCompetitorPrefix returns a %q event. "+
-				"The name and its doc comment promise open/tradeable events; the SQL has no status "+
-				"predicate.", cancelled[0].Status)
+
+		if _, err := conn.Exec(ctx,
+			`UPDATE events SET status = 'scheduled' WHERE id = $1`, cat.EventID); err != nil {
+			t.Fatalf("restore event status: %v", err)
 		}
 	})
 

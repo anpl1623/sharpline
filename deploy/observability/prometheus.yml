@@ -11,14 +11,66 @@
 # exactly as it will reach them by Service DNS in Kubernetes.
 #
 # Metric-name contract: every application series is prefixed `sharpline_`.
-# The authoritative list lives in the phase handoff notes; the dashboard and
-# the alert rules in ./rules/ are written against those names.
+# The authoritative list lives in ./rules/sharpline-alerts.yml, whose header
+# also fixes the histogram bucket boundaries that the SLI rules select by exact
+# `le` literal. The dashboard and the alert rules are written against those names.
 #
-# Validated with:
-#   docker run --rm -v ./prometheus.yml:/etc/prometheus/prometheus.yml \
-#     -v ./rules:/etc/prometheus/rules \
-#     --entrypoint /bin/promtool prom/prometheus@sha256:508729e0... \
-#     check config /etc/prometheus/prometheus.yml
+# =============================================================================
+# VERIFIED AGAINST A RUNNING PROMETHEUS, NOT ONLY PARSED — 2026-08-17
+# =============================================================================
+#
+# Phase 0 wrote this file before any service emitted a metric, and never booted
+# the obs profile at all ("~1.5GB of image pulls against a VM that hit 100%
+# disk"). An unverified scrape config is how a dashboard ends up permanently
+# empty, so it was checked end to end:
+#
+#   make up-obs                                   -> 14 containers, all healthy
+#   GET prometheus:9090/api/v1/targets?state=any   -> 8/8 health="up",
+#                                                     0 lastError, 0 dropped
+#   GET prometheus:9090/api/v1/rules               -> 6 groups, every rule
+#                                                     health="ok", no eval errors
+#
+# Queried from a throwaway container on the compose network, because nothing here
+# binds a host port (CLAUDE.md §12) and the Go images are distroless with no
+# shell, so the probe cannot run inside them:
+#
+#   docker run --rm --network sharpline --entrypoint /bin/sh \
+#     alpine:latest@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b \
+#     -c 'wget -qO- http://prometheus:9090/api/v1/targets?state=any'
+#
+# NO JOB WAS SILENTLY DOWN. One real defect was found and fixed: the
+# `otel-collector-otlp` job was the only target in the file with no `service`
+# label, so `up{...}` for it rendered a blank series name in the dashboard's
+# scrape-health panel. Fixed below.
+#
+# What is live today (read off api:8080/metrics and settle:8084/metrics, not
+# inferred from source): 15 `sharpline_db_*` metric families are DEFINED by
+# internal/platform/postgres, of which 11 appear on an idle service. The four
+# absent ones — query_duration_seconds, query_errors_total,
+# transaction_duration_seconds, transactions_total — are label-vector families
+# that the Prometheus client omits until they have their first observation. An
+# idle stack running no queries therefore shows "No data" on the query panels,
+# and that is correct rather than a broken selector.
+#
+# api and settle are the ONLY services with these series; ingest, pricer and
+# stream open no pool. That is why no alert in ./rules uses absent() on them.
+#
+# =============================================================================
+# NOT SCRAPED, DELIBERATELY
+# =============================================================================
+#
+# postgres, redis and kafka export no Prometheus metrics of their own and no
+# exporter sidecar (postgres_exporter, redis_exporter, JMX/kafka_exporter) is in
+# CLAUDE.md §9's container inventory. Adding one is an inventory change and needs
+# an ADR, so it is flagged rather than smuggled in here. Until then the data
+# plane is observed indirectly and honestly: Postgres through the
+# `sharpline_db_*` series the services themselves export, and Kafka through the
+# `sharpline_kafka_*` series the franz-go clients export. Consumer lag measured
+# at the consumer is arguably the better signal anyway — it is the number the
+# staleness SLO actually depends on.
+#
+# `web` is also absent: it is a Next.js server with no /metrics endpoint, and §9
+# lists no frontend metrics.
 
 global:
   scrape_interval: 15s
@@ -34,8 +86,8 @@ rule_files:
 # Alertmanager is deliberately NOT in the container inventory (CLAUDE.md §9
 # names prometheus / grafana / jaeger / otel-collector and nothing else), so no
 # `alerting.alertmanagers` block is declared. Rules still evaluate and fire —
-# they surface in Prometheus /alerts and in Grafana's alert list. Adding
-# Alertmanager is an inventory change and needs an ADR.
+# they surface in Prometheus /alerts and in the dashboard's annotation queries.
+# Adding Alertmanager is an inventory change and needs an ADR.
 
 scrape_configs:
   # ---------------------------------------------------------------- self ----
@@ -109,6 +161,8 @@ scrape_configs:
   #   settle 8084 | web 3000 — migrate is absent), and a static target that is
   #   down 99.99% of the time produces a permanent `up == 0` and poisons every
   #   "is anything broken" query.
+  #   Confirmed still true on the live stack: `docker compose ps` shows
+  #   sharpline-migrate-1 in state Exited(0) while every other service runs.
   #   If migration duration/outcome must be graphed, the correct mechanism is a
   #   Pushgateway (not in the container inventory -> needs an ADR) or, in the
   #   cluster, kube-state-metrics `kube_job_status_*`. Flagged to the topology
@@ -120,6 +174,15 @@ scrape_configs:
   # (a) Collector-internal telemetry: receiver/exporter throughput, queue size,
   #     refused/dropped spans. This is how you find out the trace pipeline is
   #     silently dropping data.
+  #
+  #     Live inventory on the pinned image, for the benefit of anyone writing a
+  #     rule against it: 12 `otelcol_*` families are exposed at rest, and NONE
+  #     of the counters carries a `_total` suffix (otelcol_process_cpu_seconds,
+  #     otelcol_process_uptime, otelcol_resourcedetection_attributes_detected are
+  #     all `# TYPE ... counter` without it). The processor/receiver span
+  #     counters are created lazily and do not exist until the first span
+  #     traverses the pipeline. ./rules/sharpline-alerts.yml was corrected
+  #     accordingly — it had been alerting on a name this build cannot produce.
   - job_name: otel-collector-internal
     metrics_path: /metrics
     static_configs:
@@ -133,10 +196,36 @@ scrape_configs:
   #     contract series come from the services' own /metrics endpoints above,
   #     NOT from here — services must not double-export, or every series lands
   #     in Prometheus twice under two different job labels.
+  #
+  #     Currently returns a 200 with an EMPTY body, because no service exports
+  #     metrics over OTLP yet (compose.obs.yaml sets SHARPLINE_OTEL_ENDPOINT, but
+  #     the services use it for traces). The job is up with only its five
+  #     synthetic scrape series. Correct for now; do not repurpose the job to
+  #     make it look populated.
   - job_name: otel-collector-otlp
     metrics_path: /metrics
+    # honor_labels so OTLP-sourced series keep the resource labels their own SDK
+    # set, instead of having them overwritten by this job's target labels.
     honor_labels: true
     static_configs:
       - targets: ["otel-collector:8889"]
         labels:
+          # ADDED 2026-08-17. Every other target in this file carries `service`;
+          # this one did not, so `up{component=~"backend|observability"}` returned
+          # one series with an empty {{service}} and the dashboard's scrape-health
+          # panel rendered a nameless line. Under honor_labels an OTLP series that
+          # carries its own `service` label still wins, which is the intent — this
+          # only names the synthetic series (up, scrape_*) that have no labels of
+          # their own to honour.
+          service: otel-collector
           component: observability
+    # MECHANICAL ENFORCEMENT of the "services must not double-export" rule stated
+    # above. A comment cannot stop it; this can. If a service is ever configured
+    # to push its `sharpline_*` metrics over OTLP as well as serving them on
+    # /metrics, the duplicate arriving through this job is dropped here instead of
+    # silently doubling every rate() and every sum() in the dashboard under a
+    # second job label. The service's own scrape stays authoritative.
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: "sharpline_.*"
+        action: drop

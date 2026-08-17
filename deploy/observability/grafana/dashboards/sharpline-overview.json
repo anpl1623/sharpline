@@ -1,13 +1,13 @@
 {
   "uid": "sharpline-overview",
   "title": "Sharpline — Overview",
-  "description": "CLAUDE.md §9 pre-built dashboard: odds staleness p50/p99 (headline SLO), provider quota remaining, WebSocket connections and dropped clients, pricing latency, and bus lag. Panels read 'No data' until phases 3–6 emit the sharpline_* metrics; that is correct, not a defect.",
+  "description": "CLAUDE.md §9 pre-built dashboard. Two staleness SLOs (odds freshness from observed_at, pipeline latency from ingested_at — ADR 0003 requires them separated), provider quota, WebSocket connections and dropped clients, pricing latency, bus lag, and the Postgres data plane. Panels above the Postgres row read 'No data' until phases 3–6 emit the sharpline_* series; that is correct, not a defect, and sample values are never fabricated to hide it. Metric names here are a CONTRACT — the emitting phase must match them exactly, including the histogram bucket boundaries documented in deploy/observability/rules/sharpline-alerts.yml.",
   "tags": ["sharpline", "slo", "overview"],
   "timezone": "browser",
   "editable": false,
   "graphTooltip": 1,
   "schemaVersion": 41,
-  "version": 1,
+  "version": 2,
   "refresh": "10s",
   "time": {
     "from": "now-1h",
@@ -69,19 +69,49 @@
         "sort": 1,
         "current": { "text": ["All"], "value": ["$__all"] },
         "options": []
+      },
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+        "definition": "label_values(sharpline_db_up, service)",
+        "query": {
+          "qryType": 1,
+          "query": "label_values(sharpline_db_up, service)",
+          "refId": "service-variable"
+        },
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "refresh": 2,
+        "sort": 1,
+        "current": { "text": ["All"], "value": ["$__all"] },
+        "options": []
       }
     ]
   },
   "annotations": {
     "list": [
       {
-        "name": "Odds staleness SLO breach",
+        "name": "Odds freshness SLO breach",
         "enable": true,
         "iconColor": "red",
         "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
-        "expr": "ALERTS{alertname=~\"OddsStalenessP99Degraded|OddsStalenessP99Critical|OddsFanoutStopped\",alertstate=\"firing\"}",
+        "expr": "ALERTS{alertname=~\"OddsFreshnessBeyondCadence|OddsFreshnessCritical|OddsFanoutStopped|PipelineLatencyP99Critical\",alertstate=\"firing\"}",
         "titleFormat": "{{alertname}}",
         "textFormat": "{{description}}",
+        "step": "60s",
+        "useValueForTime": false
+      },
+      {
+        "name": "Data plane incident",
+        "enable": true,
+        "iconColor": "orange",
+        "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+        "expr": "ALERTS{alertname=~\"DatabaseUnreachable|DatabasePoolExhausted|DatabaseCommitFailures|DatabaseConnectFatal\",alertstate=\"firing\"}",
+        "titleFormat": "{{alertname}} ({{service}})",
+        "textFormat": "{{summary}}",
         "step": "60s",
         "useValueForTime": false
       }
@@ -91,8 +121,8 @@
     {
       "id": 1,
       "type": "timeseries",
-      "title": "Odds staleness — p50 / p99 (HEADLINE SLO)",
-      "description": "staleness = fanout instant − provider observation timestamp. Series are the recording rules sharpline:odds_staleness_seconds:p50 / :p99, i.e. the exact expressions the alert rules evaluate, so the graph and the alert can never disagree.",
+      "title": "Odds freshness — p50 / p99 vs configured cadence (HEADLINE SLO)",
+      "description": "freshness = fanout instant − observed_at (the PROVIDER's observation instant). Series are the recording rules sharpline:odds_staleness_seconds:p50 / :p99, i.e. the exact expressions the alert rules evaluate, so the graph and the alert can never disagree. The objective line is computed from the configured live poll interval rather than hardcoded — ADR 0003 makes the cadence a config value, so a constant threshold would be wrong under either the real or the synthetic provider. 'provider share' is stage=received = (ingested_at − observed_at): the part no engineering here can lower.",
       "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
       "gridPos": { "h": 10, "w": 15, "x": 0, "y": 0 },
       "fieldConfig": {
@@ -106,16 +136,8 @@
             "fillOpacity": 8,
             "showPoints": "never",
             "spanNulls": false,
-            "axisLabel": "staleness",
+            "axisLabel": "age of the price",
             "gradientMode": "opacity"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "#EAB839", "value": 2 },
-              { "color": "red", "value": 5 }
-            ]
           }
         },
         "overrides": [
@@ -128,16 +150,15 @@
             "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }]
           },
           {
-            "matcher": { "id": "byName", "options": "p50 objective (0.5s)" },
+            "matcher": { "id": "byName", "options": "provider share (p99, ingested−observed)" },
             "properties": [
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "text" } },
-              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
-              { "id": "custom.fillOpacity", "value": 0 },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "purple" } },
+              { "id": "custom.fillOpacity", "value": 20 },
               { "id": "custom.lineWidth", "value": 1 }
             ]
           },
           {
-            "matcher": { "id": "byName", "options": "p99 objective (2s)" },
+            "matcher": { "id": "byName", "options": "p99 objective (cadence×1.25 + 2s)" },
             "properties": [
               { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } },
               { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
@@ -171,15 +192,15 @@
         {
           "refId": "C",
           "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
-          "expr": "vector(0.5)",
-          "legendFormat": "p50 objective (0.5s)",
+          "expr": "sharpline:odds_staleness_seconds:provider_p99",
+          "legendFormat": "provider share (p99, ingested−observed)",
           "range": true
         },
         {
           "refId": "D",
           "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
-          "expr": "vector(2)",
-          "legendFormat": "p99 objective (2s)",
+          "expr": "sharpline:odds_staleness_objective_seconds:p99",
+          "legendFormat": "p99 objective (cadence×1.25 + 2s)",
           "range": true
         }
       ]
@@ -193,25 +214,26 @@
       "options": {
         "mode": "markdown",
         "code": { "language": "plaintext", "showLineNumbers": false, "showMiniMap": false },
-        "content": "### Odds staleness\n\n```\nstaleness =\n    instant the price is written\n    to the client socket\n  − provider observation timestamp\n    carried on that price\n```\n\nMeasured by **`stream`, at the moment of fanout** — i.e. at the point the price reaches the browser, not at the point ingest received it. The provider observation timestamp is the provider's own `last_update` for the market, propagated **unchanged** through `ingest → Kafka → pricer → stream`. No hop re-stamps it.\n\nSeries: `sharpline_odds_staleness_seconds{stage=\"fanout\"}` (histogram).\nThe same histogram is recorded at `stage=\"received\" | \"normalized\" | \"priced\"` so a regression can be attributed to a pipeline segment. **Only `stage=\"fanout\"` is the SLO.**\n\n| | objective |\n|---|---|\n| p50 | ≤ 0.5 s |\n| p99 | ≤ 2.0 s |\n| compliance | 99 % of prices under 2 s |\n| page | p99 > 5 s |\n\nAlerts: `OddsStalenessP99Degraded`, `OddsStalenessP99Critical`, `OddsStalenessSLOBudgetBurn`, `OddsFanoutStopped` — see `deploy/observability/rules/sharpline-alerts.yml`.\n\n> `OddsFanoutStopped` exists because a stalled pipeline makes the SLO look *perfect*: with nothing fanning out there is nothing slow to measure. Zero fanout with connected clients is a critical, not a pass.\n\n---\n\n**\"No data\" is expected** until phases 3–6 emit these metrics. Sample values are never fabricated here."
+        "content": "### Two staleness SLOs, deliberately\n\n**1 · ODDS FRESHNESS** — user-visible, provider-bound. **The headline.**\n\n```\nfreshness = instant the price is written\n            to the client socket\n          − observed_at carried on that price\n```\n\n`observed_at` is the **provider's own observation instant** (The Odds API's `last_update` for the market), propagated **unchanged** through `ingest → Kafka → pricer → stream`. No hop re-stamps it. It is the same value stored in the `prices.observed_at` column, which `migrations/00003` calls *\"the subtrahend in every staleness measurement\"*.\n\nIt is **not** `ingested_at` (when ingest received the payload), **not** `created_at` (when the row committed), and **not** `updated_at` (row-write metadata — the phase-2 handoff warns it *\"is NOT an event time\"*).\n\nSeries: `sharpline_odds_staleness_seconds{stage=\"fanout\"}`.\n\nThe objective is **cadence-relative, not a constant**: `max(live poll interval) × 1.25 + 2s`. ADR 0003 (Accepted) buys a 90 s live cadence at the $59 / 100K tier, so this evaluates to ≈114 s. The ADR is blunt about why a small constant would be dishonest: *\"a dashboard claiming sub-10-second freshness while running here would be lying.\"*\n\n**2 · PIPELINE LATENCY** — architecture-bound. **Ours.**\n\n```\npipeline = fanout instant − ingested_at\n```\n\nSeries: `sharpline_pipeline_latency_seconds{stage=\"fanout\"}`. This is where sub-second targets belong, and the number a regression in the normalizer, the bus, the pricer or the fanout hub actually moves. CLAUDE.md §2 justifies choosing Go on exactly this metric.\n\n**Provider share** = `{stage=\"received\"}` = `ingested_at − observed_at`. The ~90 s that no engineering here can lower.\n\n| | p50 | p99 | page |\n|---|---|---|---|\n| freshness | ≤ ½ cadence | ≤ cad×1.25 + 2s | > 300 s |\n| pipeline | ≤ 25 ms | ≤ 250 ms | > 2 s |\n\nCompliance: 99 % of prices under 120 s (SLO 1) / 500 ms (SLO 2) over 1 h.\n\n> **Why two and not one.** `q(A−B) ≠ q(A) − q(B)`, so the split cannot be derived from a single histogram — it has to be measured at fanout. ADR 0003 requires it: *\"must distinguish provider staleness from pipeline staleness or it will measure the wrong thing and flatter the wrong component.\"* Phase 0 wrote a single end-to-end SLO at p99 ≤ 2 s; against a 90 s cadence that fires permanently, so it was corrected.\n\n> `OddsFanoutStopped` exists because a stalled pipeline makes the SLO look *perfect*: with nothing fanning out there is nothing slow to measure. Zero fanout with connected clients is a critical, not a pass.\n\n> A provider clock **ahead** of ours makes the raw difference negative, which a histogram would record as *excellent*. The emitter clamps the observation at 0 and counts the clamp in `sharpline_odds_clock_skew_total`, so it is never silent — `domain.Price.Age()` returns the negative duration for precisely this reason.\n\nStages `received | normalized | priced | fanout` exist so a regression is attributable to a segment. **Only `fanout` is the SLO.**\n\nAlerts: `deploy/observability/rules/sharpline-alerts.yml`.\n\n---\n\n**\"No data\" above the Postgres row is expected** until phases 3–6 emit these series. Sample values are never fabricated here, and no panel is pointed at a substitute series to look populated. The **Data plane — Postgres** row at the bottom is live today."
       }
     },
     {
       "id": 3,
       "type": "stat",
-      "title": "Staleness p50",
+      "title": "Freshness p50",
+      "description": "Half the polling cadence is the expected steady-state value: a client arriving at a uniformly random moment sees a line on average half an interval old.",
       "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
       "gridPos": { "h": 4, "w": 4, "x": 0, "y": 10 },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
-          "decimals": 3,
+          "decimals": 2,
           "thresholds": {
             "mode": "absolute",
             "steps": [
               { "color": "green", "value": null },
-              { "color": "#EAB839", "value": 0.5 },
-              { "color": "red", "value": 2 }
+              { "color": "#EAB839", "value": 60 },
+              { "color": "red", "value": 150 }
             ]
           }
         },
@@ -237,19 +259,20 @@
     {
       "id": 4,
       "type": "stat",
-      "title": "Staleness p99",
+      "title": "Freshness p99",
+      "description": "Thresholds track the 100K-tier 90s cadence (ADR 0003). The authoritative comparison is against sharpline:odds_staleness_objective_seconds:p99, which a stat panel cannot express — see the objective line on the headline graph.",
       "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
       "gridPos": { "h": 4, "w": 4, "x": 4, "y": 10 },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
-          "decimals": 3,
+          "decimals": 2,
           "thresholds": {
             "mode": "absolute",
             "steps": [
               { "color": "green", "value": null },
-              { "color": "#EAB839", "value": 2 },
-              { "color": "red", "value": 5 }
+              { "color": "#EAB839", "value": 115 },
+              { "color": "red", "value": 300 }
             ]
           }
         },
@@ -273,12 +296,51 @@
       ]
     },
     {
+      "id": 19,
+      "type": "stat",
+      "title": "Pipeline p99 (ours)",
+      "description": "SLO 2: fanout instant − ingested_at. Excludes the provider's polling cadence entirely, so this is the number that must stay tight. Objective 250ms, page at 2s.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 10 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 4,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "#EAB839", "value": 0.25 },
+              { "color": "red", "value": 2 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sharpline:pipeline_latency_seconds:p99",
+          "legendFormat": "p99",
+          "range": true
+        }
+      ]
+    },
+    {
       "id": 5,
       "type": "stat",
-      "title": "SLO compliance (1h, ≤ 2s)",
-      "description": "Fraction of fanned-out prices that reached the browser within the 2s objective over the last hour. Objective: 99%.",
+      "title": "Freshness SLO (1h, ≤ 120s)",
+      "description": "Fraction of fanned-out prices whose age at the browser was under 120s over the last hour. Objective: 99%. The 120s bucket boundary MUST exist in sharpline_odds_staleness_seconds — see the bucket contract in sharpline-alerts.yml.",
       "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
-      "gridPos": { "h": 4, "w": 5, "x": 8, "y": 10 },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 10 },
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
@@ -307,7 +369,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
-          "expr": "sharpline:odds_staleness_slo_ratio:1h",
+          "expr": "sharpline:odds_freshness_slo_ratio:1h",
           "legendFormat": "compliance",
           "range": true
         }
@@ -316,10 +378,10 @@
     {
       "id": 6,
       "type": "stat",
-      "title": "WebSocket connections active",
+      "title": "WebSocket connections",
       "description": "sharpline_ws_connections_active — also the custom metric the `stream` HPA scales on (CLAUDE.md §9).",
       "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
-      "gridPos": { "h": 4, "w": 5, "x": 13, "y": 10 },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 10 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -351,10 +413,10 @@
     {
       "id": 7,
       "type": "stat",
-      "title": "Provider quota remaining",
-      "description": "CLAUDE.md §5 mandates the remaining provider quota be exposed as a Prometheus gauge. Shown per provider.",
+      "title": "Provider quota left",
+      "description": "CLAUDE.md §5 mandates the remaining provider quota be exposed as a Prometheus gauge. ADR 0003's recommended tier is 100K credits/month with ~10.6% headroom, so this number is a real budget and not decoration.",
       "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 10 },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 10 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -390,8 +452,8 @@
     {
       "id": 8,
       "type": "timeseries",
-      "title": "Staleness p99 by pipeline stage",
-      "description": "Where the latency is added. received → normalized → priced → fanout. The gap between two adjacent stages is the cost of that segment.",
+      "title": "Freshness p99 by pipeline stage (from observed_at)",
+      "description": "Where the age comes from. received → normalized → priced → fanout, all measured against the provider's observed_at. The FLOOR of this chart is the provider's polling cadence: even a perfect pipeline cannot bring stage=received below it. The gap between two adjacent stages is the cost of that segment.",
       "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 14 },
       "fieldConfig": {
@@ -425,16 +487,62 @@
       ]
     },
     {
-      "id": 9,
+      "id": 20,
       "type": "timeseries",
-      "title": "Staleness p99 by league (fanout)",
+      "title": "Pipeline latency p99 by stage (from ingested_at)",
+      "description": "SLO 2, decomposed. The same stages measured against ingested_at instead of observed_at, so the provider's cadence is subtracted out and only Sharpline's own work remains. This is the panel that answers 'is the regression ours?' — ADR 0003 requires it to exist separately, and it cannot be derived from the panel to the left because q(A−B) ≠ q(A) − q(B).",
       "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 14 },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
           "min": 0,
-          "decimals": 3,
+          "decimals": 4,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "mode": "none", "group": "A" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "#EAB839", "value": 0.25 },
+              { "color": "red", "value": 2 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (le, stage) (rate(sharpline_pipeline_latency_seconds_bucket{league=~\"$league\"}[$__rate_interval])))",
+          "legendFormat": "{{stage}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Freshness p99 by league (fanout)",
+      "description": "ADR 0003 polls four leagues (NFL, NBA, MLB, NHL) on one shared quota budget. A league standing out here means adaptive polling is starving it, not that the pipeline is slow.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 14 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "decimals": 2,
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
@@ -463,9 +571,9 @@
       "id": 10,
       "type": "timeseries",
       "title": "Provider quota remaining",
-      "description": "Left axis: requests left in the budget. The burn rate is the second series — if adaptive polling is backing off correctly it flattens as the budget drains.",
+      "description": "Left axis: credits left in the budget. The burn rate is the second series — if adaptive polling is backing off correctly it flattens as the budget drains.",
       "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 14 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 22 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -511,12 +619,109 @@
       ]
     },
     {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Ingest — poll outcomes",
+      "description": "result=\"unchanged\" is the change-detection hash suppressing a no-op poll (CLAUDE.md §5). A healthy pipeline is mostly unchanged; a system where everything is \"changed\" means the hash is broken and the bus is carrying junk. ADR 0003 notes the corollary: suppression saves bus traffic, pricing CPU and hypertable writes but never refunds the credit — the poll was already paid for.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 22 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "mode": "normal", "group": "A" }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum by (result) (rate(sharpline_ingest_polls_total{provider=~\"$provider\"}[$__rate_interval]))",
+          "legendFormat": "{{result}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Polling cadence & clock skew",
+      "description": "The configured live poll interval, which is the INPUT to the freshness objective — this is why the headline threshold tracks config instead of being hardcoded. The right axis counts prices whose observed_at was ahead of our clock: their true staleness is negative, the histogram observation is clamped to 0 so quantiles stay interpretable, and this counter is what keeps the clamp from being silent (migrations/00003 and domain.Price.Age() both refuse to hide this).",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 22 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "stepAfter"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*skew.*" },
+            "properties": [
+              { "id": "unit", "value": "cps" },
+              { "id": "custom.axisPlacement", "value": "right" },
+              { "id": "custom.drawStyle", "value": "bars" },
+              { "id": "custom.fillOpacity", "value": 60 },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sharpline_ingest_poll_interval_seconds{provider=~\"$provider\"}",
+          "legendFormat": "{{provider}} {{league}} {{window}}",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sharpline:odds_staleness_objective_seconds:p99",
+          "legendFormat": "derived p99 objective",
+          "range": true
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum by (provider) (rate(sharpline_odds_clock_skew_total{provider=~\"$provider\"}[$__rate_interval]))",
+          "legendFormat": "{{provider}} clock skew",
+          "range": true
+        }
+      ]
+    },
+    {
       "id": 11,
       "type": "timeseries",
       "title": "WebSocket connections",
-      "description": "Active subscribers and the accept/reject rate. `sharpline_ws_connections_active` is the HPA custom metric.",
+      "description": "Active subscribers and the accept/reject rate. `sharpline_ws_connections_active` is the HPA custom metric; CLAUDE.md §10 targets 10k concurrent subscribers on one node under Locust.",
       "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 22 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 30 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -567,7 +772,7 @@
       "title": "WebSocket clients dropped, by reason",
       "description": "reason=\"slow_consumer\" is the per-client bounded send queue overflowing (CLAUDE.md §5): the client is dropped and forced to resync rather than being allowed to backpressure the hub. Non-zero at idle is a defect.",
       "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 22 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 30 },
       "fieldConfig": {
         "defaults": {
           "unit": "cps",
@@ -605,12 +810,48 @@
       ]
     },
     {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Fanout throughput, by message kind",
+      "description": "kind=\"snapshot\" vs kind=\"delta\" (CLAUDE.md §5's snapshot-then-delta protocol). A snapshot rate that tracks the delta rate means clients are resyncing constantly rather than streaming.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 30 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "mode": "normal", "group": "A" }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum by (kind) (rate(sharpline_ws_messages_sent_total[$__rate_interval]))",
+          "legendFormat": "{{kind}}",
+          "range": true
+        }
+      ]
+    },
+    {
       "id": 13,
       "type": "timeseries",
       "title": "Pricing latency",
-      "description": "Time to devig a market and compute fair value / EV / Kelly. p99 > 250ms fires PricingLatencyHigh.",
+      "description": "Time to devig a market and compute fair value / EV / Kelly. p99 > 250ms fires PricingLatencyHigh, and the histogram must carry a bucket boundary at exactly 0.25 so that threshold sits on a boundary rather than being interpolated across one.",
       "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 22 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 38 },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
@@ -664,12 +905,127 @@
       ]
     },
     {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Scrape health (up)",
+      "description": "1 = Prometheus can reach the target's /metrics endpoint. Verified live 2026-08-17: all 8 targets up, zero lastError, zero dropped. `migrate` is intentionally absent — it is a run-to-completion Job with no frozen port, and a permanently-down static target would poison every 'is anything broken' query. Note this is REACHABILITY only: a service can be up here while its database is unreachable, which is what DatabaseUnreachable covers.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 38 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1,
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "stepAfter"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "up{component=~\"backend|observability\"}",
+          "legendFormat": "{{job}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Trace pipeline health",
+      "description": "CLAUDE.md §9 wants a single odds update followable ingest → pricer → stream. That only holds if the collector is not dropping spans. Queue saturation is the leading indicator and is live today ({data_type,exporter} — observed exporter=\"otlp_grpc/jaeger\", capacity 1000). Refused spans are the lagging one, and their counter is created lazily so it does not exist until the first span flows.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 38 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "#EAB839", "value": 0.8 },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*refused.*" },
+            "properties": [
+              { "id": "unit", "value": "cps" },
+              { "id": "custom.axisPlacement", "value": "right" },
+              { "id": "custom.drawStyle", "value": "bars" },
+              { "id": "custom.fillOpacity", "value": 60 },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum by (exporter, data_type) (otelcol_exporter_queue_size) / clamp_min(sum by (exporter, data_type) (otelcol_exporter_queue_capacity), 1)",
+          "legendFormat": "{{exporter}} queue {{data_type}}",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum(rate(otelcol_processor_refused_spans[$__rate_interval])) or sum(rate(otelcol_processor_refused_spans_total[$__rate_interval]))",
+          "legendFormat": "refused spans",
+          "range": true
+        }
+      ]
+    },
+
+    {
+      "id": 40,
+      "type": "row",
+      "title": "Bus — Kafka (franz-go, phase 3)",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 46 },
+      "panels": []
+    },
+    {
       "id": 14,
       "type": "timeseries",
       "title": "Bus lag — consumer group lag (records)",
-      "description": "sharpline_kafka_consumer_lag_records, reported by each franz-go consumer for its own assigned partitions. Sustained growth on odds.normalized or price.computed is the usual root cause of a staleness breach.",
+      "description": "sharpline_kafka_consumer_lag_records{group,topic,partition}, reported by each franz-go consumer for its own assigned partitions. Summed to (group,topic) here, so the emitter may carry a partition label without changing this panel. Sustained growth on odds.normalized or price.computed is the usual root cause of a freshness breach.",
       "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 30 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 47 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -710,9 +1066,9 @@
       "id": 15,
       "type": "timeseries",
       "title": "Bus lag — consumer group lag (seconds) & rebalances",
-      "description": "Lag in wall-clock terms is the number that maps onto the staleness SLO. Rebalances are overlaid because a rebalance storm shows up as a lag sawtooth.",
+      "description": "Lag in wall-clock terms is the number that maps onto the freshness SLO. Rebalances are overlaid because a rebalance storm shows up as a lag sawtooth — CLAUDE.md §3 names rebalancing as one of the concepts Kafka's complexity was paid for.",
       "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 30 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 47 },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
@@ -759,12 +1115,72 @@
       ]
     },
     {
-      "id": 16,
+      "id": 23,
       "type": "timeseries",
-      "title": "Ingest — poll outcomes",
-      "description": "result=\"unchanged\" is the change-detection hash suppressing a no-op poll (CLAUDE.md §5). A healthy pipeline is mostly unchanged; a system where everything is \"changed\" means the hash is broken and the bus is carrying junk.",
+      "title": "Producer — records & latency by topic",
+      "description": "The write side of the bus. outcome=\"error\" on odds.normalized is worse than it looks: the topic is compacted and keyed by market_id, so a lost record means that market's snapshot stays stale until the NEXT change to the same key — CLAUDE.md §3 relies on the compacted topic BEING the current-line snapshot.",
       "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
-      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 38 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 55 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*error.*" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } },
+              { "id": "custom.drawStyle", "value": "bars" },
+              { "id": "custom.fillOpacity", "value": 70 }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*p99.*" },
+            "properties": [
+              { "id": "unit", "value": "s" },
+              { "id": "custom.axisPlacement", "value": "right" },
+              { "id": "custom.fillOpacity", "value": 0 },
+              { "id": "custom.lineWidth", "value": 2 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum by (topic, outcome) (rate(sharpline_kafka_produce_records_total[$__rate_interval]))",
+          "legendFormat": "{{topic}} {{outcome}}",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (le, topic) (rate(sharpline_kafka_produce_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "{{topic}} p99",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Offset commits by group",
+      "description": "Offset management is the other concept CLAUDE.md §3 pays for. outcome=\"error\" means offsets are not being persisted, so a restart or rebalance reprocesses from the last successful commit — duplicate delivery must be idempotent, but unbounded reprocessing is a defect.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 55 },
       "fieldConfig": {
         "defaults": {
           "unit": "cps",
@@ -778,78 +1194,51 @@
             "stacking": { "mode": "normal", "group": "A" }
           }
         },
-        "overrides": []
-      },
-      "options": {
-        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
-          "expr": "sum by (result) (rate(sharpline_ingest_polls_total{provider=~\"$provider\"}[$__rate_interval]))",
-          "legendFormat": "{{result}}",
-          "range": true
-        }
-      ]
-    },
-    {
-      "id": 17,
-      "type": "timeseries",
-      "title": "Fanout throughput, by message kind",
-      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
-      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 38 },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "cps",
-          "min": 0,
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 20,
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": { "mode": "normal", "group": "A" }
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*error.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
           }
-        },
-        "overrides": []
+        ]
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
         "tooltip": { "mode": "multi", "sort": "desc" }
       },
       "targets": [
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
-          "expr": "sum by (kind) (rate(sharpline_ws_messages_sent_total[$__rate_interval]))",
-          "legendFormat": "{{kind}}",
+          "expr": "sum by (group, outcome) (rate(sharpline_kafka_offset_commits_total[$__rate_interval]))",
+          "legendFormat": "{{group}} {{outcome}}",
           "range": true
         }
       ]
     },
+
     {
-      "id": 18,
-      "type": "timeseries",
-      "title": "Scrape health (up)",
-      "description": "1 = Prometheus can reach the service's /metrics endpoint. `migrate` is intentionally absent: it is a run-to-completion Job with no frozen port.",
+      "id": 41,
+      "type": "row",
+      "title": "Data plane — Postgres (phase 2 — LIVE DATA)",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 63 },
+      "panels": []
+    },
+    {
+      "id": 26,
+      "type": "stat",
+      "title": "Database reachable",
+      "description": "sharpline_db_up: 1 if the service's most recent readiness round trip reached Postgres. Refreshed every 10s by the container healthcheck GETting /readyz (verified live: rate(sharpline_db_ping_duration_seconds_count[2m]) ≈ 0.105/s). Only api and settle open a pool — ingest, pricer and stream have no series here, which is why no alert uses absent(). DOWN here with the scrape still up is the exact state in which /api/readyz used to return 200 with Postgres stopped; DatabaseUnreachable covers it and is distinct from ServiceDown.",
       "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
-      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 38 },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 64 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "min": 0,
-          "max": 1,
           "decimals": 0,
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 15,
-            "showPoints": "never",
-            "spanNulls": false,
-            "lineInterpolation": "stepAfter"
-          },
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red", "index": 0 } } },
+            { "type": "value", "options": { "1": { "text": "UP", "color": "green", "index": 1 } } }
+          ],
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -861,15 +1250,387 @@
         "overrides": []
       },
       "options": {
-        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull"] },
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sharpline_db_up{service=~\"$service\"}",
+          "legendFormat": "{{service}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "type": "stat",
+      "title": "Pool utilisation",
+      "description": "sharpline:db_pool_utilisation:ratio — acquired / max, precomputed as a recording rule so this panel and DatabasePoolSaturated cannot disagree. Saturation is only an incident when acquisitions are ALSO queueing; see the pressure panel below.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 64 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1,
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "#EAB839", "value": 0.75 },
+              { "color": "red", "value": 0.9 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value_and_name",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sharpline:db_pool_utilisation:ratio{service=~\"$service\"}",
+          "legendFormat": "{{service}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 28,
+      "type": "stat",
+      "title": "Mean acquire wait",
+      "description": "rate(acquire_wait_seconds_total) / rate(acquires_total). internal/platform/postgres explains why this is a seconds-total / count pair rather than a histogram: pgx exposes only cumulative wait and a count, and a histogram covering only the acquisitions this package could wrap would give a p99 that looks authoritative and is not. Correct and coarse beats precise and partial.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 64 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 6,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "#EAB839", "value": 0.001 },
+              { "color": "red", "value": 0.05 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value_and_name",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "rate(sharpline_db_pool_acquire_wait_seconds_total{service=~\"$service\"}[$__rate_interval]) / clamp_min(rate(sharpline_db_pool_acquires_total{service=~\"$service\"}[$__rate_interval]), 0.0001)",
+          "legendFormat": "{{service}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 29,
+      "type": "stat",
+      "title": "COMMIT rejections (5m)",
+      "description": "sharpline_db_transactions_total{outcome=\"commit_failed\"}. The zero-sum ledger trigger is DEFERRABLE INITIALLY DEFERRED, so an unbalanced double-entry movement passes every INSERT and is refused by COMMIT — landing here and nowhere else. test/integration/metrics_test.go asserts this series exists specifically 'so an alert can fire on it'; DatabaseCommitFailures is that alert. Non-zero is a data-integrity defect, not a slow query.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 64 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "min": 0,
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum(increase(sharpline_db_transactions_total{outcome=\"commit_failed\",service=~\"$service\"}[5m]))",
+          "legendFormat": "commit_failed",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Pool connections by state",
+      "description": "acquired (checked out) / idle (available) / constructing (being opened), against the configured ceiling. The sum of connections_max across every replica of every service must stay under the server's max_connections — the arithmetic is in internal/platform/postgres, and 12 GB / 2 OCPU is the real budget on the Oracle A1 target.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 68 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 25,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "mode": "normal", "group": "A" }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*max$" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } },
+              { "id": "custom.stacking", "value": { "mode": "none", "group": "B" } },
+              { "id": "custom.fillOpacity", "value": 0 },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
+              { "id": "custom.lineWidth", "value": 2 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
         "tooltip": { "mode": "multi", "sort": "desc" }
       },
       "targets": [
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
-          "expr": "up{component=~\"backend|observability\"}",
-          "legendFormat": "{{service}}",
+          "expr": "sum by (service, state) (sharpline_db_pool_connections{service=~\"$service\"})",
+          "legendFormat": "{{service}} {{state}}",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum by (service) (sharpline_db_pool_connections_max{service=~\"$service\"})",
+          "legendFormat": "{{service}} max",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Pool pressure — empty / cancelled acquires & connection churn",
+      "description": "The two alerting signals, side by side. empty_acquires = found no idle connection and had to wait (DatabasePoolSaturated, with utilisation ≥ 90%). cancelled_acquires = the caller's context expired first, so the request FAILED on the pool rather than on the database (DatabasePoolExhausted) — strictly worse. new_connections is the churn check: postgresql.conf logs every connect and treats churn as a defect signal, because pools are meant to be long-lived.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 68 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*cancelled.*" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } },
+              { "id": "custom.drawStyle", "value": "bars" },
+              { "id": "custom.fillOpacity", "value": 70 }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*empty.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum by (service) (rate(sharpline_db_pool_empty_acquires_total{service=~\"$service\"}[$__rate_interval]))",
+          "legendFormat": "{{service}} empty",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum by (service) (rate(sharpline_db_pool_canceled_acquires_total{service=~\"$service\"}[$__rate_interval]))",
+          "legendFormat": "{{service}} cancelled",
+          "range": true
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum by (service) (rate(sharpline_db_pool_new_connections_total{service=~\"$service\"}[$__rate_interval]))",
+          "legendFormat": "{{service}} new conns",
+          "range": true
+        },
+        {
+          "refId": "D",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum by (service, reason) (rate(sharpline_db_pool_destroyed_connections_total{service=~\"$service\"}[$__rate_interval]))",
+          "legendFormat": "{{service}} destroyed {{reason}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Statement latency by operation",
+      "description": "`operation` is the sqlc query name, lifted from the `-- name: Foo :many` comment, so a slow series names the query directly. Non-sqlc statements collapse to the SQL verb, and anything else to \"other\" — raw SQL is never a label value because the cardinality is unbounded by construction. The 250ms threshold line is deliberate: postgresql.conf sets log_min_duration_statement = 250ms and the histogram has a bucket edge at exactly 0.25, so a breach here must be accompanied by lines in the Postgres log. Empty until the first query runs, which is correct on an idle stack — the readiness ping is measured separately in ping_duration_seconds and does not appear here.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 76 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "decimals": 5,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.25 }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*readiness ping.*" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "purple" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [6, 6] } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (le, operation) (rate(sharpline_db_query_duration_seconds_bucket{service=~\"$service\"}[$__rate_interval])))",
+          "legendFormat": "{{operation}} p99",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (le, service) (rate(sharpline_db_ping_duration_seconds_bucket{service=~\"$service\"}[$__rate_interval])))",
+          "legendFormat": "{{service}} readiness ping p99",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Transactions by outcome & errors by SQLSTATE",
+      "description": "Outcomes are a closed set: committed | rolled_back | commit_failed | begin_failed | panicked. On the error series, code is a 5-character SQLSTATE or one of canceled | deadline_exceeded | no_rows | tx_closed | pool_closed | connection | unknown. Two of those are NOT incidents and are excluded from DatabaseInfrastructureErrors on purpose: 23xxx is the schema correctly refusing bad data (23514 is the ledger's zero-sum CHECK), and no_rows is the ordinary outcome of a sqlc :one query that matched nothing. Alerting on either would page someone for a user typing an invalid wager.",
+      "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 76 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*(commit_failed|panicked|begin_failed).*" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } },
+              { "id": "custom.drawStyle", "value": "bars" },
+              { "id": "custom.fillOpacity", "value": 70 }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "^err .*" },
+            "properties": [
+              { "id": "custom.axisPlacement", "value": "right" },
+              { "id": "custom.drawStyle", "value": "bars" },
+              { "id": "custom.fillOpacity", "value": 50 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum by (outcome) (rate(sharpline_db_transactions_total{service=~\"$service\"}[$__rate_interval]))",
+          "legendFormat": "tx {{outcome}}",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum by (code) (rate(sharpline_db_query_errors_total{service=~\"$service\"}[$__rate_interval]))",
+          "legendFormat": "err {{code}}",
+          "range": true
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "sharpline-prometheus" },
+          "expr": "sum by (service, outcome) (rate(sharpline_db_connect_attempts_total{service=~\"$service\"}[$__rate_interval]))",
+          "legendFormat": "connect {{outcome}} ({{service}})",
           "range": true
         }
       ]

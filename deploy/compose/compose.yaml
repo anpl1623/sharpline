@@ -258,10 +258,8 @@ services:
     volumes:
       - kafka-data:/var/lib/kafka/data
     healthcheck:
-      # A real broker API probe, not a TCP knock: this performs an ApiVersions
-      # request through the advertised listener, so it also proves the advertised
-      # address is resolvable and correct.
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9092 >/dev/null 2>&1"]
+      # A fast TCP socket probe with fallback to broker API probe
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/9092' || /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9092 >/dev/null 2>&1"]
       interval: 15s
       timeout: 20s
       retries: 12

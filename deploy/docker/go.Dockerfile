@@ -89,27 +89,45 @@ COPY . .
 # the compile cache is keyed per target arch so a cross-build for amd64 does not
 # evict the arm64 objects (and vice versa) on the dev Mac.
 #
-# The trailing `go tool nm | grep _cgo_` is a prime-directive guard: a
-# cgo-linked binary carries an ELF INTERP segment and cannot run on
-# distroless/static. Failing here beats failing at container start.
+# The two trailing checks are the prime-directive guard: a cgo-linked binary
+# carries an ELF INTERP segment and cannot run on distroless/static. Failing
+# here beats failing at container start.
+#
+# DO NOT REVERT THESE TO `go tool nm /out/sharpline | grep ' _cgo_'`. That was
+# the original guard and it was VACUOUS, measured on 2026-08-17 during the phase
+# 3a gate: `-ldflags="-s -w"` twelve lines below strips the symbol table, so
+# `go tool nm` exits with "no symbol section / no symbols" and prints NOTHING.
+# The grep therefore had no input and could never match. Proven by building
+# ./cmd/api with CGO_ENABLED=1 and the identical `-s -w` flags in a builder with
+# gcc installed: the result was dynamically linked against
+# /lib/ld-musl-aarch64.so.1 -- i.e. it would have crashed on distroless/static
+# -- and it passed the old guard cleanly. The guard was also wrong in the other
+# direction: an UNSTRIPPED CGO_ENABLED=0 binary carries twelve `_cgo_*` runtime
+# DATA symbols (_cgo_mmap, _cgo_sigaction, ...) that exist in every Go binary,
+# so dropping `-s -w` would have made the old guard fail on a perfectly static
+# build.
+#
+# What replaces it:
+#   1. `go version -m` reads the build settings the toolchain EMBEDS in the
+#      binary. That record survives `-s -w`, is written by the compiler rather
+#      than inferred, and is exact.
+#   2. the dynamic-loader string check catches the actual runtime failure the
+#      comment above describes -- a statically linked Go binary never names
+#      /lib/ld-musl-* or /lib64/ld-linux-*.
 #
 # No comments inside the RUN body — the Dockerfile parser handles whole-line
 # comments inside a continued instruction inconsistently across frontends.
 #
-# VERSION/REVISION STAMPING — READ THIS, IT IS CURRENTLY INERT.
-# The Go linker silently ignores `-X` for a symbol that does not exist, so the
-# stamps below cost nothing but also DO NOTHING until a main package (or a
-# shared buildinfo package) declares them. Verified against the real tree:
-# `grep -a v0.1.0-phase0` on the built api binary finds nothing. Two symbol
-# homes are stamped so whichever the backend picks works with no Dockerfile
-# change; declare EITHER of:
-#
-#   package main
-#   var version, commit, buildDate string
-#
-#   package buildinfo   // internal/platform/buildinfo  <- preferred: lets every
-#   var Version, Commit, BuildDate string   //  service export one shared
-#                                           //  sharpline_build_info gauge.
+# VERSION/REVISION STAMPING — LIVE SINCE PHASE 3A. It used to be inert.
+# The Go linker silently ignores `-X` for a symbol that does not exist, so these
+# stamps did nothing until `internal/platform/buildinfo` landed and all six mains
+# were wired to it. They now land: re-verified on 2026-08-17 by extracting
+# /usr/local/bin/sharpline from sharpline/api:local and grepping the binary for
+# the BUILD_DATE and REVISION passed on that build (both present, exactly once).
+# Two symbol homes are stamped — `main.{version,commit,buildDate}` and
+# `internal/platform/buildinfo.{Version,Commit,BuildDate}` — so either wiring
+# works with no Dockerfile change. buildinfo is the one actually consumed; it is
+# what lets every service export one shared sharpline_build_info gauge.
 #
 # `-X main.service` is deliberately NOT set: cmd/*/main.go declares
 # `const service = "api"`, and `-X` cannot write to a const. The service name
@@ -146,8 +164,15 @@ RUN --mount=type=cache,id=sharpline-gomod,target=/go/pkg/mod,sharing=locked \
         -o /out/sharpline \
         ./cmd/${SERVICE}; \
     chmod 0555 /out/sharpline; \
-    if go tool nm /out/sharpline 2>/dev/null | grep -q ' _cgo_'; then \
-        echo "ERROR: binary contains cgo symbols; CGO_ENABLED=0 was not honoured" >&2; \
+    if ! go version -m /out/sharpline | grep -qE '^[[:space:]]*build[[:space:]]+CGO_ENABLED=0$'; then \
+        echo "ERROR: CGO_ENABLED=0 was not honoured; the toolchain recorded:" >&2; \
+        go version -m /out/sharpline | grep -E 'CGO_ENABLED' >&2 || \
+            echo "  (no CGO_ENABLED build setting at all)" >&2; \
+        exit 65; \
+    fi; \
+    if strings /out/sharpline | grep -qE '^/lib(64)?/ld-(musl|linux)'; then \
+        echo "ERROR: binary names a dynamic loader, so it carries an ELF INTERP" >&2; \
+        echo "       segment and cannot run on distroless/static" >&2; \
         exit 65; \
     fi; \
     ls -l /out/sharpline

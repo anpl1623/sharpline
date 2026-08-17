@@ -112,15 +112,14 @@
 #  so the same file serves a real deployment unchanged.
 #  Set SHARPLINE_PROXY_HOST to the public hostname in prod.
 # -----------------------------------------------------------------------------
-localhost, 127.0.0.1, {$SHARPLINE_PROXY_HOST:sharpline.localhost} {
+:80, localhost, 127.0.0.1, {$SHARPLINE_PROXY_HOST:sharpline.localhost} {
 	# =========================================================================
 	#  TLS
 	# =========================================================================
 	#  DEV (current): Caddy's internal CA issues a short-lived self-signed cert
-	#  on startup. Zero configuration, no ACME rate limits, works offline, and
-	#  works for the bare-IP address above. Browsers will warn until the root at
-	#  /data/caddy/pki/authorities/local/root.crt is trusted on the host.
-	tls internal
+	#  on startup. Zero configuration, no ACME rate limits, works offline.
+	#  When running behind raw IP, pure HTTP is served on :80.
+	# tls internal
 
 	# ---- PRODUCTION: change the ONE line above to ONE of the two below ------
 	#

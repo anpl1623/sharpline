@@ -112,6 +112,55 @@ func (r Rounding) Valid() bool {
 	}
 }
 
+// ParseRounding is the inverse of String for the defined modes.
+//
+// It exists because a wager's rounding policy is PERSISTED: `wagers.rounding` is
+// a TEXT column whose CHECK admits exactly the three spellings String produces,
+// so rehydrating a [Wager] out of the database is a call to this function.
+// Without it the round trip is one-way and settlement would have to guess the
+// policy a payout was computed under — which is the one thing a settled wager
+// must never be re-derived from.
+//
+// Case-sensitive, and no aliases. The accepted set is exactly what String emits,
+// nothing more: "HALF_TO_EVEN", "bankers" and "half-to-even" are all errors. A
+// parser that is more forgiving than its serializer is how two spellings of the
+// same policy end up in one column.
+//
+// "unknown" is rejected along with everything else. It is String's rendering of
+// the invalid zero value, never a storable state (the CHECK constraint refuses
+// it), so accepting it here would hand callers a Rounding that every
+// float-consuming operation then rejects.
+func ParseRounding(s string) (Rounding, error) {
+	switch s {
+	case "half_away_from_zero":
+		return RoundHalfAwayFromZero, nil
+	case "half_to_even":
+		return RoundHalfToEven, nil
+	case "toward_zero":
+		return RoundTowardZero, nil
+	default:
+		return RoundingUnknown, fmt.Errorf("rounding mode %q: %w", sample(s), ErrUnknownRounding)
+	}
+}
+
+// MarshalText implements encoding.TextMarshaler.
+func (r Rounding) MarshalText() ([]byte, error) {
+	if !r.Valid() {
+		return nil, fmt.Errorf("rounding mode %d: %w", uint8(r), ErrUnknownRounding)
+	}
+	return []byte(r.String()), nil
+}
+
+// UnmarshalText implements encoding.TextUnmarshaler.
+func (r *Rounding) UnmarshalText(b []byte) error {
+	parsed, err := ParseRounding(string(b))
+	if err != nil {
+		return err
+	}
+	*r = parsed
+	return nil
+}
+
 // FromMinorUnits builds a Money from a count of minor units.
 //
 // It returns an error outside [MinSafeMoney, MaxSafeMoney] rather than

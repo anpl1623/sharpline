@@ -250,8 +250,9 @@ func orderedProduct(factors []float64) float64 {
 //
 // # Residual limits
 //
-// The quadrature's ordering heuristic and stopping rule are Genz's, and its error
-// estimate is the spread across shifted lattices rather than a proven bound. The
+// The quadrature's ordering heuristic is Genz's; its stopping rule is a refinement
+// test on the running estimate, which is an error estimate rather than a proven
+// bound (latticeEstimate states what it measures and what it does not). The
 // result is checked against the Fréchet-Hoeffding bounds that hold under any
 // dependence structure — max(0, Σp_i − (n−1)) ≤ P ≤ min p_i — and a violation
 // beyond the numerical slack returns ErrParlayNotPriceable. Passing that check

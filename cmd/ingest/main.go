@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/anpl1623/sharpline/internal/platform/buildinfo"
 	"github.com/anpl1623/sharpline/internal/platform/config"
 	"github.com/anpl1623/sharpline/internal/platform/httpx"
 	"github.com/anpl1623/sharpline/internal/platform/logging"
@@ -43,7 +44,11 @@ func run() error {
 	}
 
 	log := logging.New(os.Stdout, cfg.LogLevel, service, cfg.Env)
-	log.Info("starting", slog.Any("config", cfg))
+	// Build identity on the first line; see cmd/api/main.go for why.
+	log.Info("starting",
+		slog.Any("build", buildinfo.Read()),
+		slog.Any("config", cfg),
+	)
 
 	// Recorded now because it is the single most consequential runtime switch
 	// in this binary; the adapter it selects is built in phase 3.
@@ -55,10 +60,23 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	// The registry is built here rather than left to httpx.NewServer's nil
+	// fallback so that a collector can be installed on it BEFORE the listener is
+	// constructed. Registering after NewServer would work too, but only via
+	// srv.Registry(), which reads as reaching back into the server for a
+	// dependency it was never given (CLAUDE.md §12: constructor injection).
+	registry := httpx.NewRegistry()
+
+	// sharpline_build_info; see cmd/api/main.go.
+	if err := buildinfo.Register(registry, service); err != nil {
+		return fmt.Errorf("%s: %w", service, err)
+	}
+
 	srv, err := httpx.NewServer(httpx.ServerOptions{
-		Service: service,
-		Addr:    cfg.HTTPAddr,
-		Logger:  log,
+		Service:  service,
+		Addr:     cfg.HTTPAddr,
+		Logger:   log,
+		Registry: registry,
 	})
 	if err != nil {
 		return fmt.Errorf("%s: build operational listener: %w", service, err)

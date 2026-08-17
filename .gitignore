@@ -49,7 +49,13 @@ cover.html
 # Reproduce a recorded failure from its seed instead — rapid prints the
 # -rapid.seed= value alongside the failfile path — or record the counterexample as
 # an ordinary table-driven case, which is where a found bug belongs permanently.
-testdata/rapid/
+#
+# NOTE the leading `**/`. A gitignore pattern containing a mid-string slash is
+# ANCHORED to the directory holding the .gitignore, so a bare `testdata/rapid/`
+# matched only a repo-root `/testdata/rapid/` — which does not exist — and left
+# the real failfiles under `internal/domain/odds/testdata/rapid/` fully tracked.
+# That is exactly the situation this rule was written to prevent. Keep the `**/`.
+**/testdata/rapid/
 
 # ── Node / Next.js ───────────────────────────────────────────────────────────
 # node_modules and .next live on named Docker volumes, never on the host

@@ -1001,10 +1001,12 @@ var ErrOrthantNotConverged = errors.New("multivariate normal quadrature did not 
 
 const (
 	// orthantRelTol and orthantAbsTol together set the stopping rule. The
-	// quadrature stops when three times the standard error across the shifted
-	// lattices falls to max(orthantAbsTol, orthantRelTol·estimate) — three sigma,
-	// so a result is called converged only when the spread across independent
-	// shifts is comfortably tighter than the target.
+	// quadrature stops when three times the largest movement of the running
+	// estimate across its last two doublings of work falls to
+	// max(orthantAbsTol, orthantRelTol·estimate) — a refinement test, so a result
+	// is called converged only when doubling the effort twice in a row would move
+	// the answer by comfortably less than the target. latticeEstimate documents why
+	// the criterion measures movement rather than a standard error across shifts.
 	//
 	// The target is RELATIVE because the quantity spans orders of magnitude: a
 	// three-leg joint sits near 0.2 and a twenty-five-leg one near 1e-5, and an
@@ -1030,9 +1032,10 @@ const (
 	//     4e-4 in absolute probability, itself only a couple of Monte Carlo standard
 	//     errors, so most of that gap is the reference rather than the quadrature.
 	//
-	// The stopping rule binds only on long, heavily correlated tickets, and on the
-	// near-singular edge of the positive semi-definite region it cannot be met at
-	// all; that case returns ErrOrthantNotConverged.
+	// The stopping rule binds only on long, heavily correlated tickets and on the
+	// singular edge of the positive semi-definite region, where the integrand
+	// collapses to a discontinuous indicator. Those cases now cost more batches
+	// rather than being refused; see orthantMaxBatches.
 	//
 	// orthantAbsTol is a floor, not a target. Relative accuracy on a vanishingly
 	// small orthant probability is both unattainable and pointless: a joint
@@ -1048,12 +1051,13 @@ const (
 	// are not required by the Richtmyer construction.
 	//
 	// The split between the two is a real trade rather than an arbitrary
-	// factorisation. Accuracy for a fixed budget favours few large lattices, since
-	// a single lattice's error falls as 1/N while averaging independent shifts only
-	// divides it by √batches; the error ESTIMATE favours many small ones, since it
-	// is a variance over the batch means. Eight lattices of 8,192 is the smallest
-	// budget that both leaves the variance meaningful and measured inside the
-	// target across the whole accuracy profile.
+	// factorisation. Accuracy for a fixed budget favours few large lattices, since a
+	// single lattice's error falls as 1/N; the error ESTIMATE favours many small
+	// ones, because it is measured across doublings of the batch count and a budget
+	// of B batches offers only log₂B of them. Eight lattices of 8,192 is the
+	// smallest budget that both leaves three checkpoints under the floor — which is
+	// what the two-quiet-doublings rule needs before it may stop at all — and lands
+	// inside the target across the whole accuracy profile.
 	//
 	// The floor is a real cost: 65,536 integrand evaluations, each a normal CDF and
 	// a normal quantile per dimension, so a six-leg parlay is on the order of ten
@@ -1068,33 +1072,40 @@ const (
 	// orthantMaxBatches caps the batch loop at 256, i.e. 2,097,152 points. Reaching
 	// it returns ErrOrthantNotConverged.
 	//
-	// It was 96, and 96 was too low for one input class that is not exotic: a
-	// correlation matrix sitting exactly on the boundary of the positive
+	// # History, because the first answer here was the wrong one
+	//
+	// It was 96, and was raised to 256 to make one input class stop being refused:
+	// a correlation matrix sitting exactly on the boundary of the positive
 	// semi-definite region. Equicorrelation at ρ = -1/(n-1) is singular, so Cholesky
 	// produces a zero pivot, so the last variable is a deterministic combination of
 	// the earlier ones and its factor in the integrand collapses from a normal CDF
 	// to a {0,1} indicator. A lattice rule is fast on a smooth integrand and slow on
-	// a discontinuous one, and that is exactly the trade made here.
+	// a discontinuous one.
 	//
-	// The measured case: three legs at 0.125, 0.2998 and 0.9556 with ρ = -0.5 — a
-	// perfectly ordinary set of marginals for three mutually-exclusive-ish outcomes.
-	// Its 3σ spread reaches 1.017e-6 at 96 batches against a target of 1e-6 and
-	// 9.942e-7 at 200, where it converges and stays; the estimate itself has already
-	// settled to 1.40683e-5 by then, so the extra batches are buying the error
-	// ESTIMATE rather than the answer. 256 clears it with headroom and keeps the
-	// power-of-two shape of the other two constants.
+	// That raise treated a symptom. The property suite went on to find a second
+	// input on the same edge — three legs at 0.25, 0.15929 and 0.96405 at ρ = -0.5 —
+	// where the old rule's spread was still 1.395e-6 against a 1e-6 target after all
+	// 256 batches, and the ticket was refused again. Raising the cap a second time
+	// would have bought one more counterexample's silence at 4M evaluations, and a
+	// third would have cost 8M.
 	//
-	// Note what was NOT changed: the stopping rule. Reaching the answer by widening
-	// the tolerance would have been a smaller diff and a worse one — the accuracy
-	// demanded of a delivered price is identical, and only the effort permitted to
-	// reach it has moved. The cap still binds, and reaching it still refuses to
-	// return the unconverged estimate.
+	// The reason it was a treadmill is recorded on latticeEstimate: the quantity
+	// being driven below the target was not the error. On this input the true error
+	// was 1.9e-7 at the eight-batch FLOOR — already an order inside the target —
+	// while the reported statistic, which assumes independent batches this estimator
+	// does not have, stood at 7.5e-6 and fell only as B^-0.5. The cap was never the
+	// binding constraint; the error estimate was. Correcting it prices that input at
+	// 64 batches, a quarter of the cap, with a measured error of 1.4e-7.
+	//
+	// So the cap stays at 256 as headroom rather than as the fix, and it still binds
+	// on integrands that genuinely cannot be reached — a 24-dimensional product of
+	// Gaussians is pinned as one in TestLatticeAccuracyProfile — where reaching it
+	// still refuses rather than returning the estimate it happens to hold.
 	//
 	// The cost is bounded and paid only by the hard cases: a well-conditioned parlay
-	// still stops at the orthantMinBatches floor of 8. The worst case is now about
-	// 2.1M integrand evaluations, a few hundred milliseconds, which is a price worth
-	// paying to quote a ticket rather than refuse it — and a caller pricing hundreds
-	// of combinations should already be caching, as the note above says.
+	// still stops at the orthantMinBatches floor of 8. The worst case is about 2.1M
+	// integrand evaluations, a few hundred milliseconds; a caller pricing hundreds of
+	// combinations should already be caching, as the note above says.
 	orthantMaxBatches = 256
 
 	// orthantMaxDimension is the largest integration dimension, one below the
@@ -1158,8 +1169,11 @@ func fractionalPart(x float64) float64 { return x - math.Floor(x) }
 // baker (tent) transform x ↦ |2x − 1| that periodises the integrand and lifts the
 // convergence rate, then shifted (Cranley & Patterson, "Randomization of Number
 // Theoretic Methods for Multiple Integration", SIAM Journal on Numerical Analysis,
-// Vol. 13 (1976), pp. 904-914) and averaged over several shifts. The spread across
-// shifts is the error estimate.
+// Vol. 13 (1976), pp. 904-914) and averaged over several shifts. The shifts run
+// along their own Kronecker sequence rather than a random source, so the average is
+// over a stratified set of displacements and not over independent draws — which is
+// what makes the result reproducible, and what dictates how its error is estimated
+// (see latticeEstimate).
 //
 // Variables are reordered most-constrained-first — ascending threshold — before
 // factoring, which is Genz's recommended ordering heuristic and sharply reduces the
@@ -1172,19 +1186,22 @@ func fractionalPart(x float64) float64 { return x - math.Floor(x) }
 //
 // # Convergence criterion, iteration cap, and determinism
 //
-// Batches of orthantLatticePoints are accumulated until three times the standard
-// error of the batch means falls to max(orthantAbsTol, orthantRelTol·estimate),
-// with at least orthantMinBatches evaluated and at most orthantMaxBatches.
-// Exhausting the cap returns ErrOrthantNotConverged; the unconverged estimate is
-// never returned to a caller.
+// Batches of orthantLatticePoints are accumulated until three times the largest
+// movement of the running estimate across its last two doublings of work falls to
+// max(orthantAbsTol, orthantRelTol·estimate), with at least orthantMinBatches
+// evaluated and at most orthantMaxBatches. Exhausting the cap returns
+// ErrOrthantNotConverged; the unconverged estimate is never returned to a caller.
 //
 // The shifts are generated from a fixed irrational sequence rather than from a
 // random source, so the function is deterministic: the same inputs give bit-identical
-// output on every run and every platform, which is what lets it be tested at all.
-// The cost is that the reported standard error is the spread over one fixed set of
-// shifts rather than a fresh random sample, so it is an error estimate and not an
-// error bound. The tests measure the achieved accuracy against an independent
-// simulation instead of trusting it.
+// output on every run and every platform, which is what lets it be tested at all. It
+// also means the batch means are not independent samples, so a standard error across
+// them says nothing about this estimator — latticeEstimate records the measurement
+// that established that and the refinement test used in its place. What remains true
+// either way is that the stopping quantity is an error ESTIMATE and not a bound, so
+// the tests measure achieved accuracy against independent references — the
+// identity-matrix closed form, a polar-coordinate integral for the singular
+// trivariate orthant, and a seeded simulation — instead of trusting it.
 //
 // # Range and edge cases
 //
@@ -1476,13 +1493,56 @@ func clampToOpenUnit(p float64) float64 {
 }
 
 // latticeEstimate integrates f over the unit cube [0,1]^dimension by averaging
-// shifted Richtmyer lattice rules, stopping when three times the standard error of
-// the batch means falls to max(absTol, relTol·|estimate|).
+// shifted Richtmyer lattice rules, stopping when the running estimate stops moving:
+// three times the largest movement across the last two doublings of the batch count
+// must fall to max(absTol, relTol·|estimate|).
+//
+// # Why the stopping rule is a refinement test and not a standard error
+//
+// This routine used to stop on 3·√(V̂/B), where V̂ is the sample variance of the B
+// batch means. That statistic is the standard error of a mean of B INDEPENDENT
+// samples, and the batches here are not independent samples of anything. Every
+// batch is the same Richtmyer lattice displaced by shift_b = frac(b·√q), a Kronecker
+// sequence, so the shifts are a deterministic low-discrepancy set rather than random
+// draws (Cranley & Patterson randomisation with the randomness removed, which is
+// what makes this function reproducible bit for bit). Averaging over stratified
+// shifts converges far faster than averaging over independent ones, so 3·√(V̂/B) is
+// not an estimate of this estimator's error — it is an estimate of a different,
+// worse estimator's error, and it exceeds the truth by one to three orders of
+// magnitude.
+//
+// That is measurable rather than arguable, and TestLatticeErrorEstimateTracksTruth
+// measures it. On the singular three-leg orthant that motivated this change the old
+// statistic fell as B^-0.5 (7.53e-6 at 8 batches to 3.46e-7 at 4096, a factor of 21.8
+// over 512× the work, against √512 = 22.6) while the true error fell roughly as B^-1
+// and was already 1.9e-7 at the eight-batch floor. The rule therefore demanded two
+// million points to certify an answer that sixty-five thousand had already delivered,
+// exhausted the cap, and refused to price a perfectly ordinary ticket.
+//
+// The replacement measures the thing the caller actually cares about: how much the
+// answer would still move if the work kept doubling. Because the running mean over 2B
+// batches is (m_B + m'_B)/2, the movement |m_2B − m_B| is half the disagreement
+// between the two halves and so is naturally on the scale of the error of m_2B — a
+// self-calibrating quantity, no distributional assumption attached. Two guards keep
+// it conservative: the movement is multiplied by three, preserving the old rule's
+// safety factor, and the largest of the LAST TWO movements is used, so a single
+// checkpoint that happens to land on a stationary point cannot trigger a stop.
+//
+// It remains an error ESTIMATE and not a proven bound — a deterministic sequence can
+// plateau — which is why the tests measure achieved accuracy against independent
+// references (the identity-matrix closed form, and a polar-coordinate reference for
+// the singular trivariate orthant) rather than against this number.
+//
+// Checkpoints are at powers of two and at maxBatches, so the work is at most twice
+// what an every-batch test would use, and a doubling is what the movement is
+// measured across.
 //
 // On non-convergence it returns the last estimate together with its spread AND a
 // non-nil error. The estimate is returned only so that a diagnostic can report how
 // far off it was; it must not be used, and the single production caller discards
-// it. Every other function in this package treats a non-nil error as fatal.
+// it. Every other function in this package treats a non-nil error as fatal. The
+// spread is +Inf when the cap was too small to reach two checkpoint movements at all,
+// which is the honest report: nothing was measured.
 //
 // It is factored out of orthantByLattice so that the stopping rule can be tested
 // directly, including the non-convergence path that a converged integrand never
@@ -1496,8 +1556,14 @@ func latticeEstimate(dimension int, f func([]float64) float64, minBatches, maxBa
 	point := make([]float64, dimension)
 	shift := make([]float64, dimension)
 
-	var total, totalSquares float64
-	batches := 0
+	var (
+		total       float64
+		checkpoint  float64 // running estimate at the previous checkpoint
+		movement    float64 // |estimate − checkpoint| at the previous checkpoint
+		checkpoints int
+	)
+	spread = math.Inf(1)
+
 	for batch := 1; batch <= maxBatches; batch++ {
 		for i := range dimension {
 			shift[i] = fractionalPart(float64(batch) * latticeShiftBase[i])
@@ -1514,28 +1580,36 @@ func latticeEstimate(dimension int, f func([]float64) float64, minBatches, maxBa
 			batchTotal += f(point)
 		}
 
-		mean := batchTotal / orthantLatticePoints
-		total += mean
-		totalSquares += mean * mean
-		batches = batch
+		total += batchTotal / orthantLatticePoints
+		estimate = total / float64(batch)
 
-		if batch >= minBatches {
-			estimate = total / float64(batches)
-			variance := (totalSquares - float64(batches)*estimate*estimate) / float64(batches-1)
-			if variance < 0 {
-				variance = 0 // cancellation on a set of identical batch means
-			}
-			spread = 3 * math.Sqrt(variance/float64(batches))
-			if spread <= math.Max(absTol, relTol*math.Abs(estimate)) {
-				return estimate, spread, nil
-			}
+		if batch&(batch-1) != 0 && batch != maxBatches {
+			continue // not a doubling and not the cap
+		}
+
+		previous := movement
+		movement = math.Abs(estimate - checkpoint)
+		checkpoint = estimate
+		checkpoints++
+
+		// The first checkpoint has nothing to move away from, and the second has
+		// measured only one movement where the rule wants two.
+		if checkpoints < 3 {
+			continue
+		}
+
+		// The larger of the last two movements, so a single checkpoint that lands
+		// on a stationary point cannot certify a result on its own.
+		spread = 3 * math.Max(movement, previous)
+		if batch >= minBatches && spread <= math.Max(absTol, relTol*math.Abs(estimate)) {
+			return estimate, spread, nil
 		}
 	}
 
 	return estimate, spread, fmt.Errorf(
-		"odds: lattice integration in %d dimensions reached a three-sigma spread of only %g on an estimate of %g, "+
-			"against a relative target of %g, in %d batches of %d points: %w",
-		dimension, spread, estimate, relTol, maxBatches, orthantLatticePoints, ErrOrthantNotConverged)
+		"odds: lattice integration in %d dimensions moved by %g across its last doublings on an estimate of %g, "+
+			"against a target of max(%g, %g·estimate), in %d batches of %d points: %w",
+		dimension, spread, estimate, absTol, relTol, maxBatches, orthantLatticePoints, ErrOrthantNotConverged)
 }
 
 // snapToUnitRange pulls a value that is within correlationRangeTolerance of ±1

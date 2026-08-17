@@ -39,6 +39,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/anpl1623/sharpline/internal/platform/buildinfo"
 	"github.com/anpl1623/sharpline/internal/platform/config"
 	"github.com/anpl1623/sharpline/internal/platform/logging"
 	"github.com/anpl1623/sharpline/internal/platform/migrate"
@@ -86,7 +87,15 @@ func run(inv migrate.Invocation) error {
 	}
 
 	log := logging.New(os.Stdout, cfg.LogLevel, service, cfg.Env)
+	// The build identity is on the first line for every binary (see
+	// cmd/api/main.go), and this is the ONLY place it appears for this one: the
+	// package comment above explains why migrate serves no /metrics endpoint, so
+	// there is no sharpline_build_info series for it. That makes the log line the
+	// sole answer to "which image applied this migration" — which is exactly the
+	// question asked when a deploy rolls an older image over a newer schema, the
+	// case `validate` exists to refuse.
 	log.Info("starting",
+		slog.Any("build", buildinfo.Read()),
 		slog.Any("config", cfg),
 		slog.String("command", string(inv.Command)),
 	)

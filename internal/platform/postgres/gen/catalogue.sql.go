@@ -567,6 +567,7 @@ SELECT id, league_id, kind, name,
   FROM events
  WHERE home_competitor_name IS NOT NULL
    AND lower(home_competitor_name) LIKE lower($2::TEXT) || '%'
+   AND status IN ('scheduled', 'live')
 UNION
 SELECT id, league_id, kind, name,
        home_competitor_name, away_competitor_name,
@@ -574,6 +575,7 @@ SELECT id, league_id, kind, name,
   FROM events
  WHERE away_competitor_name IS NOT NULL
    AND lower(away_competitor_name) LIKE lower($2::TEXT) || '%'
+   AND status IN ('scheduled', 'live')
  ORDER BY scheduled_start
  LIMIT $1
 `
@@ -616,6 +618,47 @@ type SearchOpenEventsByCompetitorPrefixRow struct {
 // caller cannot turn the search into a leading-wildcard scan by passing "%x".
 // (A literal `%` or `_` inside the prefix still matches as a wildcard -- escape
 // it at the call site if that ever matters.)
+//
+// ---------------------------------------------------------------------------
+// THE STATUS PREDICATE, AND WHY IT IS A NARROWER SET THAN THE BOARD'S
+// ---------------------------------------------------------------------------
+//
+// Phase 2 shipped this query with NO status predicate at all, so it returned
+// settled, cancelled and postponed events -- the name said "Open", the comment
+// said "Tradeable", and the SQL said "every event that ever existed". A search box
+// that offers last season's finals is not a defect a user reports; it is one they
+// quietly stop trusting the product over.
+//
+// The set is 'scheduled' and 'live', and it is NOT hand-picked: it is exactly
+// domain.EventStatus.AcceptsWagers(), which is the one definition of "tradeable"
+// the system has. If a status is ever added to or removed from that method, this
+// predicate changes with it -- the two are kept in agreement by hand, and the place
+// that catches a divergence is the SearchOpenEventsByCompetitorPrefix subtest in
+// test/integration/queries_test.go, which cancels this event and asks what comes
+// back. Phase 2 wrote that subtest as a TRIPWIRE recording the missing predicate
+// ("If that was a deliberate fix, delete this assertion"); this is the deliberate
+// fix, so the assertion it left inverts here -- a cancelled event must now return
+// ZERO rows.
+//
+// That makes this set deliberately NARROWER than the ('scheduled','live',
+// 'suspended') of ListOpenEventsInLeague and ListOpenEventsStartingBefore above.
+// The difference is real and it is a product decision, not an oversight: those two
+// queries populate the BOARD, which shows a suspended market greyed out because a
+// suspension is usually seconds long and hiding the event mid-suspension would
+// make the board flicker. This query answers "what can I bet on", and a suspended
+// market cannot be bet on -- Market.AcceptsWagers refuses it at the slip.
+//
+// The consequence to accept: a user searching during a suspension will not find
+// that event. If that turns out to be the wrong trade, the fix is to add
+// 'suspended' HERE and say so -- not to widen AcceptsWagers, which governs whether
+// a wager is accepted and must not be loosened to make a search box friendlier.
+//
+// PLAN NOTE: unlike the two board queries, these literals are NOT matching a
+// partial index's predicate. events_{home,away}_competitor_search_idx are partial
+// on `<col> IS NOT NULL` only, so status is evaluated as a filter on the rows the
+// index scan returns. That is the right shape here -- the prefix is far more
+// selective than the status -- and it is why the set can be chosen on product
+// grounds rather than being dictated by an index definition.
 func (q *Queries) SearchOpenEventsByCompetitorPrefix(ctx context.Context, arg SearchOpenEventsByCompetitorPrefixParams) ([]SearchOpenEventsByCompetitorPrefixRow, error) {
 	rows, err := q.db.Query(ctx, searchOpenEventsByCompetitorPrefix, arg.RowLimit, arg.Prefix)
 	if err != nil {

@@ -603,22 +603,37 @@ buildx-web: buildx-setup ## Multi-arch build of the web image
 migrate: ## Run migrations to head via the real migrate container (never a host binary)
 	$(COMPOSE) run --rm migrate
 
+# These two used to drive the GOOSE CLI in the tools image, because they predate the
+# migrate binary. That left TWO implementations of the same operation in the repo --
+# `goose status` against the migrations/ directory, and `migrate status` against the
+# SQL embedded in the image -- and they can disagree about the only thing either is
+# for. The disagreement is not hypothetical: the CLI reads the working tree, the
+# binary reads its own embed, so an uncommitted migration file is "pending" to one
+# and does not exist to the other, and an image built before a migration was added
+# reports a different set than the checkout it is running beside.
+#
+# CLAUDE.md section 9 settles which one wins -- migrations are "never a binary
+# someone runs by hand", the operation belongs to the image the compose stack and
+# the Helm hook run -- so every migrate-* target below now drives the BINARY. The
+# thing a developer exercises locally is the thing that runs in production.
+#
+# `migrate-create` is the ONE exception and it stays on the goose CLI, because the
+# binary has no create mode and should not grow one: internal/platform/migrate
+# implements up / up-to / down / down-to / status / version / validate (see
+# migrate.Command), all of which operate on an embedded, already-built SQL set.
+# Scaffolding a NEW file is a working-tree operation on a repo the runtime image
+# does not contain -- the image has no shell, no filesystem to write into, and its
+# embed is fixed at build time. So it is the tools container's job by construction,
+# not by legacy.
+
 .PHONY: migrate-status
-migrate-status: ## Show migration status (ad-hoc goose control)
-	$(COMPOSE_TOOLS) run --rm goose goose status
+migrate-status: ## List every embedded migration and whether it is applied (migrate binary)
+	$(COMPOSE) run --rm migrate status
 
 .PHONY: migrate-down
-migrate-down: ## Roll back the most recent migration (ad-hoc goose control)
-	$(COMPOSE_TOOLS) run --rm goose goose down
+migrate-down: ## Roll back the most recently applied migration (migrate binary)
+	$(COMPOSE) run --rm migrate down
 
-# The four targets below drive the migrate BINARY, not the goose CLI, and that is
-# the point of them. `migrate-status` / `migrate-down` above reach for the tools
-# image because they predate the binary; these do not, so the thing CI and the
-# Helm hook run in production is the thing a developer exercises locally. CLAUDE.md
-# section 9: migrations are "never a binary someone runs by hand" -- so every one of
-# these is a container invocation of the same image the compose stack and the k8s
-# Job use.
-#
 # `validate` is the pre-flight: it refuses to run when the database carries an
 # applied version this image does not embed, which is what deploying an older
 # image over a newer schema looks like. Without it that case reports "0 applied"
@@ -747,22 +762,48 @@ migrate-dry-run: build-tools ## Apply + roll back every migration on a THROWAWAY
 ##@ Test
 # =============================================================================
 
+# FLAG PASSTHROUGH. Both targets forward $(ARGS) to `go test`, which is the same
+# variable the redis-cli, kafka-topics, npm and terraform targets already use for
+# "extra flags for the underlying tool" -- so there is one convention to learn
+# rather than a per-target one.
+#
+# This closes a real CLAUDE.md section 12 gap ("every developer action has a make
+# target"). The recipes used to be a literal `go test -count=1 $(PKG)` with no seam,
+# so there was no way to get -v, -run, -shuffle=on or -timeout through make, and
+# phase 2 worked around it three times by hand-writing the whole `docker run`
+# invocation -- which is precisely how a host `go test` eventually creeps in.
+#
+#   make test  ARGS=-v
+#   make test  ARGS='-run TestParseRounding -v'  PKG=./internal/domain
+#   make test  ARGS='-shuffle=on -timeout=20m'
+#   make test  ARGS='-run TestSearchOpenEvents' PKG=./test/integration
+#
+# $(PKG) stays a separate variable and stays LAST, so a package pattern in ARGS
+# would be a second pattern rather than a replacement -- pass PKG for that.
 .PHONY: test
-test: cache-init docker-socket ## Run the Go suite in a container (docker socket mounted for testcontainers)
+test: cache-init docker-socket ## Run the Go suite in a container (ARGS='-v -run X', PKG=./internal/...)
 	docker run --rm \
 	  $(DOCKER_GO_FLAGS) \
 	  $(DOCKER_TESTCONTAINERS_FLAGS) \
 	  $(GO_IMAGE) \
-	  go test -count=1 $(PKG)
+	  go test -count=1 $(ARGS) $(PKG)
 
+# The flags reach `go test` as POSITIONAL PARAMETERS rather than being interpolated
+# into the `sh -c` script, and that is not stylistic. Interpolating them would put
+# $(ARGS) inside a single-quoted shell string, so ARGS='-run "A|B"' -- the exact
+# shape a -run pattern with an alternation takes -- would terminate the quoting and
+# the recipe would fail on a syntax error rather than on a test. Passing them after
+# the script makes the shell do the splitting, so any quoting the caller writes
+# survives intact. `go-test` is $0 and exists only to occupy that slot.
 .PHONY: test-race
-test-race: cache-init docker-socket ## Run the suite under the race detector (needs CGO + a C toolchain)
+test-race: cache-init docker-socket ## Run the suite under the race detector (ARGS/PKG as above; needs CGO + a C toolchain)
 	docker run --rm \
 	  $(DOCKER_GO_FLAGS) \
 	  $(DOCKER_TESTCONTAINERS_FLAGS) \
 	  -e CGO_ENABLED=1 \
 	  $(GO_IMAGE) \
-	  sh -c 'apk add --no-cache gcc musl-dev >/dev/null && go test -race -count=1 $(PKG)'
+	  sh -c 'apk add --no-cache gcc musl-dev >/dev/null && exec go test -race -count=1 "$$@"' \
+	    go-test $(ARGS) $(PKG)
 
 # Coverage thresholds, from CLAUDE.md section 10: "Coverage target 80% overall, and
 # effectively 100% on internal/domain/odds." They are ENFORCED here, not merely
@@ -825,32 +866,85 @@ test-race: cache-init docker-socket ## Run the suite under the race detector (ne
 # and 1 in vig.go, already annotated as unreachable-but-kept in the source.
 #
 # A rise for any OTHER reason is a design signal, not a routine edit.
+# ---------------------------------------------------------------------------
+# Why -coverpkg is not optional here
+# ---------------------------------------------------------------------------
+#
+# Without it, `go test` instruments ONLY the package whose tests are running. A
+# package exercised entirely from another package's tests therefore reports zero,
+# and the number is not a measurement -- it is an artefact of which directory the
+# test file happens to live in.
+#
+# Phase 2 made that concrete: internal/platform/postgres/gen showed 0/158 while
+# test/integration ran every one of its generated queries against a real Postgres.
+# The 158 statements were covered; the profile just had nowhere to record it. A
+# coverage report that says 0% about tested code teaches people to disbelieve the
+# report, which costs more than the missing number.
+#
+# `-coverpkg=./...` instruments every package in the module for every test binary,
+# so a hit is attributed to the package that OWNS the line rather than to the
+# package that happened to run. The costs, both real and both accepted: every test
+# binary now compiles instrumented copies of every package (slower, absorbed by the
+# build cache), and the merged profile contains the SAME BLOCK MORE THAN ONCE --
+# once per test binary that instrumented it. The rollup below dedupes by block
+# identity for exactly that reason. Summing the raw lines, which is what the
+# pre-3a script did, would multiply the denominator by the number of test binaries
+# and report a total that is both wrong and flattering.
+#
+# The pattern is `./...` rather than a hand-picked list: a package added later must
+# default to being measured. cmd/* is therefore in the denominator too, at 0%,
+# which is honest -- a `func main` wired by hand is not covered by anything, and
+# the number should say so rather than hide it by exclusion.
+COVER_PKGS ?= ./...
+
+# ---------------------------------------------------------------------------
+# The thresholds, and what 3a changed
+# ---------------------------------------------------------------------------
+#
+# COVER_MIN_TOTAL stays 80, which is CLAUDE.md section 10's floor verbatim. Adding
+# -coverpkg cannot lower a coverage figure -- the set of coverable blocks is
+# unchanged (packages with no test files were already in the profile; Go emits
+# zero-coverage entries for them), and blocks that were already hit stay hit. All
+# it does is credit hits that were previously discarded. So the floor did not need
+# to move to accommodate the fix, which is the only reason it did not: a gate
+# lowered to make a number pass is a gate deleted with extra steps.
+#
+# COVER_MAX_ODDS_UNCOVERED is a BLOCK BUDGET, not a percentage (see the long note
+# above). It can only fall under -coverpkg, never rise, for the same reason.
 COVER_MIN_TOTAL          ?= 80
 COVER_MAX_ODDS_UNCOVERED ?= 18
 COVER_ODDS_PKG           ?= github.com/anpl1623/sharpline/internal/domain/odds
 
 .PHONY: cover
-cover: cache-init docker-socket ## Coverage: per-package rollup + HTML, gated at 80% overall and on domain/odds' uncovered-block budget
+cover: cache-init docker-socket ## Coverage: per-package rollup + HTML, cross-package attribution via -coverpkg, gated
 	docker run --rm \
 	  $(DOCKER_GO_FLAGS) \
 	  $(DOCKER_TESTCONTAINERS_FLAGS) \
 	  $(GO_IMAGE) \
-	  go test -count=1 -covermode=atomic -coverprofile=coverage.out $(PKG)
+	  go test -count=1 -covermode=atomic -coverpkg=$(COVER_PKGS) -coverprofile=coverage.out $(ARGS) $(PKG)
 	docker run --rm $(DOCKER_GO_FLAGS) $(GO_IMAGE) go tool cover -func=coverage.out
 	docker run --rm $(DOCKER_GO_FLAGS) $(GO_IMAGE) go tool cover -html=coverage.out -o coverage.html
 	@docker run --rm $(DOCKER_GO_FLAGS) $(GO_IMAGE) awk \
 	  -v minTotal='$(COVER_MIN_TOTAL)' -v maxOddsGap='$(COVER_MAX_ODDS_UNCOVERED)' -v oddsPkg='$(COVER_ODDS_PKG)' ' \
 	  /^mode:/ { next } \
 	  { \
-	    file = $$1; sub(/:[0-9]+\.[0-9]+,[0-9]+\.[0-9]+$$/, "", file); \
-	    pkg = file; sub(/\/[^\/]*$$/, "", pkg); \
-	    if (!(pkg in seen)) { seen[pkg] = 1; order[++n] = pkg } \
-	    ns = $$2 + 0; hit = (($$3 + 0) > 0); \
-	    stmt[pkg] += ns; total += ns; \
-	    if (hit) { cov[pkg] += ns; covered += ns } \
-	    else if (pkg == oddsPkg) { gap[++g] = $$1 } \
+	    key = $$1; \
+	    if (!(key in nstmt)) { \
+	      korder[++k] = key; nstmt[key] = $$2 + 0; \
+	      file = key; sub(/:[0-9]+\.[0-9]+,[0-9]+\.[0-9]+$$/, "", file); \
+	      pkg = file; sub(/\/[^\/]*$$/, "", pkg); \
+	      pkgof[key] = pkg; \
+	      if (!(pkg in seen)) { seen[pkg] = 1; order[++n] = pkg } \
+	    } \
+	    if (($$3 + 0) > 0) { hits[key] = 1 } \
 	  } \
 	  END { \
+	    for (j = 1; j <= k; j++) { \
+	      key = korder[j]; pkg = pkgof[key]; ns = nstmt[key]; \
+	      stmt[pkg] += ns; total += ns; \
+	      if (key in hits) { cov[pkg] += ns; covered += ns } \
+	      else if (pkg == oddsPkg) { gap[++g] = key } \
+	    } \
 	    printf "\ncoverage by package (statements)\n"; \
 	    printf "  ------------------------------------------------------------------------\n"; \
 	    for (i = 1; i <= n; i++) { \
@@ -1257,22 +1351,152 @@ web-build: ## Production Next.js build in a container (standalone output)
 # =============================================================================
 ##@ Terraform (runs from the tools container, CLAUDE.md section 9)
 # =============================================================================
+#
+# CLAUDE.md section 9: "Nothing is provisioned by hand. Terraform owns the kind
+# cluster, Kafka topics and their per-topic retention/compaction settings, Grafana
+# dashboards and alert rules, namespaces... Runs from the tools container like
+# everything else." The release binary is baked into deploy/docker/tools.Dockerfile
+# and is never a host dependency.
+#
+# TF_ENV selects the environment root under deploy/terraform/envs/ and is consumed
+# by compose.tools.yaml's `terraform` service as its working_dir. It is exported
+# near the top of this file (default: local).
+#
+#   make tf-init                          # local
+#   TF_ENV=prod make tf-init tf-validate  # prod
+#
+# WHY THESE RUN AS THE INVOKING USER. `terraform init` writes .terraform/ AND
+# .terraform.lock.hcl into the bind-mounted repo, and the lock file is COMMITTED
+# (see /.gitignore -> "Lockfiles ARE committed"). The compose service declares
+# `user: "0:0"` because phase 10's kind provider needs the Docker socket; leaving
+# it root here would leave a root-owned lock file and state file in the working
+# tree that the author cannot edit. Same reasoning as section 7's "the lockfile
+# round-trips back through the mount".
+#
+# Phase 10 needs the socket back for the kind provider: set TF_DOCKER_USER= (empty)
+# to fall through to the service's own root user.
+TF_DOCKER_USER ?= $(DOCKER_AS_USER)
+
+# Optional broker override, passed as a Terraform input. Empty means the env root's
+# own default applies -- which for `local` is the frozen kafka:9092 topology and for
+# `prod` is deliberately nothing at all, so a prod apply cannot silently retarget
+# the laptop's broker.
+TF_BOOTSTRAP ?=
+TF_ENV_ARGS   = $(if $(strip $(TF_BOOTSTRAP)),-e TF_VAR_bootstrap_servers=$(strip $(TF_BOOTSTRAP)))
+
+TF_RUN = $(COMPOSE_TOOLS) run --rm $(TF_DOCKER_USER) $(TF_ENV_ARGS) terraform terraform
+
+# Platforms the committed lock file must carry checksums for. Both, always: the
+# tools image is built multi-arch (arm64 dev Mac AND the arm64 Oracle target, amd64
+# for portability and CI), and `terraform init` records hashes for the CURRENT
+# platform only. A lock file holding arm64 hashes alone fails init on an amd64
+# runner with "checksums previously recorded... no matching hash", which is a CI
+# break that cannot be reproduced on the machine that caused it.
+TF_LOCK_PLATFORMS ?= linux_amd64 linux_arm64
+
+# `terraform validate` and `plan` need the provider schema, so init must have run.
+# Failing with the target name is better than failing with terraform's own
+# "Missing required provider" wall of text.
+.PHONY: tf-preflight
+tf-preflight: ## Check TF_ENV is real, it has been init'ed, and (local) that the broker is up
+	@case '$(TF_ENV)' in \
+	   local|prod) ;; \
+	   *) printf 'FAIL  TF_ENV=%s is not an environment root.\n' '$(TF_ENV)'; \
+	      printf '      Existing roots: %s\n' "$$(ls -1 '$(ROOT_DIR)/deploy/terraform/envs' | tr '\n' ' ')"; \
+	      exit 1 ;; \
+	 esac
+	@if [ ! -d '$(ROOT_DIR)/deploy/terraform/envs/$(TF_ENV)/.terraform' ]; then \
+	   printf 'FAIL  deploy/terraform/envs/%s has not been initialised.\n' '$(TF_ENV)'; \
+	   printf '      Run:  %smake tf-init\n' '$(if $(filter-out local,$(TF_ENV)),TF_ENV=$(TF_ENV) ,)'; \
+	   exit 1; \
+	 fi
+	@# NOTE: do NOT write the bare word `terraform` in a recipe MESSAGE. It is in
+	@# HOST_TOOLCHAIN_CMDS, and `verify-no-host-toolchain` scans the whole recipe
+	@# line when the line contains no `docker`/$(COMPOSE...) call -- which a plain
+	@# printf never does -- so a friendly message trips the guard exactly like a
+	@# real host invocation would. The path form `deploy/terraform/envs` is safe:
+	@# the guard's word boundary excludes `/`, so a path is never a bare command.
+	@printf 'OK  TF_ENV=%s (deploy/terraform/envs/%s is initialised)\n' '$(TF_ENV)' '$(TF_ENV)'
+
+# Kafka reachability, checked only for `local`, where "the broker" is a compose
+# container this Makefile owns. The alternative is a 10s AdminClient timeout and a
+# dial error that names a hostname the reader has no reason to connect to `make up`.
+.PHONY: tf-preflight-kafka
+tf-preflight-kafka: tf-preflight ## Local only: refuse to plan/apply against a broker that is not running
+	@if [ '$(TF_ENV)' != 'local' ]; then \
+	   printf 'SKIP broker reachability: TF_ENV=%s is not the compose stack.\n' '$(TF_ENV)'; \
+	   exit 0; \
+	 fi; \
+	 state=$$($(COMPOSE) ps --format '{{.Name}} {{.Health}}' kafka 2>/dev/null | awk 'NR==1{print $$2}'); \
+	 if [ "$$state" != 'healthy' ]; then \
+	   printf '\nFAIL  the compose Kafka is not healthy (state: %s).\n' "$${state:-not running}"; \
+	   printf '      Topics are created by Terraform against a RUNNING broker; there is no\n'; \
+	   printf '      offline mode. Start the stack first:\n\n'; \
+	   printf '        make up\n\n'; \
+	   exit 1; \
+	 fi; \
+	 printf 'OK  kafka: healthy\n'
 
 .PHONY: tf-init
-tf-init: ## terraform init for TF_ENV (local|prod)
-	$(COMPOSE_TOOLS) run --rm terraform terraform init $(ARGS)
+tf-init: ## terraform init for TF_ENV (local|prod); writes the committed .terraform.lock.hcl
+	$(TF_RUN) init -input=false $(ARGS)
 
-.PHONY: tf-plan
-tf-plan: ## terraform plan for TF_ENV
-	$(COMPOSE_TOOLS) run --rm terraform terraform plan $(ARGS)
-
-.PHONY: tf-apply
-tf-apply: ## terraform apply for TF_ENV
-	$(COMPOSE_TOOLS) run --rm terraform terraform apply $(ARGS)
+.PHONY: tf-validate
+tf-validate: tf-preflight ## Static validation of TF_ENV: syntax, types, variable and module wiring
+	$(TF_RUN) validate $(ARGS)
 
 .PHONY: tf-fmt
-tf-fmt: ## terraform fmt across the whole deploy tree
+tf-fmt: ## Rewrite every .tf file under deploy/terraform to canonical form
 	$(COMPOSE_TOOLS) run --rm $(DOCKER_AS_USER) terraform terraform fmt -recursive /workspace/deploy/terraform
+
+.PHONY: tf-fmt-check
+tf-fmt-check: ## Fail if any .tf file is not canonically formatted (CI-safe, writes nothing)
+	$(COMPOSE_TOOLS) run --rm $(DOCKER_AS_USER) terraform terraform fmt -recursive -check -diff /workspace/deploy/terraform
+
+.PHONY: tf-plan
+tf-plan: tf-preflight-kafka ## terraform plan for TF_ENV -- an EMPTY plan is the goal after an apply
+	$(TF_RUN) plan -input=false $(ARGS)
+
+# The convergence assertion, and it is worth having as its own target. A Terraform
+# config that never reaches an empty plan is worse than no Terraform: every run
+# proposes changes, so nobody can tell a real drift from the config's own noise, and
+# the "declared state IS the real state" claim that justifies section 9's whole
+# argument stops being checkable. -detailed-exitcode makes that testable -- 0 means
+# no changes, 2 means changes pending, 1 means error -- so this belongs in CI.
+.PHONY: tf-drift
+tf-drift: tf-preflight-kafka ## Fail if TF_ENV has ANY pending change (idempotency / drift check)
+	$(TF_RUN) plan -input=false -detailed-exitcode $(ARGS)
+
+.PHONY: tf-apply
+tf-apply: tf-preflight-kafka ## terraform apply for TF_ENV (ARGS=-auto-approve to skip the prompt)
+	$(TF_RUN) apply -input=false $(ARGS)
+
+.PHONY: tf-destroy
+tf-destroy: tf-preflight-kafka ## Delete every Terraform-managed topic in TF_ENV -- DESTROYS TOPIC DATA
+	@printf '\n'
+	@printf 'This deletes the Kafka topics declared in deploy/terraform/envs/%s.\n' '$(TF_ENV)'
+	@printf 'On the compacted topics that discards the current-line SNAPSHOT, and on\n'
+	@printf 'wager.events it discards the settlement audit trail (the durable record is\n'
+	@printf 'ledger_entries in Postgres, not the topic -- but the replay window is gone).\n'
+	@printf '\n'
+	$(TF_RUN) destroy -input=false $(ARGS)
+
+.PHONY: tf-output
+tf-output: tf-preflight ## Print TF_ENV's outputs: topic names, partition map, per-topic config
+	$(TF_RUN) output $(if $(ARGS),$(ARGS),-json)
+
+.PHONY: tf-show
+tf-show: tf-preflight ## Show the recorded state for TF_ENV
+	$(TF_RUN) show $(ARGS)
+
+.PHONY: tf-lock
+tf-lock: ## Re-record provider checksums for EVERY target platform into .terraform.lock.hcl
+	$(TF_RUN) providers lock $(addprefix -platform=,$(TF_LOCK_PLATFORMS)) $(ARGS)
+
+.PHONY: tf-providers
+tf-providers: tf-preflight ## Show which providers TF_ENV requires and which versions are locked
+	$(TF_RUN) version
+	$(TF_RUN) providers
 
 # =============================================================================
 ##@ Deploy -- Kubernetes, Helm only (CLAUDE.md section 9)
@@ -1385,6 +1609,49 @@ deploy-status: deploy-preflight build-tools ## Report the release and the worklo
 	  helm status $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
 	docker run $(DOCKER_KUBE_FLAGS) $(TOOLS_IMAGE) \
 	  kubectl --namespace $(HELM_NAMESPACE) get deployments,statefulsets,pods,services,ingress --output wide
+
+# =============================================================================
+##@ Deploy -- Cloud VM / Docker Compose (Always Free Tier)
+# =============================================================================
+
+VM_HOST        ?= 34.56.164.139
+VM_USER        ?= Andrewpleeter
+VM_SSH_KEY     ?= $(HOME)/.ssh/google_compute_engine
+VM_SSH_OPTS    ?= -o StrictHostKeyChecking=no -o ConnectTimeout=10
+
+.PHONY: deploy-vm
+deploy-vm: ## Deploy latest stack to remote VM host (make deploy-vm VM_HOST=34.56.164.139)
+	@printf '==> Deploying Sharpline to VM %s@%s...\n' '$(VM_USER)' '$(VM_HOST)'
+	@ssh $(if $(wildcard $(VM_SSH_KEY)),-i $(VM_SSH_KEY)) $(VM_SSH_OPTS) $(VM_USER)@$(VM_HOST) '\
+	  set -euo pipefail; \
+	  cd ~/sharpline; \
+	  git fetch --all; \
+	  git reset --hard origin/main || true; \
+	  sudo docker compose --env-file .env -f deploy/compose/compose.yaml build --parallel; \
+	  sudo docker compose --env-file .env -f deploy/compose/compose.yaml up -d postgres redis kafka; \
+	  sudo docker compose --env-file .env -f deploy/compose/compose.yaml run --rm migrate; \
+	  sudo docker compose --env-file .env -f deploy/compose/compose.yaml up -d --remove-orphans; \
+	  printf "==> Waiting for service readiness...\n"; \
+	  for i in $$(seq 1 30); do \
+	    if curl -fs http://localhost/api/healthz >/dev/null 2>&1 && curl -fs http://localhost/api/readyz >/dev/null 2>&1; then \
+	      printf "==> Sharpline is UP and HEALTHY on VM.\n"; \
+	      exit 0; \
+	    fi; \
+	    sleep 2; \
+	  done; \
+	  printf "FAIL  Healthcheck timed out after 60s.\n"; \
+	  exit 1'
+	@$(MAKE) deploy-vm-status VM_HOST=$(VM_HOST)
+
+.PHONY: deploy-vm-status
+deploy-vm-status: ## Check health and container status on remote VM host
+	@printf '==> Querying remote status on %s...\n' '$(VM_HOST)'
+	@ssh $(if $(wildcard $(VM_SSH_KEY)),-i $(VM_SSH_KEY)) $(VM_SSH_OPTS) $(VM_USER)@$(VM_HOST) '\
+	  cd ~/sharpline && sudo docker compose --env-file .env -f deploy/compose/compose.yaml ps'
+	@printf '==> Probing API healthz...\n'
+	@curl -sf -m 5 http://$(VM_HOST)/api/healthz && printf '\n' || printf 'FAIL: healthz unreachable\n'
+	@printf '==> Probing API readyz...\n'
+	@curl -sf -m 5 http://$(VM_HOST)/api/readyz && printf '\n' || printf 'FAIL: readyz unreachable\n'
 
 # =============================================================================
 ##@ Caches / cleanup

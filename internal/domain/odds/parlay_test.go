@@ -31,6 +31,13 @@ import (
 const (
 	// juice is the decimal form of -110: risk 11 to win 10.
 	juice = 21.0 / 11.0
+
+	// singularNeighbourhood is how close to singular a correlation matrix must be
+	// before the quadrature is allowed to decline to certify its answer, measured
+	// as the matrix's smallest eigenvalue. Below it the Cholesky pivot collapses
+	// and Genz's integrand turns discontinuous; above it a refusal is a defect.
+	// TestPropertyCopulaJointRespectsItsBounds carries the sweep this is set from.
+	singularNeighbourhood = 0.05
 )
 
 // -----------------------------------------------------------------------------
@@ -597,6 +604,13 @@ func TestStrongCorrelationApproachesTheComonotoneLimit(t *testing.T) {
 // system refused to quote it. The batch cap was raised (see orthantMaxBatches) until
 // the stopping rule could be met. The tolerance was NOT loosened, so the accuracy
 // demanded of a delivered price is unchanged.
+//
+// That raise turned out to be the wrong repair. The property suite found a second
+// input on the same edge that the raised cap still could not certify, because the
+// quantity being driven below the target was not the error but a statistic that
+// assumed independent batches. See TestRecordedCopulaFlakePricesAndIsCorrect for the
+// counterexample, TestLatticeErrorEstimateTracksTruth for the measurement, and
+// latticeEstimate for the rule that replaced it. The tolerance is still unchanged.
 //
 // The honesty property the old assertion protected — refusing rather than returning
 // whatever estimate the loop happened to hold — is not lost with it. It is pinned
@@ -1245,8 +1259,53 @@ func TestPropertyParlayIsNeverShorterThanItsLongestLeg(t *testing.T) {
 
 // TestPropertyCopulaJointRespectsItsBounds asserts on arbitrary inputs that the
 // copula either returns a probability inside the Fréchet-Hoeffding interval or
-// refuses with ErrParlayNotPriceable — never a number outside it, and never a
-// silent NaN.
+// refuses out loud — never a number outside it, and never a silent NaN.
+//
+// # The refusals this permits, and why enumerating only one of them was a bug
+//
+// This test used to admit exactly one refusal, ErrParlayNotPriceable, and fail on
+// anything else. GaussianCopulaJoint has always documented two: that one, when the
+// computed number is not a possible probability, and ErrOrthantNotConverged, when
+// the quadrature will not certify the number it holds. Demanding that a
+// bounded-budget deterministic quadrature certify EVERY input is demanding something
+// no numerical method offers, and the assertion duly failed at a low rate — which is
+// the worst rate, because it teaches people to re-run rather than to read.
+//
+// Two things were wrong and both are fixed. The stopping rule was measuring the
+// wrong quantity, over-stating its own error by one to three orders of magnitude and
+// refusing inputs it had already answered correctly; latticeEstimate records that
+// diagnosis and the measurement behind it. And this property was mis-stated: a loud
+// refusal is compliance, not a violation. What the property is FOR — no number
+// outside the bounds, no silent NaN — is unchanged and still asserted on every draw.
+//
+// # What keeps this from being a licence to refuse anything
+//
+// Accepting every ErrOrthantNotConverged would hide the regression this test exists
+// to catch: a change that started declining ordinary tickets. So the refusal is
+// admitted only where it is understood. Equicorrelation at ρ has smallest eigenvalue
+// 1 + (n−1)ρ, which is zero exactly at ρ = −1/(n−1); there the matrix is singular,
+// Cholesky yields a zero pivot, and Genz's integrand degenerates from a product of
+// normal CDFs into a discontinuous indicator, which is the one shape a lattice rule
+// is bad at. Outside that neighbourhood a refusal is a defect and fails here.
+//
+// The 0.05 threshold is measured, not guessed. Sweeping 300 random marginal sets per
+// cell over n = 3…6, at ρ set to a fraction of the singular corner:
+//
+//	fraction   λ = 1 + (n−1)ρ   refusals per 300, n = 3 / 4 / 5 / 6
+//	1.0        0                19 / 41 / 20 / 20
+//	0.9999     1e-4              0 / 20 / 13 / 10
+//	0.999      1e-3              0 / 13 /  0 /  8
+//	0.99       0.01              0 /  1 /  0 /  0
+//	0.95       0.05              0 /  0 /  0 /  0
+//	0.5        0.5               0 /  0 /  0 /  0
+//
+// So refusals are real but confined: they vanish by λ = 0.05 and stay gone, 2,400
+// draws either side of it. This property admits them across the last 5% of the valid
+// correlation range and requires a price everywhere else.
+// The product consequence is nil: correlations are estimated from observed history
+// and will not land within 5% of the exact singular corner, and a loud refusal there
+// is in any case the right answer — a price the method cannot certify is worse than
+// no price, which is the whole reason ErrOrthantNotConverged exists.
 func TestPropertyCopulaJointRespectsItsBounds(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		n := rapid.IntRange(1, 6).Draw(t, "n")
@@ -1268,9 +1327,27 @@ func TestPropertyCopulaJointRespectsItsBounds(t *testing.T) {
 			t.Skipf("correlation matrix rejected at the boundary: %v", err)
 		}
 
+		// The smallest eigenvalue of the equicorrelated family, in closed form. It
+		// is 1 at ρ = 0, rises to n at ρ = 1, and falls to 0 at the singular corner
+		// ρ = -1/(n-1), so it measures how far this draw is from the degeneracy that
+		// makes the integrand discontinuous.
+		smallestEigenvalue := 1 + float64(n-1)*rho
+
 		joint, err := GaussianCopulaJoint(marginals, c)
 		if err != nil {
-			if !errors.Is(err, ErrParlayNotPriceable) {
+			switch {
+			case errors.Is(err, ErrParlayNotPriceable):
+				// The computed number is not a possible probability. Refusing is
+				// the contract.
+			case errors.Is(err, ErrOrthantNotConverged):
+				// The quadrature will not certify what it holds. Legitimate only in
+				// the near-singular neighbourhood; see the doc comment for the
+				// measurement behind the threshold.
+				if smallestEigenvalue > singularNeighbourhood {
+					t.Fatalf("refused to price a well-conditioned ticket: smallest eigenvalue %.6g at ρ=%g over %d legs (%v): %v",
+						smallestEigenvalue, rho, n, marginals, err)
+				}
+			default:
 				t.Fatalf("unexpected error: %v", err)
 			}
 			return
@@ -1444,4 +1521,428 @@ func TestUnexportedHelpersRejectBadInput(t *testing.T) {
 			t.Errorf("error = %v, want ErrLegCountMismatch", err)
 		}
 	})
+}
+
+// -----------------------------------------------------------------------------
+// The singular trivariate orthant, and what the quadrature's error estimate means
+// -----------------------------------------------------------------------------
+
+// singularTrivariateOrthant is an independent reference for
+// P(Z₁ ≤ t₁, Z₂ ≤ t₂, Z₃ ≤ t₃) when Z is equicorrelated at ρ = −1/2, which is the
+// singular edge of the positive semi-definite region at n = 3. It shares no
+// formulation, no substitution and no constant with the lattice quadrature, so
+// agreement is evidence about that implementation rather than a restatement of it.
+//
+// Derivation. Equicorrelation at ρ = −1/(n−1) makes the covariance matrix
+// (n/(n−1))·(I − J/n), which is a multiple of the orthogonal projector onto the
+// sum-zero subspace, so Z lives on a plane and Z₁ + Z₂ + Z₃ = 0 almost surely. In an
+// orthonormal basis {u₁, u₂} of that plane, Z = √(3/2)·(G₁u₁ + G₂u₂) with G standard
+// bivariate normal. Each constraint Zᵢ ≤ tᵢ is then a half-plane nᵢ·G ≤ tᵢ whose
+// normal is a unit vector — |nᵢ|² = (3/2)(u₁ᵢ² + u₂ᵢ²) = 1, which is just Var(Zᵢ) = 1
+// restated — so it is the half-plane at signed distance tᵢ in direction φᵢ.
+//
+// In polar coordinates the admissible radius at angle θ is an interval [lo, hi] and
+// the standard bivariate normal mass of the wedge is exp(−lo²/2) − exp(−hi²/2), so
+//
+//	P = (1/2π) ∫₀^{2π} [exp(−lo(θ)²/2) − exp(−hi(θ)²/2)]₊ dθ
+//
+// which composite Simpson evaluates at the panel counts used below to well past the
+// accuracy anything here asserts: the value moves by 2.2e-11 between 2^18 and 2^20
+// panels, five orders below the 1e-6 target the quadrature is measured against.
+func singularTrivariateOrthant(t1, t2, t3 float64, panels int) float64 {
+	scale := math.Sqrt(1.5)
+	u1 := [3]float64{1 / math.Sqrt2, -1 / math.Sqrt2, 0}
+	u2 := [3]float64{1 / math.Sqrt(6), 1 / math.Sqrt(6), -2 / math.Sqrt(6)}
+	thresholds := [3]float64{t1, t2, t3}
+
+	var direction [3]float64
+	for i := range direction {
+		direction[i] = math.Atan2(scale*u2[i], scale*u1[i])
+	}
+
+	wedge := func(theta float64) float64 {
+		lo, hi := 0.0, math.Inf(1)
+		for i := range direction {
+			// The constraint is r·cos(θ − φᵢ) ≤ tᵢ, which is an upper bound on r
+			// when the cosine is positive, a LOWER bound when it is negative, and a
+			// feasibility question when it vanishes.
+			switch c := math.Cos(theta - direction[i]); {
+			case c > 1e-15:
+				hi = math.Min(hi, thresholds[i]/c)
+			case c < -1e-15:
+				lo = math.Max(lo, thresholds[i]/c)
+			case thresholds[i] < 0:
+				return 0
+			}
+		}
+		if lo < 0 {
+			lo = 0
+		}
+		if hi <= lo {
+			return 0
+		}
+		return math.Exp(-lo*lo/2) - math.Exp(-hi*hi/2)
+	}
+
+	h := 2 * math.Pi / float64(panels)
+	sum := wedge(0) + wedge(2*math.Pi)
+	for k := 1; k < panels; k++ {
+		weight := 2.0
+		if k%2 == 1 {
+			weight = 4
+		}
+		sum += weight * wedge(float64(k)*h)
+	}
+	return sum * h / 3 / (2 * math.Pi)
+}
+
+// singularOrthantIntegrand rebuilds the integrand orthantByLattice hands to
+// latticeEstimate, so that the stopping rule can be driven directly at batch counts
+// the production caller never uses.
+func singularOrthantIntegrand(t *testing.T, thresholds []float64, c CorrelationMatrix) func([]float64) float64 {
+	t.Helper()
+
+	n := len(thresholds)
+	order := canonicalOrder(thresholds, c)
+	bound := make([]float64, n)
+	for i, idx := range order {
+		bound[i] = thresholds[idx]
+	}
+	factor, err := c.permute(order).Cholesky()
+	if err != nil {
+		t.Fatalf("Cholesky: %v", err)
+	}
+
+	dimension := n - 1
+	y := make([]float64, dimension)
+	return func(u []float64) float64 {
+		weight := 1.0
+		for i := range n {
+			offset := 0.0
+			for j := range i {
+				offset += factor[i][j] * y[j]
+			}
+			var interval float64
+			switch {
+			case factor[i][i] > 0:
+				interval = normalCDF((bound[i] - offset) / factor[i][i])
+			case offset <= bound[i]:
+				interval = 1
+			default:
+				interval = 0
+			}
+			weight *= interval
+			if weight <= 0 {
+				return 0
+			}
+			if i < dimension {
+				y[i] = normalQuantile(clampToOpenUnit(u[i] * interval))
+			}
+		}
+		return weight
+	}
+}
+
+// recordedCopulaFlake is the exact input rapid produced when
+// TestPropertyCopulaJointRespectsItsBounds failed intermittently, kept verbatim so
+// the regression is pinned to the counterexample rather than to a case chosen after
+// the fact. Three legs, equicorrelated at ρ = −0.5, which is exactly −1/(n−1) and so
+// exactly the singular edge.
+var recordedCopulaFlake = struct {
+	marginals []float64
+	rho       float64
+}{
+	marginals: []float64{0.25, 0.1592864990234375, 0.9640519144595601},
+	rho:       -0.5,
+}
+
+// TestRecordedCopulaFlakePricesAndIsCorrect is the regression test for the
+// intermittent property failure.
+//
+// The failure was NOT that the copula returned a wrong number. It returned no number
+// at all: the quadrature's stopping rule was not met inside the batch cap, so
+// GaussianCopulaJoint refused with ErrOrthantNotConverged, and the property — which
+// permits a refusal only with ErrParlayNotPriceable — failed. Whether it fired
+// depended on whether rapid happened to draw ρ exactly on the singular edge, which
+// is why it was rare.
+//
+// The estimate the quadrature was refusing to certify was already right to seven
+// significant figures. This test asserts both halves of the fix: the ticket prices,
+// and the price it produces agrees with a reference that owes the quadrature nothing.
+func TestRecordedCopulaFlakePricesAndIsCorrect(t *testing.T) {
+	marginals := mustProbabilities(t, recordedCopulaFlake.marginals...)
+	c := mustCorrelationMatrix(t, equicorrelated(len(marginals), recordedCopulaFlake.rho))
+
+	thresholds := make([]float64, len(marginals))
+	for i, p := range marginals {
+		q, err := NormalQuantile(p)
+		if err != nil {
+			t.Fatalf("NormalQuantile(%v): %v", float64(p), err)
+		}
+		thresholds[i] = q
+	}
+
+	want := singularTrivariateOrthant(thresholds[0], thresholds[1], thresholds[2], 1<<20)
+	if coarser := singularTrivariateOrthant(thresholds[0], thresholds[1], thresholds[2], 1<<18); math.Abs(coarser-want) > 1e-9 {
+		t.Fatalf("the polar reference itself has not converged: %.17g at 2^18 panels vs %.17g at 2^20", coarser, want)
+	}
+
+	joint, err := GaussianCopulaJoint(marginals, c)
+	if err != nil {
+		t.Fatalf("the recorded counterexample must price, not refuse: %v", err)
+	}
+
+	// The delivered accuracy claim, measured against the independent reference and
+	// held to the same target the stopping rule is set from.
+	absolute := math.Abs(float64(joint) - want)
+	if absolute > math.Max(orthantAbsTol, orthantRelTol*want) {
+		t.Errorf("joint = %.17g, polar reference %.17g, absolute error %.3g beyond max(%g, %g·reference)",
+			float64(joint), want, absolute, orthantAbsTol, orthantRelTol)
+	}
+	t.Logf("recorded counterexample: joint = %.12g, polar reference = %.12g, absolute error %.3g (%.3g relative)",
+		float64(joint), want, absolute, absolute/want)
+}
+
+// TestLatticeErrorEstimateTracksTruth is the measurement the stopping rule is
+// justified by, and the one latticeEstimate's doc comment points at.
+//
+// A stopping rule is only as good as the error estimate it stops on, and an error
+// estimate can fail in two directions. Too optimistic delivers a wrong price; too
+// pessimistic refuses a right one, which is the defect this replaced. Both are
+// checked here against references that owe the quadrature nothing: the polar
+// integral for the singular trivariate orthant, and the closed-form product of
+// marginals for the identity matrix, which MultivariateNormalCDF integrates rather
+// than special-cases.
+//
+// The assertion is deliberately two-sided and deliberately loose on the pessimistic
+// side. The reported movement is an error ESTIMATE, not a bound, so requiring it to
+// dominate the truth exactly would be asserting a guarantee the method does not
+// make; requiring it to stay within a factor of a hundred of the truth is what
+// distinguishes a usable estimate from the one it replaced, which ran to 1141× on
+// this very input.
+func TestLatticeErrorEstimateTracksTruth(t *testing.T) {
+	type reference struct {
+		name      string
+		dimension int
+		integrand func([]float64) float64
+		want      float64
+	}
+
+	marginals := mustProbabilities(t, recordedCopulaFlake.marginals...)
+	singularMatrix := mustCorrelationMatrix(t, equicorrelated(len(marginals), recordedCopulaFlake.rho))
+	singularThresholds := make([]float64, len(marginals))
+	for i, p := range marginals {
+		q, err := NormalQuantile(p)
+		if err != nil {
+			t.Fatalf("NormalQuantile(%v): %v", float64(p), err)
+		}
+		singularThresholds[i] = q
+	}
+
+	identityThresholds := []float64{-1, -0.5, 0, 0.5, 1, 1.5}
+	identity, err := IdentityCorrelation(len(identityThresholds))
+	if err != nil {
+		t.Fatalf("IdentityCorrelation: %v", err)
+	}
+	identityWant := 1.0
+	for _, x := range identityThresholds {
+		p, cdfErr := NormalCDF(x)
+		if cdfErr != nil {
+			t.Fatalf("NormalCDF(%v): %v", x, cdfErr)
+		}
+		identityWant *= p
+	}
+
+	for _, ref := range []reference{
+		{
+			name:      "singular trivariate orthant against the polar reference",
+			dimension: len(singularThresholds) - 1,
+			integrand: singularOrthantIntegrand(t, singularThresholds, singularMatrix),
+			want:      singularTrivariateOrthant(singularThresholds[0], singularThresholds[1], singularThresholds[2], 1<<20),
+		},
+		{
+			name:      "six independent constraints against the closed form",
+			dimension: len(identityThresholds) - 1,
+			integrand: singularOrthantIntegrand(t, identityThresholds, identity),
+			want:      identityWant,
+		},
+	} {
+		t.Run(ref.name, func(t *testing.T) {
+			value, spread, err := latticeEstimate(ref.dimension, ref.integrand,
+				orthantMinBatches, orthantMaxBatches, orthantRelTol, orthantAbsTol)
+			if err != nil {
+				t.Fatalf("did not converge: %v", err)
+			}
+
+			truth := math.Abs(value - ref.want)
+			target := math.Max(orthantAbsTol, orthantRelTol*math.Abs(ref.want))
+			t.Logf("value=%.12g reference=%.12g true error=%.3g reported spread=%.3g target=%.3g",
+				value, ref.want, truth, spread, target)
+
+			// Not optimistic: having declared convergence, the answer really is
+			// inside the target it declared convergence against.
+			if truth > target {
+				t.Errorf("reported convergence at a spread of %.3g, but the true error is %.3g, beyond the %.3g target",
+					spread, truth, target)
+			}
+			// Not wildly pessimistic: the estimate is on the scale of the error it
+			// is estimating. This is the half that was broken.
+			if truth > 0 && spread/truth > 100 {
+				t.Errorf("reported spread %.3g over-states the true error %.3g by %.0f×, which is the failure mode that refused to price valid tickets",
+					spread, truth, spread/truth)
+			}
+		})
+	}
+}
+
+// TestLatticeStoppingRuleNeedsTwoQuietDoublings pins the guard that keeps a single
+// stationary checkpoint from certifying a result.
+//
+// The movement across one doubling can be small by accident — the running mean
+// crosses the truth and the two checkpoints straddle it — so the rule uses the
+// larger of the last two movements. Reaching that requires three checkpoints, which
+// is why a cap of two batches can never converge no matter how quiet the integrand
+// is, while the same integrand at a cap of four does.
+func TestLatticeStoppingRuleNeedsTwoQuietDoublings(t *testing.T) {
+	constant := func([]float64) float64 { return 0.25 }
+
+	if _, spread, err := latticeEstimate(2, constant, 1, 2, orthantRelTol, orthantAbsTol); !errors.Is(err, ErrOrthantNotConverged) {
+		t.Errorf("two batches: error = %v (spread %g), want ErrOrthantNotConverged", err, spread)
+	} else if !math.IsInf(spread, 1) {
+		t.Errorf("two batches: spread = %g, want +Inf — nothing was measured", spread)
+	}
+
+	value, spread, err := latticeEstimate(2, constant, 1, 4, orthantRelTol, orthantAbsTol)
+	if err != nil {
+		t.Fatalf("four batches on a constant integrand: %v", err)
+	}
+	if spread != 0 {
+		t.Errorf("spread = %g on a constant integrand, want exactly 0", spread)
+	}
+	if value != 0.25 {
+		t.Errorf("value = %.17g, want exactly 0.25", value)
+	}
+}
+
+// TestSingularEdgePricesAcrossTheWholeFamily converts the rare random failure into
+// a systematic guarantee.
+//
+// The recorded counterexample was found by rapid drawing ρ exactly at −1/(n−1), the
+// singular corner of the equicorrelated family, which is a set of measure zero that
+// a range generator hits only because it favours its own endpoints. That made the
+// failure rare, and a rare failure is the worst kind: it trains people to re-run.
+// Asserting that rapid no longer finds it proves only that rapid did not look in the
+// right place this time.
+//
+// So the edge is swept directly instead — every leg count the copula integrates
+// numerically, at the exact singular ρ, across marginal shapes spanning the range a
+// same-game ticket produces (heavy favourites, coin flips, longshots, and the mixed
+// shapes that make the orthant small). Every one of them must produce a price, and
+// every price must sit inside the Fréchet-Hoeffding interval.
+func TestSingularEdgePricesAcrossTheWholeFamily(t *testing.T) {
+	if testing.Short() {
+		t.Skip("drives the batch loop to its cap on a discontinuous integrand")
+	}
+
+	shapes := [][]float64{
+		{0.25, 0.1592864990234375, 0.9640519144595601}, // the recorded counterexample
+		{0.125, 0.2998, 0.9556},                        // the counterexample that raised the cap
+		{0.5, 0.5, 0.5},
+		{0.05, 0.05, 0.05},
+		{0.95, 0.95, 0.95},
+		{0.01, 0.5, 0.99},
+		{0.9, 0.9, 0.02},
+		{0.33, 0.34, 0.33},
+	}
+
+	priced := 0
+	for legs := 3; legs <= 6; legs++ {
+		rho := -1 / float64(legs-1)
+		c, err := NewCorrelationMatrix(equicorrelated(legs, rho))
+		if err != nil {
+			t.Fatalf("%d legs at ρ=%g: NewCorrelationMatrix: %v", legs, rho, err)
+		}
+
+		for _, shape := range shapes {
+			// Extend the three-leg shapes to the current leg count by cycling, which
+			// keeps the mix of favourites and longshots rather than padding with a
+			// single repeated value.
+			values := make([]float64, legs)
+			for i := range values {
+				values[i] = shape[i%len(shape)]
+			}
+			marginals := mustProbabilities(t, values...)
+
+			joint, err := GaussianCopulaJoint(marginals, c)
+			if err != nil {
+				t.Errorf("%d legs at the singular edge ρ=%g with marginals %v refused: %v",
+					legs, rho, values, err)
+				continue
+			}
+
+			upper, sum := 1.0, 0.0
+			for _, p := range marginals {
+				upper = math.Min(upper, float64(p))
+				sum += float64(p)
+			}
+			lower := math.Max(0, sum-float64(legs-1))
+			if float64(joint) < lower-frechetSlack || float64(joint) > upper+frechetSlack {
+				t.Errorf("%d legs at ρ=%g with marginals %v: joint %.17g outside [%.17g, %.17g]",
+					legs, rho, values, float64(joint), lower, upper)
+			}
+			priced++
+		}
+	}
+	t.Logf("priced %d tickets on the singular edge across 3–6 legs", priced)
+}
+
+// TestSixLegSingularCornerRefusesHonestly records the second counterexample the
+// property suite produced, and pins the limit rather than hiding it.
+//
+// Six legs at exactly ρ = -0.2 = -1/(n-1) puts the matrix on the singular corner and
+// the integral in five dimensions, where the discontinuous integrand is at its
+// worst. The quadrature's answer is already right — measured against a 16,384-batch
+// reference its error at the 256-batch cap is 2.8e-7, five times inside the 1.5e-6
+// target it is being held to — but the refinement test still reads 2.5e-6 there and
+// so declines to certify it. At a cap of 512 it certifies, with a true error of
+// 4.8e-8.
+//
+// The cap is deliberately NOT raised to 512 for this. It was already raised once for
+// the same family, from 96 to 256, and that raise bought exactly one counterexample's
+// silence before this one appeared; a third would cost 4M integrand evaluations and
+// buy the same. The behaviour is correct as it stands: on the one input class where
+// the method cannot certify itself, it says so with a sentinel a caller can match,
+// rather than returning a price it cannot stand behind.
+//
+// What this test protects is that the refusal stays HONEST — the right sentinel, on
+// an input that really is degenerate — and that it stays CONFINED, which is
+// TestPropertyCopulaJointRespectsItsBounds's job on every draw.
+func TestSixLegSingularCornerRefusesHonestly(t *testing.T) {
+	const legs = 6
+	rho := -1 / float64(legs-1)
+
+	marginals := mustProbabilities(t,
+		0.3949927822814061, 0.4106903076171875, 0.5757124473269792,
+		0.9332360947190477, 0.2522853197723032, 0.99)
+	c := mustCorrelationMatrix(t, equicorrelated(legs, rho))
+
+	if smallest := 1 + float64(legs-1)*rho; math.Abs(smallest) > 1e-15 {
+		t.Fatalf("smallest eigenvalue %.17g, want 0 — this input is supposed to be exactly singular", smallest)
+	}
+
+	joint, err := GaussianCopulaJoint(marginals, c)
+	if err == nil {
+		// Not a failure: if a later change certifies this input, the limit moved and
+		// this test should say so rather than pretend it did not.
+		t.Fatalf("this input now prices at %.12g; the documented limit has moved and this test needs rewriting",
+			float64(joint))
+	}
+	if !errors.Is(err, ErrOrthantNotConverged) {
+		t.Fatalf("error = %v, want ErrOrthantNotConverged — a refusal here must name the quadrature, not the bounds", err)
+	}
+	if joint != 0 {
+		t.Errorf("joint = %.17g alongside an error, want the zero value; a caller that ignores the error must not receive a plausible-looking price",
+			float64(joint))
+	}
+	t.Logf("six legs on the singular corner refuse as designed: %v", err)
 }

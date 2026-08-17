@@ -1176,11 +1176,12 @@ func TestLatticeAccuracyProfile(t *testing.T) {
 			continue
 		}
 		relative := math.Abs(value-want) / want
-		t.Logf("smooth %2d-D reference: value=%.12f exact=%.12f true relative error=%.3g reported three-sigma spread=%.3g",
+		t.Logf("smooth %2d-D reference: value=%.12f exact=%.12f true relative error=%.3g reported refinement bound=%.3g",
 			dimension, value, want, relative, spread)
 
 		// The bound is against the TRUE error, not the reported spread. The spread
-		// is a spread across shifts rather than a proven bound, so asserting on it
+		// is three times the movement of the running estimate across a doubling of
+		// the batch count rather than a proven bound, so asserting on it
 		// would be asserting that the estimator agrees with itself.
 		if relative > 5*orthantRelTol {
 			t.Errorf("smooth %d-D reference: true relative error %.3g is more than five times the %g stopping rule",

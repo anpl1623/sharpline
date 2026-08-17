@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/anpl1623/sharpline/internal/platform/buildinfo"
 	"github.com/anpl1623/sharpline/internal/platform/config"
 	"github.com/anpl1623/sharpline/internal/platform/httpx"
 	"github.com/anpl1623/sharpline/internal/platform/logging"
@@ -42,7 +43,14 @@ func run() error {
 	}
 
 	log := logging.New(os.Stdout, cfg.LogLevel, service, cfg.Env)
-	log.Info("starting", slog.Any("config", cfg))
+	// Build identity on the first line; see cmd/api/main.go for why. It matters
+	// more here than anywhere else in the system: this binary writes the ledger,
+	// and "which build graded this wager" is a question a settlement dispute
+	// starts with.
+	log.Info("starting",
+		slog.Any("build", buildinfo.Read()),
+		slog.Any("config", cfg),
+	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
@@ -54,6 +62,10 @@ func run() error {
 	// registry shared with the listener, and *postgres.DB as a real readiness
 	// Checker rather than a boolean latched at startup.
 	registry := httpx.NewRegistry()
+
+	if err := buildinfo.Register(registry, service); err != nil {
+		return fmt.Errorf("%s: %w", service, err)
+	}
 
 	db, err := postgres.Connect(ctx, postgres.Options{
 		DSN:      cfg.PostgresDSN,
