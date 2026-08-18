@@ -92,7 +92,8 @@ jobs:
             
             echo "==> Fetching latest changes (${COMMIT_SHA:0:12})..."
             git fetch --all --tags
-            git checkout "${COMMIT_SHA}"
+            git reset --hard
+            git checkout -f "${COMMIT_SHA}"
             
             echo "==> Building container stack..."
             if [ "${REBUILD}" = "true" ]; then
