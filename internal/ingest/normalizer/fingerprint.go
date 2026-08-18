@@ -147,6 +147,10 @@ func (m NormalizedMarket) Hash() Fingerprint {
 		w.s(b.Slug)
 		w.s(b.Name)
 		w.s(b.Kind)
+		// A book becoming (or ceasing to be) the sharp reference changes which
+		// book every downstream fair value is derived from, so it is a change
+		// consumers must see rather than a cosmetic relabelling.
+		w.b(b.Reference)
 	}
 
 	sels := slices.Clone(m.Selections)
@@ -195,6 +199,10 @@ func (c *canon) s(v string) {
 
 // i writes an integer field.
 func (c *canon) i(v int64) { c.s(strconv.FormatInt(v, 10)) }
+
+// b writes a boolean field. The two words are written in full rather than as
+// 0/1 so a boolean can never collide with an adjacent integer field.
+func (c *canon) b(v bool) { c.s(strconv.FormatBool(v)) }
 
 // t writes a timestamp field.
 //

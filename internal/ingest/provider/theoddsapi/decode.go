@@ -69,9 +69,10 @@ func RawContentType(format OddsFormat) string {
 // direction CLAUDE.md §12 requires and the direction that keeps the import graph
 // acyclic: theoddsapi imports normalizer, never the reverse.
 type Decoder struct {
-	provider kafka.Provider
-	format   OddsFormat
-	metrics  *Metrics
+	provider  kafka.Provider
+	format    OddsFormat
+	reference string
+	metrics   *Metrics
 }
 
 // NewDecoder returns a decoder for payloads fetched in the given odds format.
@@ -79,7 +80,13 @@ type Decoder struct {
 // format is REQUIRED and is not inferred: see the file comment. Passing the
 // wrong one is not detectable from the bytes, so it is rejected at construction
 // rather than guessed.
-func NewDecoder(format OddsFormat, m *Metrics) (*Decoder, error) {
+//
+// referenceKey is Config.ReferenceBook — the bookmaker key this deployment
+// treats as the sharp reference. It travels with the decoder rather than being
+// read from the payload because the provider publishes no such label; see
+// RawEventFrom. Empty means no book is designated, which leaves internal/pricing
+// on its own configured preference list and says so on every record.
+func NewDecoder(format OddsFormat, referenceKey string, m *Metrics) (*Decoder, error) {
 	if !format.Valid() {
 		return nil, fmt.Errorf("%w: odds format %q is neither %q nor %q",
 			ErrInvalidConfig, string(format), OddsFormatDecimal, OddsFormatAmerican)
@@ -99,7 +106,12 @@ func NewDecoder(format OddsFormat, m *Metrics) (*Decoder, error) {
 			return nil, err
 		}
 	}
-	return &Decoder{provider: p, format: format, metrics: m}, nil
+	return &Decoder{
+		provider:  p,
+		format:    format,
+		reference: strings.ToLower(strings.TrimSpace(referenceKey)),
+		metrics:   m,
+	}, nil
 }
 
 // Provider implements normalizer.Decoder.
@@ -115,7 +127,7 @@ func (d *Decoder) Decode(payload []byte) (normalizer.RawEvent, error) {
 	if err := json.Unmarshal(payload, &ev); err != nil {
 		return normalizer.RawEvent{}, fmt.Errorf("%w: the-odds-api event payload: %w", ErrMalformedResponse, err)
 	}
-	raw, dropped, err := RawEventFrom(ev, d.format)
+	raw, dropped, err := RawEventFrom(ev, d.format, d.reference)
 	if err != nil {
 		return normalizer.RawEvent{}, err
 	}
@@ -138,7 +150,16 @@ var _ normalizer.Decoder = (*Decoder)(nil)
 // An error is returned only for a payload that is structurally unusable — no
 // event identifier, or no league key — because neither can be worked around and
 // both would produce an unkeyable record on a compacted topic.
-func RawEventFrom(ev EventOdds, format OddsFormat) (normalizer.RawEvent, int, error) {
+//
+// referenceKey is the bookmaker key this deployment treats as the sharp
+// reference (Config.ReferenceBook). The bookmaker matching it — if the provider
+// returned it for this event at all — is flagged on the neutral shape, which is
+// what carries the designation into the normalizer and on to internal/pricing.
+// The provider does not label its bookmakers, so the judgement is ours and this
+// is the only place it is applied; an empty key flags nothing, and a key the
+// event does not carry flags nothing, both of which are honest states rather
+// than failures.
+func RawEventFrom(ev EventOdds, format OddsFormat, referenceKey string) (normalizer.RawEvent, int, error) {
 	id := strings.TrimSpace(ev.ID)
 	if id == "" {
 		return normalizer.RawEvent{}, 0, fmt.Errorf("%w: event payload carries no id", ErrMalformedResponse)
@@ -181,6 +202,7 @@ func RawEventFrom(ev EventOdds, format OddsFormat) (normalizer.RawEvent, int, er
 		book := normalizer.RawBook{
 			Key:        key,
 			Name:       strings.TrimSpace(bk.Title),
+			Reference:  referenceKey != "" && strings.EqualFold(key, referenceKey),
 			LastUpdate: wireInstant(bk.LastUpdate),
 		}
 		for _, mk := range bk.Markets {

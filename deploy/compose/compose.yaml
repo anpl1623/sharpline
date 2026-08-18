@@ -381,6 +381,22 @@ services:
       # environment (`--env-file ../../.env`); absent => ingest selects the synthetic
       # stochastic market-maker, which is a live generator, not fixture data.
       ODDS_API_KEY:
+      # The provider's tuning surface, read by internal/ingest/provider/theoddsapi
+      # and IGNORED ENTIRELY when ODDS_API_KEY is empty.
+      #
+      # SHARPLINE_ODDS_MONTHLY_CREDITS is the one that must be here. CLAUDE.md §5
+      # requires the quota budget be a config value, and the adapter refuses to start
+      # on a zero budget — so a key set without a budget makes `ingest` crash-loop
+      # while every other container reports healthy, which is the worst shape a
+      # failure can take. The default below is ADR 0003's recommended tier; override
+      # it in .env with the plan actually bought.
+      SHARPLINE_ODDS_MONTHLY_CREDITS: ${SHARPLINE_ODDS_MONTHLY_CREDITS:-100000}
+      # The bookmaker key marked sharp on every published record. The provider
+      # publishes no sharpness label, so this is our judgement and travels as such.
+      SHARPLINE_ODDS_REFERENCE_BOOK: ${SHARPLINE_ODDS_REFERENCE_BOOK:-}
+      SHARPLINE_ODDS_REGIONS: ${SHARPLINE_ODDS_REGIONS:-}
+      SHARPLINE_ODDS_MARKETS: ${SHARPLINE_ODDS_MARKETS:-}
+      SHARPLINE_ODDS_PLAYER_PROP_MARKETS: ${SHARPLINE_ODDS_PLAYER_PROP_MARKETS:-}
       SHARPLINE_SYNTHETIC_SEED: ${SHARPLINE_SYNTHETIC_SEED:-0}
       # Live-window poll cadence. Empty => the scheduler's 90s default, which is
       # the number ADR 0003's quota arithmetic is built on. Set it and you are
@@ -402,10 +418,17 @@ services:
         SERVICE: pricer
     image: sharpline/pricer:local
     environment:
-      # config.Pricer = HTTP | Redis | Kafka. Pure math over the bus; it never opens a
-      # database connection, so it is not given a DSN.
-      <<: [*env-base, *env-redis, *env-kafka]
+      # config.Pricer = HTTP | Kafka. Pure math over the bus: it opens neither a
+      # database connection nor a Redis client, so it is given neither. Its whole state
+      # is a fold of the compacted price.computed topic and rebuilds from one snapshot
+      # read on start — internal/pricing/doc.go argues why that must not become a cache.
+      <<: [*env-base, *env-kafka]
       SHARPLINE_HTTP_ADDR: ":8082"
+      # Ordered sharp-book preference, most preferred first. It is only consulted for
+      # books the provider has NOT designated on the wire; both adapters do designate
+      # one, so this is the fallback rather than the usual path. See
+      # internal/pricing/reference.go.
+      SHARPLINE_PRICER_REFERENCE_BOOKS: ${SHARPLINE_PRICER_REFERENCE_BOOKS:-pinnacle,sharpline}
     depends_on: *go-deps
     deploy:
       resources:

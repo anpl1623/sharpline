@@ -80,8 +80,13 @@ func (a *Adapter) rawEventFor(es *eventState, marketRaws [][]normalizer.RawMarke
 			continue
 		}
 		re.Books = append(re.Books, normalizer.RawBook{
-			Key:        book.slug,
-			Name:       book.name,
+			Key:  book.slug,
+			Name: book.name,
+			// universe.go designates the in-house book as the sharp reference.
+			// Carrying it here is what makes that designation reach the
+			// normalizer, the database and internal/pricing rather than dying
+			// at this boundary.
+			Reference:  book.reference,
 			LastUpdate: a.stepTime(es.n - int64(book.lagSteps)),
 			Markets:    markets,
 		})

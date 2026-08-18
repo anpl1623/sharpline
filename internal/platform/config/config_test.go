@@ -3,6 +3,7 @@ package config_test
 import (
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -84,7 +85,7 @@ func TestLoadFromValidation(t *testing.T) {
 		},
 		{
 			name: "redis password is optional even when redis is required",
-			spec: config.Pricer,
+			spec: config.Stream,
 			env:  with(map[string]string{config.EnvRedisPassword: ""}),
 		},
 		{
@@ -117,6 +118,21 @@ func TestLoadFromValidation(t *testing.T) {
 			name: "settle does not require redis",
 			spec: config.Settle,
 			env:  with(map[string]string{config.EnvRedisAddr: ""}),
+		},
+		{
+			// The pricer opens no Redis client. Phase 2's rule — a declared
+			// dependency must be one the binary OPENS — is what makes a probe
+			// mean something, and api/settle once declared Postgres without
+			// opening a pool so /api/readyz returned 200 with the database
+			// stopped. This asserts the declaration matches the binary.
+			name: "pricer does not require redis",
+			spec: config.Pricer,
+			env:  with(map[string]string{config.EnvRedisAddr: ""}),
+		},
+		{
+			name: "pricer reference books are optional",
+			spec: config.Pricer,
+			env:  with(map[string]string{config.EnvPricerReferenceBooks: ""}),
 		},
 		{
 			name:         "api requires postgres",
@@ -213,7 +229,7 @@ func TestLoadFromValidation(t *testing.T) {
 		},
 		{
 			name:         "redis address without a host is rejected",
-			spec:         config.Pricer,
+			spec:         config.Stream,
 			env:          with(map[string]string{config.EnvRedisAddr: ":6379"}),
 			wantErr:      config.ErrInvalid,
 			wantMentions: []string{config.EnvRedisAddr},
@@ -323,12 +339,48 @@ func TestLoadFromValidation(t *testing.T) {
 	}
 }
 
+// TestPricerReferenceBooksParseIntoAnOrderedList.
+//
+// The list is ORDERED — it is a preference, and the order is what makes one
+// binary correct against both providers — so this asserts the order survives,
+// not merely the membership. Blank entries are dropped rather than rejected so a
+// trailing comma is not a startup failure.
+func TestPricerReferenceBooksParseIntoAnOrderedList(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.LoadFrom(config.Pricer, config.MapLookup(map[string]string{
+		config.EnvKafkaBrokers:         "kafka:9092",
+		config.EnvPricerReferenceBooks: " pinnacle , sharpline , ,",
+	}))
+	if err != nil {
+		t.Fatalf("LoadFrom(pricer): %v", err)
+	}
+	want := []string{"pinnacle", "sharpline"}
+	if !slices.Equal(cfg.PricerReferenceBooks, want) {
+		t.Errorf("PricerReferenceBooks = %v, want %v", cfg.PricerReferenceBooks, want)
+	}
+
+	empty, err := config.LoadFrom(config.Pricer, config.MapLookup(map[string]string{
+		config.EnvKafkaBrokers: "kafka:9092",
+	}))
+	if err != nil {
+		t.Fatalf("LoadFrom(pricer) with no preference list: %v", err)
+	}
+	if len(empty.PricerReferenceBooks) != 0 {
+		t.Errorf("PricerReferenceBooks = %v with the variable unset, want empty — an unset "+
+			"list means \"provider designation only\", not a guessed book",
+			empty.PricerReferenceBooks)
+	}
+}
+
 func TestLoadFromDefaults(t *testing.T) {
 	t.Parallel()
 
 	// Only the variables a pricer genuinely requires; everything else absent.
+	// Redis is deliberately NOT here: the pricer opens no Redis client, its whole
+	// state is a fold of a compacted topic, and phase 2's rule is that a declared
+	// dependency must be one the binary actually opens.
 	env := map[string]string{
-		config.EnvRedisAddr:    "redis:6379",
 		config.EnvKafkaBrokers: "kafka:9092",
 	}
 

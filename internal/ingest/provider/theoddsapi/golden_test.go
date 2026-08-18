@@ -443,7 +443,7 @@ func TestGoldenNeutralDecoderRoundTrip(t *testing.T) {
 		t.Fatalf("parse sample: %v", err)
 	}
 
-	d, err := NewDecoder(OddsFormatAmerican, nil)
+	d, err := NewDecoder(OddsFormatAmerican, DefaultReferenceBook, nil)
 	if err != nil {
 		t.Fatalf("NewDecoder: %v", err)
 	}
@@ -467,6 +467,40 @@ func TestGoldenNeutralDecoderRoundTrip(t *testing.T) {
 	}
 	if len(raw.Books) != 12 {
 		t.Fatalf("raw carries %d books, want 12", len(raw.Books))
+	}
+
+	// The sharp-reference designation travels with the decoder, not with the
+	// payload, because The Odds API publishes no sharpness label. The sample
+	// carries no "pinnacle" bookmaker (see TestGoldenCatalogue), so a decoder
+	// configured with the default key must flag NOTHING rather than guessing —
+	// and a decoder configured with a key the sample does carry must flag
+	// exactly that one book. Both halves are asserted, because a flag that is
+	// always false and a flag that is always true look identical from one test.
+	for _, b := range raw.Books {
+		if b.Reference {
+			t.Errorf("book %s is flagged sharp, but the sample carries no %q bookmaker",
+				b.Key, DefaultReferenceBook)
+		}
+	}
+	present, err := NewDecoder(OddsFormatAmerican, "draftkings", nil)
+	if err != nil {
+		t.Fatalf("NewDecoder: %v", err)
+	}
+	flagged, err := present.Decode(elements[0])
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	designated := 0
+	for _, b := range flagged.Books {
+		if b.Reference {
+			designated++
+			if b.Key != "draftkings" {
+				t.Errorf("flagged %s, want draftkings", b.Key)
+			}
+		}
+	}
+	if designated != 1 {
+		t.Errorf("%d books flagged sharp, want exactly 1", designated)
 	}
 
 	// RawOutcome.Price is ALWAYS decimal — the neutral shape's own contract.
@@ -496,7 +530,7 @@ func TestGoldenNeutralDecoderRoundTrip(t *testing.T) {
 	// So the mitigation is not detection, it is that the format never has to be
 	// guessed: it travels with the request into NewDecoder, and it travels with
 	// the archived bytes as RawContentType's media-type parameter.
-	wrong, err := NewDecoder(OddsFormatDecimal, nil)
+	wrong, err := NewDecoder(OddsFormatDecimal, DefaultReferenceBook, nil)
 	if err != nil {
 		t.Fatalf("NewDecoder: %v", err)
 	}

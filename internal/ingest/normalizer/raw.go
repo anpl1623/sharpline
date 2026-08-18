@@ -137,6 +137,20 @@ type RawBook struct {
 	// falling back to this one is how both are read correctly.
 	LastUpdate time.Time `json:"last_update,omitzero"`
 
+	// Reference marks this bookmaker as the catalogue's sharp reference book.
+	//
+	// It is the provider layer's own statement about the book, and it is the
+	// authoritative answer where it exists: internal/pricing derives a market's
+	// no-vig fair value from the reference book alone, and records whether the
+	// choice came from here (a designation) or from its own configured
+	// preference list (a default). Without this field the designation exists at
+	// both ends — provider.Catalogue.ReferenceBook() reports it and
+	// books.is_reference stores it — and is dropped in the middle.
+	//
+	// That exactly one book carries it is a property of a catalogue, not of any
+	// single RawBook, so nothing here enforces it.
+	Reference bool `json:"reference,omitempty"`
+
 	Markets []RawMarket `json:"markets,omitempty"`
 }
 

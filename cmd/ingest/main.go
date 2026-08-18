@@ -343,7 +343,12 @@ func selectAdapter(cfg *config.Config, log *slog.Logger) (provider.Adapter, norm
 		// The format is the adapter's, not a second opinion: the decoder converts
 		// whatever was ASKED FOR into decimal, and asking for one format while
 		// decoding another silently reinterprets every price.
-		decoder, err := theoddsapi.NewDecoder(acfg.OddsFormat, metrics)
+		// The reference book is the adapter's too, for the same reason: the
+		// decoder is what stamps the sharp-book designation onto every record
+		// replayed off odds.raw, and a decoder that disagreed with the adapter
+		// would designate a different book on the replay path than on the live
+		// one.
+		decoder, err := theoddsapi.NewDecoder(acfg.OddsFormat, acfg.ReferenceBook, metrics)
 		if err != nil {
 			return nil, nil, err
 		}

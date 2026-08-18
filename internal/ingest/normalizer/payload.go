@@ -187,6 +187,13 @@ type BookRef struct {
 	// by this system, not observed from a real bookmaker, and every consumer
 	// that displays a price must be able to say so.
 	Kind string `json:"kind"`
+
+	// Reference is the catalogue's sharp-reference designation, propagated from
+	// RawBook.Reference. internal/pricing resolves a market's fair value from
+	// the designated book first and falls back to its own configured preference
+	// list only when no book on the record carries this flag — and it records
+	// which of the two happened on every computed record.
+	Reference bool `json:"reference,omitempty"`
 }
 
 // SelectionRef is a selection as carried on the wire.
@@ -303,6 +310,7 @@ func newRecord(provider string, v MarketView, ingestedAt time.Time) NormalizedMa
 	for _, b := range v.Books {
 		rec.Books = append(rec.Books, BookRef{
 			ID: b.ID().String(), Slug: b.Slug().String(), Name: b.Name(), Kind: b.Kind().String(),
+			Reference: b.IsReference(),
 		})
 	}
 	for _, s := range v.Selections {
@@ -405,7 +413,9 @@ func (m NormalizedMarket) Domain() (MarketView, error) {
 		if err != nil {
 			return v, err
 		}
-		book, err := domain.NewBook(domain.BookParams{ID: id, Slug: slug, Name: b.Name, Kind: kind})
+		book, err := domain.NewBook(domain.BookParams{
+			ID: id, Slug: slug, Name: b.Name, Kind: kind, Reference: b.Reference,
+		})
 		if err != nil {
 			return v, err
 		}

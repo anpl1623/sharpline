@@ -267,8 +267,8 @@ func TestPowerMarginInvertsUnderDevigPower(t *testing.T) {
 	for _, margin := range []float64{0.02, 0.045, 0.065} {
 		for _, fair := range fairs {
 			out := make([]float64, len(fair))
-			if err := applyMargin(fair, out, margin, true); err != nil {
-				t.Fatalf("applyMargin(%v, %g): %v", fair, margin, err)
+			if err := ApplyMargin(fair, out, margin, true); err != nil {
+				t.Fatalf("ApplyMargin(%v, %g): %v", fair, margin, err)
 			}
 			sum := 0.0
 			implied := make([]odds.Probability, len(out))
@@ -297,7 +297,7 @@ func TestMultiplicativeMarginHitsItsTarget(t *testing.T) {
 	fair := []float64{0.62, 0.38}
 	out := make([]float64, len(fair))
 	for _, margin := range []float64{0.02, 0.038, 0.055} {
-		if err := applyMargin(fair, out, margin, false); err != nil {
+		if err := ApplyMargin(fair, out, margin, false); err != nil {
 			t.Fatalf("applyMargin: %v", err)
 		}
 		sum := out[0] + out[1]

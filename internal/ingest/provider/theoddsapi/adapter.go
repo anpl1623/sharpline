@@ -513,7 +513,7 @@ func (a *Adapter) mapSweep(sw *OddsSweep, scope provider.Scope, sportKey string)
 			a.metrics.observeDropped(DropReasonWrongLeague, 1)
 			continue
 		}
-		raw, dropped, err := RawEventFrom(ev, sw.OddsFormat)
+		raw, dropped, err := RawEventFrom(ev, sw.OddsFormat, a.mapper.reference)
 		if err != nil {
 			a.metrics.observeDropped(DropReasonInvalidEvent, 1)
 			continue

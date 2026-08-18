@@ -107,7 +107,7 @@ func (a *Adapter) quote(fair, out []float64, b bookDef) error {
 		return fmt.Errorf("synthetic: %w: a market needs at least two selections, got %d",
 			provider.ErrInvalidSnapshot, len(fair))
 	}
-	if err := applyMargin(fair, out, b.margin, b.power); err != nil {
+	if err := ApplyMargin(fair, out, b.margin, b.power); err != nil {
 		return err
 	}
 	for i, q := range out {
@@ -124,7 +124,7 @@ func (a *Adapter) quote(fair, out []float64, b bookDef) error {
 	return nil
 }
 
-// applyMargin inflates a fair probability vector to sum to 1 + margin.
+// ApplyMargin inflates a fair probability vector to sum to 1 + margin.
 //
 // Multiplicative spreads the margin proportionally, which loads it evenly across
 // the market. Power raises every probability to a common exponent k < 1, which
@@ -137,7 +137,19 @@ func (a *Adapter) quote(fair, out []float64, b bookDef) error {
 // with, so a power-quoted market devigs back to the exact fair probabilities it
 // was generated from. That is the single most useful property this generator has
 // for phase 4: the right answer is known.
-func applyMargin(fair, out []float64, margin float64, power bool) error {
+//
+// # Why this is exported
+//
+// It is the ONE function that defines what "the generator's latent
+// probabilities" means, and internal/pricing's known-answer test is worth
+// nothing unless it inverts THIS relation rather than a second copy of it that
+// happens to agree today. A duplicate in a test harness would keep passing after
+// this function changed, which is the exact failure a known-answer test exists
+// to catch. So the quoting model is exported and the inverse is asserted across
+// the package boundary.
+//
+// out is caller-owned and must have the same length as fair.
+func ApplyMargin(fair, out []float64, margin float64, power bool) error {
 	if !power {
 		for i, p := range fair {
 			out[i] = p * (1 + margin)

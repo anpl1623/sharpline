@@ -53,6 +53,24 @@ const (
 	EnvOddsAPIKey    = "ODDS_API_KEY"
 	EnvSyntheticSeed = "SHARPLINE_SYNTHETIC_SEED"
 
+	// EnvPricerReferenceBooks is the ORDERED, comma-separated list of book slugs
+	// `pricer` treats as the sharp reference, most preferred first.
+	//
+	// It exists because sharpness is an OPINION, not a fact any provider
+	// reports, and internal/pricing/reference.go is explicit that a binary with
+	// the judgement compiled into it is the wrong shape. A ranked list rather
+	// than one name is what makes ONE binary correct against both providers:
+	// `ingest` picks its adapter from ODDS_API_KEY at startup and nothing tells
+	// `pricer` which it chose, so the pricer tries the real sharp book and falls
+	// through to the synthetic one when the real book does not quote a market.
+	//
+	// It is OPTIONAL and empty is legal. The catalogue's own designation
+	// (normalizer.BookRef.Reference) outranks this list wherever it exists, so
+	// an unset value is not a broken pricer — it is one that relies on the
+	// provider's designation alone, and every computed record says which of the
+	// two chose its reference book.
+	EnvPricerReferenceBooks = "SHARPLINE_PRICER_REFERENCE_BOOKS"
+
 	// EnvIngestLiveInterval overrides the LIVE-window poll cadence.
 	//
 	// ADR 0003 promises the cadence ladder is "retunable for a different tier
@@ -142,11 +160,24 @@ var (
 		DefaultHTTPAddr: ":8081",
 		Requires:        RequireHTTP | RequireRedis | RequireKafka,
 	}
-	// Pricer devigs, computes fair value, EV and Kelly, and finds arbitrage.
+	// Pricer devigs, computes fair value, EV and Kelly, and finds arbitrage and
+	// middles.
+	//
+	// It does NOT declare RequireRedis, and that is a correction rather than an
+	// omission. Phase 2's rule is that a declared dependency must be OPENED by
+	// the binary ("RequirePostgres in config means the binary MUST open a
+	// pool") — api and settle once declared Postgres without opening one and
+	// /api/readyz returned 200 with the database stopped, a probe worse than
+	// none. The pricer opens no Redis client: its whole state is a fold of a
+	// compacted topic and rebuilds from one snapshot read, which is exactly the
+	// argument internal/pricing/doc.go makes for not putting it in a cache. The
+	// legitimate future use is a SHARED store once replicas exist and a
+	// rebalance moves partitions; the declaration comes back with the client,
+	// not before it.
 	Pricer = Spec{
 		Service:         "pricer",
 		DefaultHTTPAddr: ":8082",
-		Requires:        RequireHTTP | RequireRedis | RequireKafka,
+		Requires:        RequireHTTP | RequireKafka,
 	}
 	// Ingest polls provider adapters and publishes normalized deltas. Redis
 	// backs the distributed rate limiter that protects the provider quota.
@@ -214,6 +245,11 @@ type Config struct {
 	// IngestLiveInterval overrides the live-window poll cadence. Zero means the
 	// scheduler's own default (90s). See EnvIngestLiveInterval.
 	IngestLiveInterval time.Duration
+
+	// PricerReferenceBooks is the ordered sharp-book preference list, already
+	// split and trimmed. Nil means "catalogue designation only".
+	// See EnvPricerReferenceBooks.
+	PricerReferenceBooks []string
 }
 
 // IsProd reports whether this process is running in the production environment.
@@ -239,6 +275,7 @@ func (c Config) LogValue() slog.Value {
 		slog.Bool("odds_api_key_set", c.OddsAPIKey != ""),
 		slog.Int64("synthetic_seed", c.SyntheticSeed),
 		slog.String("ingest_live_interval", c.IngestLiveInterval.String()),
+		slog.Any("pricer_reference_books", c.PricerReferenceBooks),
 	)
 }
 
@@ -370,6 +407,18 @@ func LoadFrom(spec Spec, lookup Lookup) (*Config, error) {
 			problems = append(problems, fmt.Errorf("%w: %s=%q: not a base-10 int64", ErrInvalid, EnvSyntheticSeed, raw))
 		}
 		cfg.SyntheticSeed = seed
+	}
+
+	// SHARPLINE_PRICER_REFERENCE_BOOKS — always optional. Empty entries are
+	// dropped rather than rejected so a trailing comma is not a startup failure;
+	// the slugs themselves are validated by pricing.NewEngine, which owns the
+	// charset rule, rather than being validated twice in two places.
+	if raw, ok := lookup(EnvPricerReferenceBooks); ok {
+		for _, part := range strings.Split(raw, ",") {
+			if slug := strings.TrimSpace(part); slug != "" {
+				cfg.PricerReferenceBooks = append(cfg.PricerReferenceBooks, slug)
+			}
+		}
 	}
 
 	// SHARPLINE_INGEST_LIVE_INTERVAL — always optional, but must parse and be

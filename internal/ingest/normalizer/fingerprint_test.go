@@ -83,7 +83,7 @@ func collectLeaves(t *testing.T, v reflect.Value, typeName string, out *[]leaf) 
 		path := typeName + "." + f.Name
 
 		switch fv.Kind() {
-		case reflect.String, reflect.Int, reflect.Float64:
+		case reflect.String, reflect.Int, reflect.Float64, reflect.Bool:
 			*out = append(*out, leaf{path: path, val: fv})
 		case reflect.Struct:
 			switch fv.Interface().(type) {
@@ -115,6 +115,8 @@ func mutate(t *testing.T, l leaf) {
 		l.val.SetInt(int64(v) + 1)
 	case float64:
 		l.val.SetFloat(v + 1)
+	case bool:
+		l.val.SetBool(!v)
 	case time.Time:
 		l.val.Set(reflect.ValueOf(v.Add(time.Second)))
 	case domain.Line:

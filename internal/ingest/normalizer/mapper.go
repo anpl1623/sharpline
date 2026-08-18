@@ -319,6 +319,7 @@ func (m *Mapper) competitors(raw RawEvent) (domain.EventKind, domain.Competitor,
 type quote struct {
 	bookKey    string
 	bookName   string
+	bookRef    bool
 	role       domain.SelectionRole
 	name       string
 	decimal    float64
@@ -410,6 +411,7 @@ func (m *Mapper) collect(raw RawEvent) ([]*marketGroup, []Reject) {
 				q := quote{
 					bookKey:    bk.Key,
 					bookName:   bk.Name,
+					bookRef:    bk.Reference,
 					role:       role,
 					name:       strings.TrimSpace(o.Name),
 					decimal:    o.Price,
@@ -616,6 +618,9 @@ func (m *Mapper) book(q quote) (domain.Book, error) {
 		// "draftkings" into "DraftKings" would be inventing display data.
 		Name: firstNonEmpty(strings.TrimSpace(q.bookName), key),
 		Kind: m.bookKind,
+		// The provider's own designation, carried through unchanged. Deciding
+		// it here would be this layer inventing a trading judgement.
+		Reference: q.bookRef,
 	})
 }
 
