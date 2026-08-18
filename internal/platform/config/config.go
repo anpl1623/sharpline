@@ -22,6 +22,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/anpl1623/sharpline/internal/platform/logging"
 )
@@ -51,6 +52,23 @@ const (
 	EnvJWTSigningKey = "SHARPLINE_JWT_SIGNING_KEY"
 	EnvOddsAPIKey    = "ODDS_API_KEY"
 	EnvSyntheticSeed = "SHARPLINE_SYNTHETIC_SEED"
+
+	// EnvIngestLiveInterval overrides the LIVE-window poll cadence.
+	//
+	// ADR 0003 promises the cadence ladder is "retunable for a different tier
+	// without a code change", and the live tier is the one that dominates the
+	// bill -- it is ~77% of the default monthly credit spend. Until this
+	// existed the promise was unmet: scheduler.DefaultTiers was reachable only
+	// by editing Go.
+	//
+	// It is also the knob that makes change detection MEASURABLE. The
+	// suppression a hash buys depends entirely on the ratio between the poll
+	// interval and the rate the market actually moves, so a deployment that
+	// cannot change the interval cannot observe the trade-off it is making.
+	//
+	// Only the live tier is exposed. The other four are derived from it in the
+	// ADR's arithmetic and exposing all five invites an inconsistent ladder.
+	EnvIngestLiveInterval = "SHARPLINE_INGEST_LIVE_INTERVAL"
 )
 
 // Deployment environments. SHARPLINE_ENV must be one of these; an unrecognised
@@ -132,10 +150,19 @@ var (
 	}
 	// Ingest polls provider adapters and publishes normalized deltas. Redis
 	// backs the distributed rate limiter that protects the provider quota.
+	//
+	// Postgres is required because ingest also HOSTS THE TIMESCALE LINE-HISTORY
+	// WRITER (CLAUDE.md §3's event flow: odds.normalized → timescale writer).
+	// That consumer opens a pool and writes the prices hypertable, so a binary
+	// that started without a DSN would report itself healthy while silently
+	// persisting nothing — the board would look live and the line history it is
+	// the whole point of would be empty. Phase 2's handoff flagged this as an
+	// open question "resolve when phase 3 builds that writer"; this is the
+	// resolution.
 	Ingest = Spec{
 		Service:         "ingest",
 		DefaultHTTPAddr: ":8083",
-		Requires:        RequireHTTP | RequireRedis | RequireKafka,
+		Requires:        RequireHTTP | RequirePostgres | RequireRedis | RequireKafka,
 	}
 	// Settle grades open wagers and writes ledger entries.
 	Settle = Spec{
@@ -183,6 +210,10 @@ type Config struct {
 	// SyntheticSeed seeds the synthetic provider's RNG so tests are
 	// deterministic. Zero means "seed from the clock".
 	SyntheticSeed int64
+
+	// IngestLiveInterval overrides the live-window poll cadence. Zero means the
+	// scheduler's own default (90s). See EnvIngestLiveInterval.
+	IngestLiveInterval time.Duration
 }
 
 // IsProd reports whether this process is running in the production environment.
@@ -207,6 +238,7 @@ func (c Config) LogValue() slog.Value {
 		slog.Bool("jwt_signing_key_set", c.JWTSigningKey != ""),
 		slog.Bool("odds_api_key_set", c.OddsAPIKey != ""),
 		slog.Int64("synthetic_seed", c.SyntheticSeed),
+		slog.String("ingest_live_interval", c.IngestLiveInterval.String()),
 	)
 }
 
@@ -338,6 +370,25 @@ func LoadFrom(spec Spec, lookup Lookup) (*Config, error) {
 			problems = append(problems, fmt.Errorf("%w: %s=%q: not a base-10 int64", ErrInvalid, EnvSyntheticSeed, raw))
 		}
 		cfg.SyntheticSeed = seed
+	}
+
+	// SHARPLINE_INGEST_LIVE_INTERVAL — always optional, but must parse and be
+	// positive if present. A zero or negative interval is a hot loop against a
+	// metered API, so it is refused rather than clamped: a silently-corrected
+	// cadence is a bill nobody predicted.
+	if raw, ok := lookup(EnvIngestLiveInterval); ok && strings.TrimSpace(raw) != "" {
+		d, err := time.ParseDuration(strings.TrimSpace(raw))
+		switch {
+		case err != nil:
+			problems = append(problems, fmt.Errorf("%w: %s=%q: not a Go duration (e.g. \"90s\", \"5m\")",
+				ErrInvalid, EnvIngestLiveInterval, raw))
+		case d <= 0:
+			problems = append(problems, fmt.Errorf("%w: %s=%q: must be positive; a non-positive poll "+
+				"interval is an unbounded loop against a metered provider",
+				ErrInvalid, EnvIngestLiveInterval, raw))
+		default:
+			cfg.IngestLiveInterval = d
+		}
 	}
 
 	if len(problems) > 0 {

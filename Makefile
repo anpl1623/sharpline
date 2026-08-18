@@ -475,8 +475,27 @@ env: ## Create .env from .env.example if it does not exist yet
 
 .PHONY: up
 up: env ## Bring up the full stack (proxy is the only published port)
+	@# Staged, and the stages are not interchangeable.
+	@#
+	@# CLAUDE.md §9: "One command to a working system is a hard requirement" and
+	@# "Topics created by Terraform, not by hand". Kafka runs with
+	@# auto-topic-creation OFF, so a producer that starts before `topics` has
+	@# converged fails every publish with UNKNOWN_TOPIC_OR_PARTITION while
+	@# reporting itself healthy -- a stack that looks up and moves no data.
+	@#
+	@# The services DO recover from that on their own (the scheduler backs off and
+	@# retries, and the normalizer's warm start is lazy), so this ordering is not
+	@# load-bearing for correctness. It is load-bearing for the first thirty
+	@# seconds a reviewer looks at the logs, which is the only impression a demo
+	@# gets to make.
+	$(COMPOSE) up --detach --build --remove-orphans --wait postgres redis kafka
+	@$(MAKE) --no-print-directory topics
 	$(COMPOSE) up --detach --build --remove-orphans
 	$(COMPOSE) ps
+
+.PHONY: topics
+topics: ## Converge the Kafka topics for TF_ENV (idempotent; run automatically by `up`)
+	@$(MAKE) --no-print-directory tf-apply ARGS=-auto-approve
 
 .PHONY: up-dev
 up-dev: env ## Bring up the stack with hot-reload overrides + kafka-ui (dev profile)
@@ -912,16 +931,25 @@ COVER_PKGS ?= ./...
 # COVER_MAX_ODDS_UNCOVERED is a BLOCK BUDGET, not a percentage (see the long note
 # above). It can only fall under -coverpkg, never rise, for the same reason.
 COVER_MIN_TOTAL          ?= 80
-COVER_MAX_ODDS_UNCOVERED ?= 18
+COVER_MAX_ODDS_UNCOVERED ?= 16
 COVER_ODDS_PKG           ?= github.com/anpl1623/sharpline/internal/domain/odds
 
 .PHONY: cover
 cover: cache-init docker-socket ## Coverage: per-package rollup + HTML, cross-package attribution via -coverpkg, gated
+	@# The profile is written to the container's own filesystem and copied out as a
+	@# single sequential write. Writing it DIRECTLY to /src corrupts it on Docker
+	@# Desktop for macOS: `go test` streams the merged profile through the virtiofs
+	@# bind mount and an 8MB write comes back with hundreds of thousands of NUL bytes
+	@# embedded, after which `go tool cover -func` dies with
+	@# `bufio.Scanner: token too long`. Measured on daemon 29.6.2: same command,
+	@# /tmp destination -> 0 NUL bytes; /src destination -> 435,062 NUL bytes.
+	@# The `cp` is inside the SAME `sh -c` so the profile never leaves the container
+	@# until it is complete.
 	docker run --rm \
 	  $(DOCKER_GO_FLAGS) \
 	  $(DOCKER_TESTCONTAINERS_FLAGS) \
 	  $(GO_IMAGE) \
-	  go test -count=1 -covermode=atomic -coverpkg=$(COVER_PKGS) -coverprofile=coverage.out $(ARGS) $(PKG)
+	  sh -c 'go test -count=1 -covermode=atomic -coverpkg=$(COVER_PKGS) -coverprofile=/tmp/coverage.out $(ARGS) $(PKG) && cp /tmp/coverage.out /src/coverage.out'
 	docker run --rm $(DOCKER_GO_FLAGS) $(GO_IMAGE) go tool cover -func=coverage.out
 	docker run --rm $(DOCKER_GO_FLAGS) $(GO_IMAGE) go tool cover -html=coverage.out -o coverage.html
 	@docker run --rm $(DOCKER_GO_FLAGS) $(GO_IMAGE) awk \
@@ -1409,6 +1437,19 @@ tf-preflight: ## Check TF_ENV is real, it has been init'ed, and (local) that the
 	   printf 'FAIL  deploy/terraform/envs/%s has not been initialised.\n' '$(TF_ENV)'; \
 	   printf '      Run:  %smake tf-init\n' '$(if $(filter-out local,$(TF_ENV)),TF_ENV=$(TF_ENV) ,)'; \
 	   exit 1; \
+	 fi
+	@# A present .terraform is NOT proof the providers are usable. TF_PLUGIN_CACHE_DIR
+	@# points at the `terraform-plugin-cache` compose volume, so what lands under
+	@# .terraform/providers is a tree of SYMLINKS into that volume -- and
+	@# `make down-hard` removes it along with every other project volume. The
+	@# result is a host directory that looks initialised and a run that dies with
+	@# "Required plugins are not installed", which reads like a lock-file problem
+	@# and is not one. Re-linking is what init does and it is idempotent, so the
+	@# recovery is automatic rather than a documented ritual.
+	@if find '$(ROOT_DIR)/deploy/terraform/envs/$(TF_ENV)/.terraform' -type l ! -exec test -e {} \; -print 2>/dev/null | grep -q .; then \
+	   printf 'NOTE  provider plugins are unresolvable (the plugin cache volume was removed,\n'; \
+	   printf '      most likely by `make down-hard`). Re-linking them.\n'; \
+	   $(MAKE) --no-print-directory tf-init ARGS=; \
 	 fi
 	@# NOTE: do NOT write the bare word `terraform` in a recipe MESSAGE. It is in
 	@# HOST_TOOLCHAIN_CMDS, and `verify-no-host-toolchain` scans the whole recipe

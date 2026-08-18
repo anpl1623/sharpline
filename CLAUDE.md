@@ -408,3 +408,39 @@ Build the container substrate before the application code. Scaffolding a Go modu
 **Start Docker Desktop first** — the daemon was not running when this was written, and nothing in this project works without it. Before touching Kubernetes: install `kind` and create a cluster; `kubectl` has no contexts configured.
 
 Run `/design-consultation` before writing a single frontend component.
+
+---
+
+## Design System
+
+`/design-consultation` has been run. **Always read `DESIGN.md` before making any visual
+or UI decision.** Fonts, colors, spacing, radius, motion, and the aesthetic direction
+are all defined there, along with the reasoning behind each — including the two
+deliberate departures from category convention (cyan/amber deltas instead of green/red,
+and a decaying delta rail instead of a cell flash) that will look like bugs to anyone
+who has not read the file.
+
+Do not deviate without explicit user approval. Any approved deviation is recorded in
+the Decisions Log at the bottom of `DESIGN.md`. In QA and review, flag any code that
+does not match it.
+
+---
+
+## Skill routing
+
+When the user's request matches an available skill, invoke it via the Skill tool. When in doubt, invoke the skill.
+
+Key routing rules:
+- Product ideas/brainstorming → invoke /office-hours
+- Strategy/scope → invoke /plan-ceo-review
+- Architecture → invoke /plan-eng-review
+- Design system/plan review → invoke /design-consultation or /plan-design-review
+- Full review pipeline → invoke /autoplan
+- Bugs/errors → invoke /investigate
+- QA/testing site behavior → invoke /qa or /qa-only
+- Code review/diff check → invoke /review
+- Visual polish → invoke /design-review
+- Ship/deploy/PR → invoke /ship or /land-and-deploy
+- Save progress → invoke /context-save
+- Resume context → invoke /context-restore
+- Author a backlog-ready spec/issue → invoke /spec

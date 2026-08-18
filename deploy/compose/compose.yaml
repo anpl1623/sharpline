@@ -106,7 +106,11 @@ x-env-base: &env-base
   # Empty => telemetry export disabled. compose.obs.yaml points this at the collector.
   SHARPLINE_OTEL_ENDPOINT: ${SHARPLINE_OTEL_ENDPOINT:-}
 
-# api, settle, migrate  (config.RequirePostgres)
+# api, ingest, settle, migrate  (config.RequirePostgres)
+#
+# ingest is on this list because it hosts the Timescale line-history writer
+# (CLAUDE.md §3: odds.normalized → timescale writer), not because it queries the
+# catalogue.
 x-env-postgres: &env-postgres
   SHARPLINE_POSTGRES_DSN: postgres://${POSTGRES_USER:-sharpline}:${POSTGRES_PASSWORD:-sharpline-dev-postgres}@postgres:5432/${POSTGRES_DB:-sharpline}?sslmode=disable
 
@@ -365,15 +369,24 @@ services:
         SERVICE: ingest
     image: sharpline/ingest:local
     environment:
-      # config.Ingest = HTTP | Redis | Kafka. No Postgres: ingest publishes to the bus,
-      # the Timescale writer consumes from it.
-      <<: [*env-base, *env-redis, *env-kafka]
+      # config.Ingest = HTTP | Postgres | Redis | Kafka.
+      #
+      # Postgres is here because ingest HOSTS the Timescale line-history writer: it
+      # publishes odds.normalized and consumes it back into the prices hypertable in
+      # the same process (CLAUDE.md §3's event flow). Without a DSN the binary now
+      # refuses to start rather than running a board with no history behind it.
+      <<: [*env-base, *env-postgres, *env-redis, *env-kafka]
       SHARPLINE_HTTP_ADDR: ":8083"
       # The provider key, and the only service that gets it. Pass-through from the
       # environment (`--env-file ../../.env`); absent => ingest selects the synthetic
       # stochastic market-maker, which is a live generator, not fixture data.
       ODDS_API_KEY:
       SHARPLINE_SYNTHETIC_SEED: ${SHARPLINE_SYNTHETIC_SEED:-0}
+      # Live-window poll cadence. Empty => the scheduler's 90s default, which is
+      # the number ADR 0003's quota arithmetic is built on. Set it and you are
+      # changing the monthly bill, so it is deliberately not given a non-default
+      # value here.
+      SHARPLINE_INGEST_LIVE_INTERVAL: ${SHARPLINE_INGEST_LIVE_INTERVAL:-}
     depends_on: *go-deps
     deploy:
       resources:

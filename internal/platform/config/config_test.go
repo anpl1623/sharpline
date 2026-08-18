@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/anpl1623/sharpline/internal/platform/config"
 )
@@ -455,4 +456,66 @@ func TestLoadFromRejectsUnusableArguments(t *testing.T) {
 			t.Errorf("LoadFrom(zero spec) = %v, want an error wrapping ErrInvalid", err)
 		}
 	})
+}
+
+// TestIngestLiveIntervalIsOptionalAndValidated.
+//
+// The live tier is ~77% of the monthly credit spend, so this is the one cadence
+// the environment can move — ADR 0003 promises the ladder is "retunable for a
+// different tier without a code change" and this variable is what makes that
+// true. Everything about it that could quietly cost money is asserted here.
+func TestIngestLiveIntervalIsOptionalAndValidated(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		value   string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "absent means the scheduler default", value: "", want: 0},
+		{name: "a plain duration parses", value: "90s", want: 90 * time.Second},
+		{name: "minutes parse", value: "5m", want: 5 * time.Minute},
+		{name: "surrounding whitespace is tolerated", value: "  45s  ", want: 45 * time.Second},
+
+		// A non-positive interval is an unbounded loop against a metered API.
+		// It is REFUSED, not clamped: a cadence silently corrected to a default
+		// is a bill nobody predicted.
+		{name: "zero is refused", value: "0s", wantErr: true},
+		{name: "negative is refused", value: "-30s", wantErr: true},
+
+		// A bare number is the most likely typo — "90" meaning ninety seconds —
+		// and Go's ParseDuration rejects it. Letting it through as 90ns would
+		// poll eleven million times a second.
+		{name: "a unitless number is refused", value: "90", wantErr: true},
+		{name: "nonsense is refused", value: "soon", wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			env := with(map[string]string{config.EnvIngestLiveInterval: tc.value})
+			cfg, err := config.LoadFrom(config.Ingest, config.MapLookup(env))
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("%s=%q was accepted; it must fail startup", config.EnvIngestLiveInterval, tc.value)
+				}
+				if !errors.Is(err, config.ErrInvalid) {
+					t.Errorf("error does not wrap ErrInvalid: %v", err)
+				}
+				if !strings.Contains(err.Error(), config.EnvIngestLiveInterval) {
+					t.Errorf("the error does not name the variable, so an operator cannot find it: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("%s=%q was rejected: %v", config.EnvIngestLiveInterval, tc.value, err)
+			}
+			if cfg.IngestLiveInterval != tc.want {
+				t.Errorf("IngestLiveInterval = %s, want %s", cfg.IngestLiveInterval, tc.want)
+			}
+		})
+	}
 }
