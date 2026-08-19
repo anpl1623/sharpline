@@ -87,7 +87,12 @@ jobs:
       # front, TLS termination and the origin -- rather than only the origin by
       # IP, which proves far less. Falls back to the raw host for a deployment
       # with no domain in front of it.
-      PUBLIC_URL: ${{ secrets.SHARPLINE_PUBLIC_URL || format('http://{0}', secrets.GCP_VM_HOST || '34.56.164.139') }}
+      #
+      # A repository VARIABLE, not a secret: the public hostname is not
+      # sensitive, it is useful to see in a log and in the run summary, and it
+      # never needs rotating. The secrets.* fallback is kept only so an existing
+      # secret keeps working if one was set.
+      PUBLIC_URL: ${{ vars.SHARPLINE_PUBLIC_URL || secrets.SHARPLINE_PUBLIC_URL || format('http://{0}', secrets.GCP_VM_HOST || '34.56.164.139') }}
       IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
     steps:
       - uses: actions/checkout@v4
