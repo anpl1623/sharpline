@@ -82,6 +82,12 @@ jobs:
       # workflow_run reports its OWN sha in github.sha, not the commit that was
       # tested, so the deployed commit has to come from the triggering run.
       DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      # The base URL the smoke test hits. Point it at the real public hostname
+      # so the check exercises what a user actually reaches -- DNS, any CDN in
+      # front, TLS termination and the origin -- rather than only the origin by
+      # IP, which proves far less. Falls back to the raw host for a deployment
+      # with no domain in front of it.
+      PUBLIC_URL: ${{ secrets.SHARPLINE_PUBLIC_URL || format('http://{0}', secrets.GCP_VM_HOST || '34.56.164.139') }}
       IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
     steps:
       - uses: actions/checkout@v4
@@ -227,13 +233,37 @@ jobs:
       - name: verify public endpoints
         if: env.SSH_AUTH_READY == 'true'
         run: |
-          set -euo pipefail
-          echo "==> Verifying public endpoint health at http://${VM_HOST}/api/healthz..."
-          curl -sf -m 10 "http://${VM_HOST}/api/healthz"
-          echo ""
-          echo "==> Verifying public endpoint readiness at http://${VM_HOST}/api/readyz..."
-          curl -sf -m 10 "http://${VM_HOST}/api/readyz"
-          echo ""
+          set -uo pipefail
+          fail=0
+          for path in /api/healthz /api/readyz; do
+            url="${PUBLIC_URL}${path}"
+            echo "==> GET ${url}"
+            # -w prints the outcome even on failure, and curl's exit code says
+            # which layer broke, which "curl: (7)" alone does not make obvious.
+            code=$(curl -sS -m 15 -o /tmp/body -w '%{http_code}' "$url" 2>/tmp/err; echo " rc=$?")
+            status="${code% rc=*}"; rc="${code##* rc=}"
+            body=$(head -c 300 /tmp/body 2>/dev/null)
+            echo "    http=${status} curl_rc=${rc} body=${body}"
+            if [ "$rc" -ne 0 ] || [ "$status" != "200" ]; then
+              fail=1
+              case "$rc" in
+                6)  echo "::error::DNS did not resolve $(echo "$url" | cut -d/ -f3)." ;;
+                7)  echo "::error::Could not connect. The rollout itself succeeded and the VM"
+                    echo "::error::answers on its own localhost, so the stack is running -- what"
+                    echo "::error::is missing is inbound reachability. Check that the cloud"
+                    echo "::error::firewall permits tcp:80 and tcp:443 from the internet." ;;
+                28) echo "::error::Timed out after 15s." ;;
+                35|60) echo "::error::TLS failure. If a CDN fronts this origin, its SSL mode must"
+                    echo "::error::match what the proxy actually serves." ;;
+                *)  [ "$status" = "521" ] && {
+                      echo "::error::521 is the CDN saying it reached ITSELF but not the origin."
+                      echo "::error::Same underlying cause as curl rc=7: the origin is not"
+                      echo "::error::reachable on 80/443 from outside."; } ;;
+              esac
+              [ -s /tmp/err ] && sed 's/^/::error::curl: /' /tmp/err
+            fi
+          done
+          exit "$fail"
 
       - name: generate rollout summary
         if: always()
@@ -246,8 +276,8 @@ jobs:
             echo "| **Target Host** | \`${VM_HOST}\` |"
             echo "| **Commit** | \`${DEPLOY_SHA}\` |"
             echo "| **Image** | \`${IMAGE_PREFIX}/<service>:${IMAGE_TAG}\` |"
-            echo "| **Web UI** | [http://${VM_HOST}](http://${VM_HOST}) |"
-            echo "| **API Health** | [http://${VM_HOST}/api/healthz](http://${VM_HOST}/api/healthz) |"
-            echo "| **API Ready** | [http://${VM_HOST}/api/readyz](http://${VM_HOST}/api/readyz) |"
+            echo "| **Public URL** | [${PUBLIC_URL}](${PUBLIC_URL}) |"
+            echo "| **API Health** | [${PUBLIC_URL}/api/healthz](${PUBLIC_URL}/api/healthz) |"
+            echo "| **API Ready** | [${PUBLIC_URL}/api/readyz](${PUBLIC_URL}/api/readyz) |"
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
