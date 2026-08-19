@@ -1139,10 +1139,35 @@ func TestCompactionCollapsesToTheLatestValuePerKey(t *testing.T) {
 
 	s := newSnapshotter(t, bus, kafka.TopicOddsNormalized)
 
+	// The precondition is that the log holds MORE THAN ONE record per key, not
+	// that it still holds all `versions` of them.
+	//
+	// This is the only thing the assertion below needs: "exactly 1 afterwards"
+	// is a demonstrated collapse precisely when there was more than 1 to
+	// collapse, and it is vacuous otherwise. Demanding the exact count demands
+	// something else entirely — that the cleaner has NOT RUN YET — and this
+	// topic is deliberately configured so that it may run at any moment:
+	// compactionSpeedups sets min.compaction.lag.ms to 0 and max.compaction.lag.ms
+	// to 1s, so a record is cleanable almost as soon as its segment closes.
+	//
+	// Whether a segment closes between the publishes above and this read is
+	// decided by the OTHER tests sharing odds.normalized — the cleaner never
+	// touches the active segment, so it takes someone else's append to roll one
+	// — and that traffic is not this test's to control. It failed exactly that
+	// way under `go test -race` once the phase-6 gateway fixture began driving
+	// the real normalizer onto this topic: one key read back 4 of its 5 records,
+	// which is compaction working, reported as compaction broken.
+	//
+	// Nothing is lost by relaxing it. The claim that every publish landed is
+	// still proven, and proven harder, at the END of this test: the one
+	// surviving record per key is decoded and must be version `versions`. A
+	// publish that never arrived cannot produce that.
 	before, _, _ := snapshotKeyCounts(t, s, mine)
 	for _, key := range keys {
-		if before[key] != versions {
-			t.Fatalf("before compaction key %s holds %d records, want %d", key, before[key], versions)
+		if before[key] < 2 {
+			t.Fatalf("before the forced roll key %s holds %d record(s); with fewer than 2 there is "+
+				"nothing for the cleaner to collapse and the assertion below would pass vacuously",
+				key, before[key])
 		}
 	}
 
@@ -1179,7 +1204,7 @@ func TestCompactionCollapsesToTheLatestValuePerKey(t *testing.T) {
 			t.Fatalf("key %s still holds %d records after %s (it held %d before). "+
 				"COMPACTION DID NOT RUN. CLAUDE.md §3's claim that a compacted topic IS the "+
 				"current-line snapshot does not hold with this configuration.",
-				key, after[key], 90*time.Second, versions)
+				key, after[key], 90*time.Second, before[key])
 		}
 	}
 

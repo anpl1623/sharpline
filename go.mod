@@ -3,6 +3,7 @@ module github.com/anpl1623/sharpline
 go 1.26.0
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/jackc/puddle/v2 v2.2.2
 	github.com/pressly/goose/v3 v3.27.3
@@ -15,6 +16,7 @@ require (
 	go.opentelemetry.io/otel v1.45.0
 	go.opentelemetry.io/otel/sdk v1.45.0
 	go.opentelemetry.io/otel/trace v1.45.0
+	go.uber.org/goleak v1.3.0
 	golang.org/x/crypto v0.54.0
 	pgregory.net/rapid v1.3.0
 )

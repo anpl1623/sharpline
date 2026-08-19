@@ -20,6 +20,7 @@ it has failed.
 | [0005](0005-helm-not-kustomize.md) | Helm as the sole Kubernetes deploy path | Accepted | 2026-08-16 |
 | [0006](0006-fair-value-from-a-reference-book.md) | Fair value from one sharp reference book, devigged with Shin | Accepted | 2026-08-18 |
 | [0007](0007-nextjs-16.md) | Move the frontend from Next.js 15 to Next.js 16 | Accepted | 2026-08-19 |
+| [0008](0008-websocket-gateway.md) | Groupless bus read, per-connection sequencing, a subprotocol-carried bearer, Redis for subscriptions only | Accepted | 2026-08-19 |
 
 ## Template
 

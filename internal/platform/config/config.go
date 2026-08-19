@@ -169,7 +169,14 @@ const (
 	RequireRedis
 	// RequireKafka means the binary produces to or consumes from the bus.
 	RequireKafka
-	// RequireJWT means the binary mints or verifies access tokens.
+	// RequireJWT means the binary CANNOT START without a signing key, because
+	// every one of its useful paths mints or verifies an access token.
+	//
+	// It is not "this binary understands tokens". `stream` verifies one when a
+	// client presents it and serves the public board when nobody does, so it
+	// reads SHARPLINE_JWT_SIGNING_KEY without declaring this — see the read in
+	// LoadFrom, which is unconditional. Declaring it here would turn an absent
+	// key into a refusal to serve public data.
 	RequireJWT
 )
 
@@ -439,16 +446,40 @@ func LoadFrom(spec Spec, lookup Lookup) (*Config, error) {
 		}
 	}
 
-	// SHARPLINE_JWT_SIGNING_KEY
-	if spec.Requires.has(RequireJWT) {
-		cfg.JWTSigningKey = get(lookup, EnvJWTSigningKey, "")
-		switch {
-		case cfg.JWTSigningKey == "":
+	// SHARPLINE_JWT_SIGNING_KEY — READ FOR EVERY BINARY, REQUIRED ONLY BY THOSE
+	// THAT DECLARE RequireJWT.
+	//
+	// This is the one variable whose requirement and whose USE are not the same
+	// question, and collapsing them was a real defect. `stream` verifies an
+	// access token presented on the WebSocket handshake (ADR 0008), so it needs
+	// the key whenever a deployment wants authenticated subscriptions — but a
+	// gateway serving the PUBLIC odds board must still start without one,
+	// because market data is public (CLAUDE.md §6) and an anonymous connection
+	// is a first-class state rather than a degraded one. Under the old shape the
+	// key was read only when it was mandatory, so `stream` could never see it at
+	// all: every presented credential was refused, `newVerifier` logged its
+	// warning on every boot, and there was no configuration that fixed it.
+	//
+	// Requiring it for `stream` is the other wrong answer. RequireJWT is a HARD
+	// gate — the process refuses to start — so declaring it would make a missing
+	// key take down a public board that does not need one.
+	//
+	// So: read it always, demand it only where it is mandatory, and validate its
+	// LENGTH wherever it is present. That last clause matters more than it
+	// looks. A key too short to be worth having is a misconfiguration in every
+	// binary that holds one, and the failure it produces is silent — tokens
+	// verify, and the signature they verify against is weak. CLAUDE.md §12
+	// ("fail fast and loudly on a bad config") applies to a key that is optional
+	// exactly as much as to one that is required.
+	cfg.JWTSigningKey = get(lookup, EnvJWTSigningKey, "")
+	switch {
+	case cfg.JWTSigningKey == "":
+		if spec.Requires.has(RequireJWT) {
 			problems = append(problems, fmt.Errorf("%w: %s", ErrMissing, EnvJWTSigningKey))
-		case len(cfg.JWTSigningKey) < minJWTKeyLen:
-			problems = append(problems, fmt.Errorf("%w: %s is %d bytes, want at least %d",
-				ErrInvalid, EnvJWTSigningKey, len(cfg.JWTSigningKey), minJWTKeyLen))
 		}
+	case len(cfg.JWTSigningKey) < minJWTKeyLen:
+		problems = append(problems, fmt.Errorf("%w: %s is %d bytes, want at least %d",
+			ErrInvalid, EnvJWTSigningKey, len(cfg.JWTSigningKey), minJWTKeyLen))
 	}
 
 	// SHARPLINE_TRUSTED_PROXIES — always optional; empty means believe nobody.

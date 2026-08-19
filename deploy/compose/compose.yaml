@@ -348,9 +348,10 @@ services:
     image: ${SHARPLINE_IMAGE_PREFIX:-sharpline}/api:${SHARPLINE_IMAGE_TAG:-local}
     environment:
       # config.API = HTTP | Postgres | Redis | Kafka | JWT — the only service that
-      # mints or verifies access tokens today, so the only one given the signing key.
-      # When `stream` grows WebSocket auth it gets the key added here explicitly; it
-      # does not inherit it.
+      # MINTS access tokens, and the only one that cannot start without the key.
+      # `stream` now VERIFIES them on the WebSocket handshake (ADR 0008) and is given
+      # the same key explicitly below; it does not inherit it, and unlike this service
+      # it starts fine without one because the odds board is public.
       <<: [*env-base, *env-postgres, *env-redis, *env-kafka]
       SHARPLINE_HTTP_ADDR: ":8080"
       SHARPLINE_JWT_SIGNING_KEY:
@@ -459,6 +460,16 @@ services:
       # deployment scales without session affinity (CLAUDE.md §9).
       <<: [*env-base, *env-redis, *env-kafka]
       SHARPLINE_HTTP_ADDR: ":8081"
+      # The SAME signing key `api` mints with, because this service VERIFIES what that
+      # one issued — a second key here would reject every token the API handed out.
+      #
+      # config.Stream deliberately does NOT declare RequireJWT, so this is optional and
+      # an empty value is legal: market data is public (CLAUDE.md §6), so the gateway
+      # serves the whole board anonymously without it. What it loses is authenticated
+      # subscriptions and resume-on-reconnect keyed by the token's session claim. A
+      # token that IS presented with no key configured is refused, never accepted
+      # unverified — see cmd/stream/main.go's newVerifier.
+      SHARPLINE_JWT_SIGNING_KEY:
     depends_on: *go-deps
     # give in-flight WebSocket clients time to be told to resync elsewhere
     stop_grace_period: 20s
@@ -579,6 +590,26 @@ services:
     environment:
       # Name fixed by deploy/proxy/Caddyfile, which reads {$SHARPLINE_PROXY_HOST}.
       SHARPLINE_PROXY_HOST: ${SHARPLINE_PROXY_HOST:-sharpline.localhost}
+      # THE REQUIRED COUNTERPART TO THE Caddyfile's DEV-TOOLS GUARD, which names
+      # this file as its owner: "the proxy service must receive SHARPLINE_ENV […]
+      # Until it does, the proxy container has no SHARPLINE_ENV, the default
+      # `prod` applies, and these four routes stay 404 -- the safe direction, but
+      # also a non-working kafka-ui."
+      #
+      # That was the live state: /grafana, /prometheus, /jaeger and /_kafka-ui all
+      # answered 404, so the observability stack CLAUDE.md §9 requires could be
+      # scraped but never looked at -- and nothing failed to say so, because 404
+      # is what the guard is supposed to return when it is closed.
+      #
+      # The guard is UNCHANGED and still fails closed: the Caddyfile's default is
+      # `prod` and only the exact string "dev" opens the block, so a deployment
+      # that sets SHARPLINE_ENV=prod (or staging, or nothing at all in an
+      # environment that does not read this file) keeps the tooling dark. This
+      # line only forwards the value every Go service already receives through
+      # x-env-base, which is the point: there is no proxy-only switch anyone can
+      # flip in production, and flipping this one would put the whole stack into
+      # dev mode, loudly, everywhere.
+      SHARPLINE_ENV: ${SHARPLINE_ENV:-dev}
       # Only consumed once the Caddyfile is switched from `tls internal` to managed
       # certificates for a real deployment.
       SHARPLINE_ACME_EMAIL: ${SHARPLINE_ACME_EMAIL:-}
