@@ -233,11 +233,20 @@ jobs:
             echo "==> Starting persistent data plane (Postgres, Redis, Kafka)..."
             sudo docker compose --env-file .env --env-file .env.deploy -f deploy/compose/compose.yaml up -d postgres redis kafka
             
+            # -T and </dev/null are both load-bearing, and their absence is why
+            # every rollout before this one silently stopped HERE.
+            #
+            # This whole script is delivered to `bash -s` on STDIN. `docker compose
+            # run` allocates a TTY and reads STDIN, so it consumed the remainder of
+            # the script: the service rollout and the readiness probe below never
+            # ran, bash reached EOF, and the step exited 0. The deploy reported
+            # success with only postgres, redis and kafka running and nothing
+            # listening on :80.
             echo "==> Running database schema migrations..."
-            sudo docker compose --env-file .env --env-file .env.deploy -f deploy/compose/compose.yaml run --rm migrate
+            sudo docker compose --env-file .env --env-file .env.deploy -f deploy/compose/compose.yaml run --rm -T migrate < /dev/null
             
             echo "==> Rolling out all platform microservices..."
-            sudo docker compose --env-file .env --env-file .env.deploy -f deploy/compose/compose.yaml up -d --remove-orphans
+            sudo docker compose --env-file .env --env-file .env.deploy -f deploy/compose/compose.yaml up -d --remove-orphans < /dev/null
             
             echo "==> Probing service readiness..."
             for i in $(seq 1 30); do
