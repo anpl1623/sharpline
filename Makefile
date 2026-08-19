@@ -230,6 +230,32 @@ endif
 export DOCKER_SOCKET
 
 RYUK_DISABLED ?= false
+
+# GO_TEST_P caps how many package test BINARIES run at once. It is not a tuning
+# knob, it is a correctness one.
+#
+# Seven packages now stand up real containers (auth/pgstore, auth/redisguard,
+# httpapi/pgstore, ingest/writer, platform/postgres, platform/redis,
+# test/integration). `go test ./...` runs package binaries concurrently, each is
+# its own process, and each process starts its own Ryuk reaper. testcontainers-go
+# v0.44.0 resolves that collision by having the losers WAIT on the winner's reaper
+# container -- but the wait strategy treats any non-running status as terminal, so
+# a reaper still in "created" fails the whole package with
+#   reaper: wait for reaper <id>: unexpected container status "created"
+# It surfaced on a DIFFERENT package on each run, which is what a thundering herd
+# looks like rather than a defect in any one test.
+#
+# Two other fixes were considered and rejected. TESTCONTAINERS_RYUK_DISABLED=true
+# removes the race by removing the reaper, but the reaper is the only thing that
+# cleans up after a panicking or killed test run, and this project has already had
+# the Docker VM reach 100% disk once. Retrying is not available: the failure is
+# inside testcontainers' own reaper bootstrap, not in code we call.
+#
+# Serialising the binaries keeps Ryuk and makes the race impossible. t.Parallel()
+# inside a package is unaffected, so the cost is only the loss of cross-package
+# overlap. Set GO_TEST_P= (empty) to restore Go's default if the upstream bug is
+# ever fixed.
+GO_TEST_P ?= -p 1
 DOCKER_TESTCONTAINERS_FLAGS = \
 	-v $(DOCKER_SOCKET):/var/run/docker.sock \
 	--add-host host.docker.internal:host-gateway \
@@ -271,6 +297,12 @@ MIGRATE_DRYRUN_WAIT     ?= 90
 SQLC_GEN_DIR           ?= internal/platform/postgres/gen
 OPENAPI_SPEC           ?= internal/httpapi/openapi.yaml
 OPENAPI_CODEGEN_CONFIG ?= internal/httpapi/oapi-codegen.yaml
+OPENAPI_SERVER_OUT     ?= internal/httpapi/gen/types.gen.go
+# pkg/client is generated from the SAME spec by a second config, because it is a
+# public SDK and must not import internal/. Both are drift-checked; a spec change
+# that regenerates one and not the other is exactly the drift this gate exists for.
+CLIENT_CODEGEN_CONFIG  ?= pkg/client/oapi-codegen.yaml
+CLIENT_OUT             ?= pkg/client/types.gen.go
 
 # `query-plans` scaffolding. Deliberately NOT sharing the MIGRATE_DRYRUN_* names or
 # container names, so the two targets can run concurrently and neither can destroy
@@ -805,7 +837,7 @@ test: cache-init docker-socket ## Run the Go suite in a container (ARGS='-v -run
 	  $(DOCKER_GO_FLAGS) \
 	  $(DOCKER_TESTCONTAINERS_FLAGS) \
 	  $(GO_IMAGE) \
-	  go test -count=1 $(ARGS) $(PKG)
+	  go test -count=1 $(GO_TEST_P) $(ARGS) $(PKG)
 
 # The flags reach `go test` as POSITIONAL PARAMETERS rather than being interpolated
 # into the `sh -c` script, and that is not stylistic. Interpolating them would put
@@ -822,7 +854,7 @@ test-race: cache-init docker-socket ## Run the suite under the race detector (AR
 	  -e CGO_ENABLED=1 \
 	  $(GO_IMAGE) \
 	  sh -c 'apk add --no-cache gcc musl-dev >/dev/null && exec go test -race -count=1 "$$@"' \
-	    go-test $(ARGS) $(PKG)
+	    go-test $(GO_TEST_P) $(ARGS) $(PKG)
 
 # Coverage thresholds, from CLAUDE.md section 10: "Coverage target 80% overall, and
 # effectively 100% on internal/domain/odds." They are ENFORCED here, not merely
@@ -949,7 +981,7 @@ cover: cache-init docker-socket ## Coverage: per-package rollup + HTML, cross-pa
 	  $(DOCKER_GO_FLAGS) \
 	  $(DOCKER_TESTCONTAINERS_FLAGS) \
 	  $(GO_IMAGE) \
-	  sh -c 'go test -count=1 -covermode=atomic -coverpkg=$(COVER_PKGS) -coverprofile=/tmp/coverage.out $(ARGS) $(PKG) && cp /tmp/coverage.out /src/coverage.out'
+	  sh -c 'go test -count=1 $(GO_TEST_P) -covermode=atomic -coverpkg=$(COVER_PKGS) -coverprofile=/tmp/coverage.out $(ARGS) $(PKG) && cp /tmp/coverage.out /src/coverage.out'
 	docker run --rm $(DOCKER_GO_FLAGS) $(GO_IMAGE) go tool cover -func=coverage.out
 	docker run --rm $(DOCKER_GO_FLAGS) $(GO_IMAGE) go tool cover -html=coverage.out -o coverage.html
 	@docker run --rm $(DOCKER_GO_FLAGS) $(GO_IMAGE) awk \
@@ -1142,7 +1174,8 @@ codegen-openapi: cache-init build-tools ## Generate server + client stubs from t
 	  exit 0; \
 	fi; \
 	docker run --rm $(DOCKER_AS_USER) $(DOCKER_TOOLS_FLAGS) $(TOOLS_IMAGE) \
-	  oapi-codegen -config $(OPENAPI_CODEGEN_CONFIG) $(OPENAPI_SPEC)
+	  sh -c 'oapi-codegen -config $(OPENAPI_CODEGEN_CONFIG) $(OPENAPI_SPEC) && \
+	         oapi-codegen -config $(CLIENT_CODEGEN_CONFIG) $(OPENAPI_SPEC)'
 
 .PHONY: openapi
 openapi: codegen-openapi ## Regenerate the OpenAPI server/client artifacts
@@ -1181,15 +1214,34 @@ codegen-check-sqlc: cache-init build-tools ## Fail if internal/platform/postgres
 # quietly leaving a second generator outside the drift gate forever.
 .PHONY: codegen-check-openapi
 codegen-check-openapi: ## Fail if the OpenAPI generator has landed but is not drift-checked
-	@if [ -f "$(OPENAPI_SPEC)" ]; then \
-	  printf 'FAIL  %s now exists, so the OpenAPI generator produces committed\n' '$(OPENAPI_SPEC)'; \
-	  printf '      output -- but codegen-check does not compare it yet.\n'; \
-	  printf '      Extend codegen-check-openapi: generate with -o pointed at a temporary\n'; \
-	  printf '      file inside the container, then `diff -u` it against the output path\n'; \
-	  printf '      %s names -- the same shape as codegen-check-sqlc.\n' '$(OPENAPI_CODEGEN_CONFIG)'; \
-	  exit 1; \
+	@if [ ! -f "$(OPENAPI_SPEC)" ]; then \
+	  printf 'OK  openapi: no spec yet (CLAUDE.md section 11, phase 5), so no committed output to drift.\n'; \
+	  exit 0; \
 	fi; \
-	printf 'OK  openapi: no spec yet (phase 5), so no committed output to drift.\n'
+	printf '==> codegen drift: committed OpenAPI output vs. a fresh generate\n'; \
+	docker run --rm $(DOCKER_AS_USER) $(DOCKER_TOOLS_FLAGS) $(TOOLS_IMAGE) \
+	  sh -c 'set -e; \
+	         tmp=$$(mktemp -d); \
+	         trap "rm -rf $$tmp" EXIT; \
+	         fail=0; \
+	         sed "s#^output:.*#output: $$tmp/server.go#" $(OPENAPI_CODEGEN_CONFIG) > "$$tmp/server.yaml"; \
+	         oapi-codegen -config "$$tmp/server.yaml" $(OPENAPI_SPEC); \
+	         if diff -u "$(OPENAPI_SERVER_OUT)" "$$tmp/server.go"; then \
+	           printf "OK  openapi server: %s matches the spec.\n" "$(OPENAPI_SERVER_OUT)"; \
+	         else \
+	           printf "\nFAIL  %s is stale.\n" "$(OPENAPI_SERVER_OUT)"; fail=1; \
+	         fi; \
+	         sed "s#^output:.*#output: $$tmp/client.go#" $(CLIENT_CODEGEN_CONFIG) > "$$tmp/client.yaml"; \
+	         oapi-codegen -config "$$tmp/client.yaml" $(OPENAPI_SPEC); \
+	         if diff -u "$(CLIENT_OUT)" "$$tmp/client.go"; then \
+	           printf "OK  openapi client: %s matches the spec.\n" "$(CLIENT_OUT)"; \
+	         else \
+	           printf "\nFAIL  %s is stale.\n" "$(CLIENT_OUT)"; fail=1; \
+	         fi; \
+	         if [ "$$fail" -ne 0 ]; then \
+	           printf "      Run: make codegen-openapi   (then commit the regenerated files)\n"; \
+	           exit 1; \
+	         fi'
 
 # -----------------------------------------------------------------------------
 # Query plans -- proves each sqlc query uses an index, against a real database

@@ -142,6 +142,12 @@ sql:
       - internal/platform/postgres/queries/catalogue.sql
       - internal/platform/postgres/queries/prices.sql
       - internal/platform/postgres/queries/betting.sql
+      # Phase 5. The REST API's own reads: keyset-paginated board and search,
+      # downsampled line history, the account/limits surface and the audit-log
+      # write. Separate from catalogue.sql because these queries have ONE
+      # consumer, where catalogue.sql's are shared with ingest's polling
+      # scheduler and must not grow the API's pagination parameters.
+      - internal/platform/postgres/queries/api.sql
 
     gen:
       go:

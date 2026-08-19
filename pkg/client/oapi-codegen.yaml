@@ -1,0 +1,73 @@
+# =============================================================================
+# oapi-codegen configuration -- OpenAPI -> Go wire types for the PUBLIC SDK
+# =============================================================================
+#
+# This is the SECOND generator run over internal/httpapi/openapi.yaml. The first
+# (internal/httpapi/oapi-codegen.yaml) emits the same schemas into
+# internal/httpapi/gen for the handlers to construct. This one emits them into
+# package `client`.
+#
+# WHY THE TYPES ARE GENERATED TWICE RATHER THAN SHARED
+# ----------------------------------------------------
+# pkg/client is the one package in this repository that is a PUBLIC API
+# (CLAUDE.md section 8: "exported Go SDK for the public API"). Go forbids any
+# module outside github.com/anpl1623/sharpline from importing an `internal/`
+# package, so an SDK whose types live in internal/httpapi/gen is an SDK nobody
+# outside this repository can compile against -- which defeats the entire point
+# of shipping one.
+#
+# The two remaining options were both worse:
+#
+#   * Promote the wire types out of internal/ into pkg/. That makes the
+#     handlers' construction types part of the public API surface, so a change
+#     the handlers need becomes a breaking change for every SDK consumer. The
+#     server's internal representation and the client's contract should be free
+#     to be the same by construction without being the same package.
+#
+#   * Hand-write the types in pkg/client. Then the SDK is a transcription of
+#     the spec, and a transcription drifts. Nothing would catch a renamed field
+#     until a caller got a zero value at runtime.
+#
+# Generating twice from ONE spec keeps both packages honest against the same
+# source. `make codegen-check-openapi` is what proves the committed output on
+# both sides still matches it; extending that target to cover this path as well
+# is a Makefile change requested alongside this file.
+#
+# The other half of the SDK -- the client, the typed errors, the retry policy,
+# and the refresh-token rotation with its single-flight guard -- is deliberately
+# NOT generated. A generated client returns an untyped response envelope per
+# operation and has no concept of a rotating credential; the ergonomics are the
+# deliverable here, and they are hand-written for the same reason the handlers
+# are.
+# =============================================================================
+
+package: client
+
+output: pkg/client/types.gen.go
+
+generate:
+  models: true
+
+output-options:
+  # Every schema in components is part of the published contract, including the
+  # ones only reachable through a $ref. Pruning would make the SDK quietly
+  # narrower than the spec it is generated from.
+  skip-prune: true
+  skip-fmt: false
+
+compatibility:
+  # PREFIX EVERY ENUM CONSTANT WITH ITS TYPE, unconditionally.
+  #
+  # By default oapi-codegen drops the type prefix when a value's name is unique
+  # across the whole spec, which is fine inside a server package and wrong in a
+  # published SDK: it exports `client.Total`, `client.Spread`, `client.Future`,
+  # `client.Decimal`, `client.Bearer` and `client.Synthetic` into a caller's
+  # namespace as bare, unqualified nouns that say nothing about what they are.
+  # `client.MarketTypeTotal` reads as what it is at the call site.
+  #
+  # It also removes a latent break: the unprefixed spelling depends on a value
+  # being unique ACROSS THE SPEC, so adding an unrelated enum elsewhere that
+  # happens to reuse one of those words silently renames a public constant. The
+  # server's own generated package keeps the default, because nothing outside
+  # this repository names its identifiers.
+  always-prefix-enum-values: true

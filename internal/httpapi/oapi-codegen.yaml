@@ -1,0 +1,68 @@
+# =============================================================================
+# oapi-codegen configuration -- OpenAPI -> Go wire types
+# =============================================================================
+#
+# Driven by `make codegen-openapi`, which runs oapi-codegen v2.8.0 inside the
+# tools image. Never run a host `oapi-codegen`; the prime directive has no
+# exception for code generators.
+#
+# WHY `models` AND NOTHING ELSE
+# -----------------------------
+# oapi-codegen can also emit a server interface (chi / echo / gin / std-http), a
+# client, and a base64-gzipped copy of the spec. All three are declined:
+#
+#   * Every server mode and the client mode import
+#     github.com/oapi-codegen/runtime for parameter binding, and the non-std
+#     server modes import a third-party router as well. Go 1.22's net/http
+#     ServeMux already does method-and-wildcard routing ("GET /events/{eventId}"),
+#     so the generated router would buy nothing and cost two dependencies in a
+#     module that currently has none for the serving path.
+#
+#   * `embedded-spec` imports github.com/getkin/kin-openapi to inflate the spec
+#     at init time. internal/httpapi serves the YAML file straight from an
+#     embed.FS instead, which is fewer moving parts and cannot disagree with the
+#     file `make codegen-check-openapi` diffs.
+#
+# What is NOT declined is the part that actually enforces the contract: the
+# response and request STRUCTS. Handlers construct these types and nothing else,
+# so a field that is not in the spec cannot be serialised -- it does not exist in
+# Go. Adding, renaming or retyping a wire field is a change to openapi.yaml
+# followed by a regenerate, or it is a compile error.
+#
+# The generated file is COMMITTED, for the same reason internal/platform/postgres/gen
+# is: `make build` then has no codegen step, and a reviewer can read the wire
+# shape in the diff. The cost of committing generated code is drift, and
+# `make codegen-check-openapi` is what pays it.
+# =============================================================================
+
+package: gen
+
+# One file, named for what it is. The `.gen.go` suffix is what golangci-lint's
+# `issues.exclude-generated` and `gofmt`-adjacent tooling key on, and it makes
+# "do not edit this by hand" visible in a file listing.
+output: internal/httpapi/gen/types.gen.go
+
+generate:
+  models: true
+
+output-options:
+  # NO name-normalizer. The default emits `Id`, `BookId`, `RequestId` and
+  # `ProvisioningUri` rather than Go's initialism spelling, which is uglier --
+  # and it stays, because the alternative was worse. Switching to
+  # `ToCamelCaseWithInitialisms` renames a field in every committed call site at
+  # once, and internal/httpapi/server.go (composition root) and cmd/api are
+  # written against the current names. A cosmetic rename that breaks two files
+  # outside this generator's own output is a change to schedule deliberately,
+  # not one to make in passing. If it is ever made, it is one commit that
+  # regenerates and fixes every reference together.
+
+  # Do not drop schemas that no operation references directly. Every schema in
+  # components is part of the published contract -- pkg/client and the Next.js
+  # frontend both name types the paths only reach through a $ref -- and pruning
+  # would make the generated package quietly narrower than the spec it is
+  # generated from.
+  skip-prune: true
+
+  # Emit the same "Code generated ... DO NOT EDIT." preamble sqlc does, so both
+  # generated trees are recognised by the same tooling.
+  skip-fmt: false
