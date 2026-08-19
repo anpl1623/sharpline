@@ -77,7 +77,8 @@ Explicitly decided, because the temptation will recur: FanDuel runs Java, and a 
 
 Where Java would normally appear is Flink jobs. Those are written as **Flink SQL** instead (see §3), which is declarative and language-free, with PyFlink for UDFs if SQL runs out. Full streaming capability, zero JVM code in the repository.
 
-**Frontend:** TypeScript + Next.js 15 (App Router). Not negotiable — the UI is the part a recruiter actually looks at.
+**Frontend:** TypeScript + Next.js 16 (App Router). Not negotiable — the UI is the part a recruiter actually looks at.
+(Originally pinned to 15; moved to 16 on 2026-08-19 — see ADR 0007.)
 
 **Python** earns a place in exactly two spots: Locust load tests, and the backtesting / quant notebooks under `analysis/`. Never in the serving path.
 
@@ -196,7 +197,7 @@ Ordered roughly by build sequence, not by importance.
 
 ## 7. Frontend
 
-Next.js 15 App Router, TypeScript strict, Tailwind, shadcn/ui, TanStack Query for REST, a purpose-built WebSocket client (reconnect with jittered backoff, sequence-gap resync, offline banner), Zustand for slip state.
+Next.js 16 App Router, TypeScript strict, Tailwind, shadcn/ui, TanStack Query for REST, a purpose-built WebSocket client (reconnect with jittered backoff, sequence-gap resync, offline banner), Zustand for slip state.
 
 **Containerized in both dev and prod — no `npm run dev` on the host.**
 
@@ -381,7 +382,7 @@ The project's framing is parity with FanDuel's public stack. Where this charter 
 | FanDuel | Here | Note |
 |---|---|---|
 | Kubernetes | Yes | Practices, not their 100+ cluster scale |
-| React | Yes | via Next.js 15 |
+| React | Yes | via Next.js 16 |
 | TypeScript | Yes | Frontend, strict mode |
 | Helm | Yes | Sole deploy path |
 | Terraform | Yes | Cluster, topics, dashboards |

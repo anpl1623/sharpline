@@ -3,8 +3,14 @@
 # ==============================================================================
 #
 # Rolls out the full Sharpline stack (Postgres/TimescaleDB, Kafka KRaft, Redis,
-# 6 Go microservices, Next.js 15 Standalone, and Caddy Edge Proxy) to the
-# cloud virtual machine with zero downtime and automated health verification.
+# 6 Go microservices, Next.js Standalone, and Caddy Edge Proxy) to the cloud
+# virtual machine, with automated health verification.
+#
+# NOT zero downtime, and it should not claim to be: the stack is stopped and
+# recreated on every rollout, because compose must be free to recreate the
+# project network when its definition changes. Named volumes persist, so data
+# survives. Zero-downtime rollout is what the Kubernetes work in CLAUDE.md §11
+# phase 10 is for; a single-VM compose deploy cannot honestly promise it.
 #
 # Required Secrets (Settings > Secrets and variables > Actions):
 #   GCP_VM_HOST        -- IP or hostname of the VM (e.g. 34.56.164.139)
@@ -179,6 +185,21 @@ jobs:
               echo "::error::exceeded the job timeout, and a silent rebuild would hide this."
               exit 1
             fi
+            
+            # Stop the previous stack before starting the new one.
+            #
+            # compose recreates the project network whenever its definition
+            # changes, and it cannot do that while the previous deploy's
+            # containers are still attached:
+            #   network sharpline has active endpoints (sharpline-api-1, ...)
+            # which is exactly how this failed once the network gained a pinned
+            # subnet and a static proxy address.
+            #
+            # No -v. Named volumes carry Postgres, Redis and Kafka state and must
+            # survive a rollout; `down -v` here would silently destroy the
+            # database on every deploy.
+            echo "==> Stopping the previous stack (named volumes preserved)..."
+            sudo docker compose --env-file .env --env-file .env.deploy -f deploy/compose/compose.yaml down --remove-orphans || true
             
             echo "==> Starting persistent data plane (Postgres, Redis, Kafka)..."
             sudo docker compose --env-file .env --env-file .env.deploy -f deploy/compose/compose.yaml up -d postgres redis kafka

@@ -406,7 +406,7 @@ matches, where it defers, and where it diverges on purpose.
 | FanDuel | Here | Note |
 |---|---|---|
 | Kubernetes | Yes | Practices, not their 100+ cluster scale |
-| React | Yes | via Next.js 15 |
+| React | Yes | via Next.js 16 |
 | TypeScript | Yes | Frontend, strict mode |
 | Helm | Yes | Sole deploy path |
 | Terraform | Yes | Cluster, topics, dashboards |
