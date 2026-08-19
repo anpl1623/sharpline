@@ -523,6 +523,27 @@ up: env ## Bring up the full stack (proxy is the only published port)
 	$(COMPOSE) up --detach --build --remove-orphans --wait postgres redis kafka
 	@$(MAKE) --no-print-directory topics
 	$(COMPOSE) up --detach --build --remove-orphans
+	@# WHY A SECOND, SCOPED --wait RATHER THAN --wait ON THE LINE ABOVE.
+	@#
+	@# The line above must CREATE every service, `migrate` included. `migrate`
+	@# is restart:"no" and runs to completion, and `--wait` treats a container
+	@# that has exited as a failed wait -- so waiting on the whole project would
+	@# fail on the one service whose exit is the success condition.
+	@#
+	@# But with no wait at all, `up` returns the moment the containers are
+	@# CREATED and reports success no matter what they do next. That is not
+	@# hypothetical: it is how this stack produced a green `make up` while
+	@# `ingest` was crash-looping on a fatal config error, restarting roughly
+	@# once a second and moving no data at all. A target that says OK while the
+	@# pipeline is dead is worse than one that fails, because the next thing
+	@# anyone does is trust it.
+	@#
+	@# So every LONG-RUNNING service is waited on explicitly. Each carries a
+	@# healthcheck, so this blocks until they are genuinely healthy and exits
+	@# non-zero if one dies or never gets there. The timeout bounds a crash
+	@# loop, which otherwise never reaches a steady state to wait for.
+	$(COMPOSE) up --detach --no-build --wait --wait-timeout 180 \
+	  postgres redis kafka api ingest pricer stream settle web proxy
 	$(COMPOSE) ps
 
 .PHONY: topics

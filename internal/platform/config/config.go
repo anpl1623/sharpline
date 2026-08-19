@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -52,6 +53,49 @@ const (
 	EnvJWTSigningKey = "SHARPLINE_JWT_SIGNING_KEY"
 	EnvOddsAPIKey    = "ODDS_API_KEY"
 	EnvSyntheticSeed = "SHARPLINE_SYNTHETIC_SEED"
+
+	// EnvTrustedProxies is the comma-separated set of CIDRs (or bare
+	// addresses) whose forwarding headers this service may believe.
+	//
+	// It exists because CLAUDE.md §6 requires per-IP rate limiting and a
+	// per-IP limiter is only as good as its idea of the client's IP. Behind
+	// the Caddy proxy, RemoteAddr is the PROXY, so with no trusted set every
+	// request in the system buckets on one address and one client exhausts the
+	// limit for everybody. Trust the header unconditionally instead and the
+	// control evaporates the other way: any caller picks its own bucket by
+	// sending a different X-Forwarded-For.
+	//
+	// So it is DEPLOYMENT CONFIGURATION, not a default this binary can guess.
+	// Set it to exactly the hop in front of the service — the compose bridge
+	// subnet, or the ingress controller's pod CIDR — and nothing else. Never a
+	// blanket private-range list: on a shared bridge network "trust RFC1918"
+	// means "trust every container", which is every container that could be
+	// compromised.
+	//
+	// Empty is valid and means "believe nobody", which is the correct and safe
+	// behaviour for a service addressed directly.
+	EnvTrustedProxies = "SHARPLINE_TRUSTED_PROXIES"
+
+	// EnvTOTPKeyring is the AEAD keyring that seals TOTP shared secrets at
+	// rest, in auth.ParseKeyring's frozen `id:base64key[,id:base64key...]`
+	// format, most recent key FIRST.
+	//
+	// It is separate from EnvJWTSigningKey and must stay separate. The JWT key
+	// signs short-lived bearer tokens and can be rotated at will — every token
+	// under the old key expires within minutes. This key DECRYPTS DATA AT REST,
+	// so losing it means every enrolled second factor becomes permanently
+	// unopenable and every one of those users is locked out of their account.
+	// One variable serving both purposes guarantees that the safe rotation
+	// cadence for one is the catastrophic one for the other.
+	//
+	// OPTIONAL. Unset means no keyring, which means TOTP enrolment is refused
+	// rather than performed without encryption — migrations/00005 requires
+	// user_totp to hold ciphertext, and a service that stored a bare shared
+	// secret because a variable was missing would be a silent downgrade of the
+	// one credential that must never be readable from a database dump.
+	// Password login, refresh rotation and the whole read surface are
+	// unaffected.
+	EnvTOTPKeyring = "SHARPLINE_TOTP_KEYRING"
 
 	// EnvPricerReferenceBooks is the ORDERED, comma-separated list of book slugs
 	// `pricer` treats as the sharp reference, most preferred first.
@@ -234,6 +278,18 @@ type Config struct {
 
 	JWTSigningKey string
 
+	// TrustedProxies is the parsed EnvTrustedProxies set, in the order given.
+	// Nil means no peer's forwarding header is believed. See EnvTrustedProxies
+	// for why this has no default.
+	TrustedProxies []string
+
+	// TOTPKeyring is the raw EnvTOTPKeyring spec, unparsed. Empty means no
+	// keyring; see EnvTOTPKeyring. It is a string rather than a parsed
+	// *auth.Keyring because internal/platform must not import internal/auth,
+	// and because parsing it here would put key material in a struct that is
+	// logged (LogValue below reports only whether it is set).
+	TOTPKeyring string
+
 	// OddsAPIKey selects the ingest provider adapter: the real The Odds API
 	// adapter when set, the synthetic stochastic market maker when not.
 	OddsAPIKey string
@@ -272,6 +328,12 @@ func (c Config) LogValue() slog.Value {
 		slog.Any("kafka_brokers", c.KafkaBrokers),
 		slog.String("otel_endpoint", c.OTELEndpoint),
 		slog.Bool("jwt_signing_key_set", c.JWTSigningKey != ""),
+		// Both of the next two report PRESENCE only. The keyring is key
+		// material and the trusted set is small enough to print, but printing
+		// the latter and not the former would invite someone to "make it
+		// consistent" in the wrong direction.
+		slog.Bool("totp_keyring_set", c.TOTPKeyring != ""),
+		slog.Int("trusted_proxies", len(c.TrustedProxies)),
 		slog.Bool("odds_api_key_set", c.OddsAPIKey != ""),
 		slog.Int64("synthetic_seed", c.SyntheticSeed),
 		slog.String("ingest_live_interval", c.IngestLiveInterval.String()),
@@ -388,6 +450,39 @@ func LoadFrom(spec Spec, lookup Lookup) (*Config, error) {
 				ErrInvalid, EnvJWTSigningKey, len(cfg.JWTSigningKey), minJWTKeyLen))
 		}
 	}
+
+	// SHARPLINE_TRUSTED_PROXIES — always optional; empty means believe nobody.
+	//
+	// Validated HERE rather than only where it is consumed, so a typo in a CIDR
+	// is a refusal to start (CLAUDE.md §12: "fail fast and loudly on a bad
+	// config") rather than a limiter that silently falls back to bucketing the
+	// whole internet under the proxy's address. A rate-limiting control that
+	// degrades quietly is the one that is never noticed.
+	if raw := strings.TrimSpace(get(lookup, EnvTrustedProxies, "")); raw != "" {
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			// A bare address is accepted and means that single host; anything
+			// else must be a CIDR. Both forms are kept verbatim so the consumer
+			// parses exactly the string the operator wrote.
+			if _, err := netip.ParsePrefix(part); err != nil {
+				if _, err := netip.ParseAddr(part); err != nil {
+					problems = append(problems, fmt.Errorf(
+						"%w: %s=%q: %q is neither a CIDR nor an IP address",
+						ErrInvalid, EnvTrustedProxies, raw, part))
+					continue
+				}
+			}
+			cfg.TrustedProxies = append(cfg.TrustedProxies, part)
+		}
+	}
+
+	// SHARPLINE_TOTP_KEYRING — always optional. Parsed by the consumer
+	// (auth.ParseKeyring) rather than here, so key material never lands in this
+	// struct in decoded form.
+	cfg.TOTPKeyring = strings.TrimSpace(get(lookup, EnvTOTPKeyring, ""))
 
 	// SHARPLINE_OTEL_ENDPOINT — always optional; empty disables export.
 	cfg.OTELEndpoint = strings.TrimSpace(get(lookup, EnvOTELEndpoint, ""))

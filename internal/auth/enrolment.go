@@ -228,6 +228,65 @@ func (s *Service) DisableTOTP(ctx context.Context, id domain.UserID, password Se
 		return ErrTOTPNotEnrolled
 	}
 
+	return s.removeSecondFactor(ctx, id)
+}
+
+// DisableTOTPWithCode removes a second factor on proof of a CURRENTLY-VALID
+// code from the factor being removed.
+//
+// # Why this exists alongside [Service.DisableTOTP]
+//
+// The two prove different things and both are legitimate step-ups. A password
+// proves knowledge of the account credential; a live TOTP code proves
+// POSSESSION of the authenticator. internal/httpapi/openapi.yaml is the
+// contract of record for the HTTP surface and it chose possession for
+// `DELETE /account/totp`: "requires a currently-valid code from the factor
+// being removed, so that a stolen access token alone cannot strip the second
+// factor."
+//
+// That is the stronger property for this particular action. Removing 2FA is
+// exactly the move an attacker holding a stolen access token AND a phished
+// password would make; requiring the factor itself is the one check neither of
+// those gets them past.
+//
+// The code goes through the same [Service.consumeTOTPCode] path a login does,
+// so the accepted window, the skew policy and — critically — the replay guard
+// all apply identically. A code burnt logging in cannot then be spent removing
+// the factor.
+//
+// A RECOVERY code is deliberately NOT accepted here. Recovery codes exist to
+// get a user past a lost authenticator into their account; letting one also
+// strip the factor would mean a single leaked recovery code both bypasses 2FA
+// and permanently disables it, with nothing left to notice.
+func (s *Service) DisableTOTPWithCode(ctx context.Context, id domain.UserID, code string) error {
+	rec, found, err := s.store.LoadTOTP(ctx, id)
+	if err != nil {
+		return fmt.Errorf("auth: load second factor: %w", err)
+	}
+	if !found {
+		return ErrTOTPNotEnrolled
+	}
+
+	// An UNCONFIRMED enrolment is removable on proof of a code from it too: the
+	// secret is real and the code validates against it, so possession is
+	// proven just as well. Refusing here would strand a user who began an
+	// enrolment, scanned it, and then changed their mind — with no way to start
+	// a different one, because BeginTOTPEnrolment refuses while a row exists.
+	if err := s.consumeTOTPCode(ctx, id, rec, code); err != nil {
+		return err
+	}
+
+	return s.removeSecondFactor(ctx, id)
+}
+
+// removeSecondFactor performs the deletion both disable paths share, AFTER
+// each has proven whatever it requires.
+//
+// Factored out so the two step-ups cannot drift in what they actually delete.
+// The one thing that must not be forgotten is the recovery codes: leaving them
+// behind produces a "disabled" second factor whose bypass still works, which is
+// worse than either state on its own because nothing in the UI would show it.
+func (s *Service) removeSecondFactor(ctx context.Context, id domain.UserID) error {
 	if err := s.store.DeleteTOTP(ctx, id); err != nil {
 		return fmt.Errorf("auth: remove second factor: %w", err)
 	}

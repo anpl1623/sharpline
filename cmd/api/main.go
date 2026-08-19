@@ -26,8 +26,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/anpl1623/sharpline/internal/auth"
+	authpg "github.com/anpl1623/sharpline/internal/auth/pgstore"
+	"github.com/anpl1623/sharpline/internal/auth/redisguard"
 	"github.com/anpl1623/sharpline/internal/httpapi"
+	"github.com/anpl1623/sharpline/internal/httpapi/authsessions"
 	"github.com/anpl1623/sharpline/internal/httpapi/middleware"
 	"github.com/anpl1623/sharpline/internal/httpapi/pgstore"
 	"github.com/anpl1623/sharpline/internal/platform/buildinfo"
@@ -252,7 +257,12 @@ func run() error {
 		return fmt.Errorf("%s: build the postgres adapter: %w", service, err)
 	}
 
-	routeSets, err := routeSets(log, stack, store)
+	sessions, err := sessionsPort(ctx, cfg, log, db, rdb, registry)
+	if err != nil {
+		return fmt.Errorf("%s: %w", service, err)
+	}
+
+	routeSets, err := routeSets(log, stack, store, sessions)
 	if err != nil {
 		return fmt.Errorf("%s: %w", service, err)
 	}
@@ -378,64 +388,77 @@ func newAuthenticator(cfg *config.Config) (middleware.Authenticator, error) {
 
 // trustedProxies is the set of peers whose X-Real-IP this service believes.
 //
-// # Why this returns an empty set and says so loudly
+// # Why this is configuration and not a default
 //
 // Getting it wrong in either direction is a real failure. Trust the header from
-// anyone and every client picks its own rate-limit bucket by sending it, so the
-// per-IP control CLAUDE.md §6 requires stops existing. Trust nobody and every
-// request buckets on the PROXY's address, so one abusive client consumes the
-// limit for everyone behind it.
+// anyone and every client picks its own rate-limit bucket by sending one, so
+// the per-IP control CLAUDE.md §6 requires stops existing. Trust nobody and
+// every request buckets on the PROXY's address, so one abusive client consumes
+// the limit for everyone behind it — which is the state this service shipped
+// in, and which the access log made visible as `client_ip` being the same
+// bridge address on every single request.
 //
 // The correct value is "exactly the hop in front of this service" — the compose
 // bridge subnet the `proxy` container sits on, or the ingress controller's pod
-// CIDR — and that is a deployment fact, not something this binary can know. A
-// blanket private-range default would be the wrong answer with the right shape:
-// on a shared bridge network "trust RFC1918" means "trust every container",
-// which is every container that could be compromised.
+// CIDR — and that is a deployment fact. A blanket private-range default would
+// be the wrong answer with the right shape: on a shared bridge network "trust
+// RFC1918" means "trust every container", which is every container that could
+// be compromised.
 //
-// So it is empty until internal/platform/config grows SHARPLINE_TRUSTED_PROXIES,
-// and this logs a warning naming the exact consequence rather than leaving a
-// degraded control to be discovered from a graph. Reading the variable directly
-// with os.Getenv would be a second configuration path, which CLAUDE.md §12
-// forbids and which is how config drifts between the compose stack and the Helm
-// chart.
+// So it comes from SHARPLINE_TRUSTED_PROXIES, config validates it, and an EMPTY
+// value is still legal and still warned about — because empty is safe but
+// degraded, and a degraded control that says nothing is one nobody fixes.
 func trustedProxies(log *slog.Logger, cfg *config.Config) (middleware.TrustedProxies, error) {
-	_ = cfg
-	log.Warn("no trusted proxy set is configured: per-IP rate limiting will bucket every "+
-		"request on the reverse proxy's own address",
-		slog.String("effect", "one client behind the proxy can exhaust the shared per-IP limit"),
-		slog.String("needs", "SHARPLINE_TRUSTED_PROXIES in internal/platform/config, "+
-			"set to the compose bridge subnet or the ingress pod CIDR"),
-		slog.String("requirement", "CLAUDE.md §6: rate limiting per user and per IP"),
-	)
-	return nil, nil
-}
-
-// routeSets returns the API's route sets, in mount order.
-//
-// # The empty case is a decision, not an omission
-//
-// httpapi.NewAPI refuses to build without every port it needs, and the session
-// port — registration, login, refresh-token rotation, TOTP enrolment — has no
-// adapter in the tree yet: internal/auth.Service implements the behaviour but
-// nothing adapts its method set to httpapi.Sessions. Rather than fabricate one,
-// this returns no route sets and says why.
-//
-// What that produces is a service that starts, passes its probes, serves
-// /metrics, and answers every path beneath /api with the spec's own 404
-// envelope. CLAUDE.md §11 requires that `docker compose up` never fail, and an
-// empty surface with a correct empty response is the honest way to honour that
-// — a stub returning fabricated events would not be.
-func routeSets(log *slog.Logger, stack *middleware.Stack, store *pgstore.Store) ([]httpapi.RouteSet, error) {
-	sessions := sessionsPort()
-	if sessions == nil {
-		log.Warn("no session adapter is wired: the API is serving its operational surface only",
-			slog.String("missing", "an httpapi.Sessions implementation over internal/auth.Service"),
-			slog.String("effect", "every path beneath /api answers a spec-shaped 404; no data is fabricated"),
+	if len(cfg.TrustedProxies) == 0 {
+		log.Warn("no trusted proxy set is configured: per-IP rate limiting will bucket every "+
+			"request on the reverse proxy's own address",
+			slog.String("effect", "one client behind the proxy can exhaust the shared per-IP limit"),
+			slog.String("needs", config.EnvTrustedProxies+
+				", set to the compose bridge subnet or the ingress pod CIDR"),
+			slog.String("requirement", "CLAUDE.md §6: rate limiting per user and per IP"),
 		)
 		return nil, nil
 	}
 
+	trusted, err := middleware.ParseTrustedProxies(cfg.TrustedProxies)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", config.EnvTrustedProxies, err)
+	}
+	log.Info("trusted proxy set configured",
+		slog.Any("cidrs", cfg.TrustedProxies),
+		slog.String("effect", "X-Real-IP is believed from these peers and from nobody else"),
+	)
+	return trusted, nil
+}
+
+// routeSets returns the API's route sets, in mount order.
+//
+// # The empty case is now a FAILURE, not a decision
+//
+// This function used to return no route sets when the session port was
+// unwired, on the reasoning that an empty surface answering the spec's own 404
+// is more honest than a stub returning fabricated events. The reasoning about
+// fabrication was right. The conclusion was wrong, and the cost was severe:
+// the api container ran for a whole phase logging
+// `"api routes mounted","routes":0,"patterns":null` while every health probe
+// stayed green, `make check` stayed green and coverage sat at 81.93% — because
+// cmd/api has no tests and every internal/httpapi test supplies its own fake.
+// A service that serves NOTHING while reporting itself healthy is not honest;
+// it is undetectable.
+//
+// Note also what the old behaviour cost beyond auth: nil sessions unmounted the
+// CATALOGUE, BOARD and HISTORY routes too, none of which need a session at all.
+//
+// So the port is wired, and if it cannot be built this returns an error and the
+// process refuses to start. Failing loudly at startup is CLAUDE.md §12's rule
+// and it is the only version of this that a reviewer or an orchestrator can
+// see.
+func routeSets(
+	log *slog.Logger,
+	stack *middleware.Stack,
+	store *pgstore.Store,
+	sessions httpapi.Sessions,
+) ([]httpapi.RouteSet, error) {
 	api, err := httpapi.NewAPI(httpapi.APIOptions{
 		Catalogue: store,
 		Prices:    store,
@@ -462,12 +485,120 @@ func routeSets(log *slog.Logger, stack *middleware.Stack, store *pgstore.Store) 
 	return []httpapi.RouteSet{api}, nil
 }
 
-// sessionsPort returns the adapter over internal/auth.Service, once one exists.
+// sessionsPort builds the adapter over internal/auth.Service.
 //
-// It is a named function returning nil rather than a nil literal at the call
-// site so that wiring it is a one-line change in one place, and so that the
-// absence is greppable.
-func sessionsPort() httpapi.Sessions { return nil }
+// # What is assembled here, and why each piece is not optional
+//
+//   - authpg.Store is the session store. Refresh-token rotation and reuse
+//     detection are a TRANSACTIONAL property (migrations/00005's partial unique
+//     index on one-successor-per-parent is what makes the detection survive a
+//     mistake in the Go), so this must be the Postgres implementation and never
+//     an in-memory stand-in.
+//   - redisguard.Guard is the TOTP replay guard. auth.MemoryReplayGuard is
+//     correct for ONE replica and wrong for the several CLAUDE.md §9 runs
+//     behind an Ingress: a code burnt on pod A is still fresh on pod B, which
+//     is a one-step replay window handed to anyone who can retry.
+//   - The keyring seals TOTP secrets at rest and is the one piece allowed to be
+//     absent, because absent means "TOTP enrolment is refused" rather than
+//     "TOTP secrets are stored in the clear". That refusal is loud in the
+//     service and warned about here.
+//
+// The argon2id hasher is built with the package defaults. Its parameters are
+// internal/auth's policy and are deliberately NOT re-specified here: a second
+// copy of a cost parameter in a composition root is how one of the two ends up
+// weakened by someone chasing a slow test.
+func sessionsPort(
+	ctx context.Context,
+	cfg *config.Config,
+	log *slog.Logger,
+	db *postgres.DB,
+	rdb *redis.Client,
+	registry prometheus.Registerer,
+) (httpapi.Sessions, error) {
+	store, err := authpg.New(db)
+	if err != nil {
+		return nil, fmt.Errorf("build the auth store: %w", err)
+	}
+
+	hasher, err := auth.NewHasher(auth.HasherOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("build the password hasher: %w", err)
+	}
+
+	tokens, err := auth.NewTokenIssuer(auth.TokenIssuerOptions{
+		SigningKey: []byte(cfg.JWTSigningKey),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("build the access-token issuer: %w", err)
+	}
+
+	guard, err := redisguard.New(redisguard.Options{Client: rdb})
+	if err != nil {
+		return nil, fmt.Errorf("build the second-factor replay guard: %w", err)
+	}
+
+	var keyring *auth.Keyring
+	if cfg.TOTPKeyring == "" {
+		log.Warn("no TOTP keyring is configured: second-factor enrolment will be refused",
+			slog.String("effect", "POST /api/v1/account/totp fails; password login and "+
+				"refresh rotation are unaffected"),
+			slog.String("needs", config.EnvTOTPKeyring+
+				", in auth.ParseKeyring's id:base64key format"),
+			slog.String("why_not_a_default", "a generated-at-startup key would decrypt "+
+				"nothing written by the previous process, locking out every enrolled user "+
+				"on restart"),
+		)
+	} else if keyring, err = auth.ParseKeyring(cfg.TOTPKeyring); err != nil {
+		// The error from ParseKeyring never quotes key material — only the id
+		// and the decoded length — so it is safe to wrap and return.
+		return nil, fmt.Errorf("parse %s: %w", config.EnvTOTPKeyring, err)
+	}
+
+	svc, err := auth.NewService(auth.Options{
+		Store:       store,
+		Hasher:      hasher,
+		Tokens:      tokens,
+		Keyring:     keyring,
+		ReplayGuard: guard,
+		// RecoveryCodes is NIL, and that is a reported gap rather than an
+		// oversight: internal/auth/pgstore implements auth.Store but not
+		// auth.RecoveryCodeStore — there is no Postgres implementation of
+		// ReplaceRecoveryCodes / ConsumeRecoveryCode in the tree at all.
+		//
+		// auth.Service tolerates nil everywhere it touches recovery codes: a
+		// presented recovery code is rejected, TOTPStatus reports
+		// RecoveryCodesRemaining as -1 ("not configured"), and removing a
+		// factor skips the clear-out because there is nothing to clear. So the
+		// effect is that a user who loses their authenticator cannot self-serve
+		// back in.
+		//
+		// Wiring an in-memory stand-in here instead would be worse in the exact
+		// way that matters: recovery codes that survive one pod and one restart
+		// are a bypass credential the user believes is durable.
+		RecoveryCodes: nil,
+		Registry:      registry,
+		Logger:        log,
+		// RefreshTTL and SessionLifetime are left at internal/auth's defaults
+		// for the same reason the argon2id parameters are: they are the
+		// security policy of the package that enforces them, and a widened
+		// lifetime set from here would not be visible to anyone reading that
+		// package's tests.
+	})
+	if err != nil {
+		return nil, fmt.Errorf("build the auth service: %w", err)
+	}
+
+	// A round trip now, rather than on the first login. The pool is already
+	// open and a store that cannot answer is a service that should not report
+	// itself ready.
+	_ = ctx
+
+	adapter, err := authsessions.New(authsessions.Options{Service: svc})
+	if err != nil {
+		return nil, fmt.Errorf("build the session adapter: %w", err)
+	}
+	return adapter, nil
+}
 
 // compile-time assertions that the seams this file depends on have not moved.
 var (

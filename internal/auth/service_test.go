@@ -1125,6 +1125,74 @@ func TestDisableTOTPRequiresThePasswordAndClearsRecoveryCodes(t *testing.T) {
 	}
 }
 
+// TestDisableTOTPWithCodeRequiresALiveCodeFromTheFactor covers the step-up
+// openapi.yaml requires for DELETE /account/totp: possession of the factor,
+// not knowledge of the password. See Service.DisableTOTPWithCode for why
+// possession is the stronger of the two for this particular action.
+func TestDisableTOTPWithCodeRequiresALiveCodeFromTheFactor(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t)
+	user := f.register(t, "person@example.com")
+	secret := f.enrol(t, user.ID)
+	ctx := context.Background()
+
+	// A wrong code is refused. Without this, a stolen access token alone would
+	// strip the factor, which is exactly the attack the factor exists to stop.
+	if err := f.svc.DisableTOTPWithCode(ctx, user.ID, "000000"); !errors.Is(err, ErrSecondFactorInvalid) {
+		t.Fatalf("DisableTOTPWithCode with a wrong code = %v, want ErrSecondFactorInvalid", err)
+	}
+
+	status, err := f.svc.TOTPStatus(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("TOTPStatus: %v", err)
+	}
+	if !status.Enrolled {
+		t.Fatal("the factor was removed by a REJECTED code")
+	}
+
+	// A live code from the factor removes it. The clock is advanced one step
+	// first because f.enrol already burnt the current step's code confirming
+	// the enrolment, and the replay guard is deliberately not fooled by
+	// spending the same code twice.
+	f.clock.advance(TOTPPeriod)
+	code, err := TOTPCodeAt(secret, f.clock.Now(), TOTPConfig{})
+	if err != nil {
+		t.Fatalf("TOTPCodeAt: %v", err)
+	}
+	if err := f.svc.DisableTOTPWithCode(ctx, user.ID, code); err != nil {
+		t.Fatalf("DisableTOTPWithCode: %v", err)
+	}
+
+	status, err = f.svc.TOTPStatus(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("TOTPStatus: %v", err)
+	}
+	if status.Enrolled || status.Pending {
+		t.Fatalf("status = %+v after DisableTOTPWithCode", status)
+	}
+	// The bypass must go with the factor, exactly as on the password path.
+	if status.RecoveryCodesRemaining != 0 {
+		t.Fatalf("%d recovery codes survived DisableTOTPWithCode", status.RecoveryCodesRemaining)
+	}
+
+	// Login no longer demands a second factor.
+	if _, err := f.svc.Login(ctx, LoginRequest{
+		Email: "person@example.com", Password: NewSecret(testPassword)}); err != nil {
+		t.Fatalf("Login after DisableTOTPWithCode = %v", err)
+	}
+
+	// And there is nothing left to remove.
+	f.clock.advance(TOTPPeriod)
+	next, err := TOTPCodeAt(secret, f.clock.Now(), TOTPConfig{})
+	if err != nil {
+		t.Fatalf("TOTPCodeAt: %v", err)
+	}
+	if err := f.svc.DisableTOTPWithCode(ctx, user.ID, next); !errors.Is(err, ErrTOTPNotEnrolled) {
+		t.Fatalf("DisableTOTPWithCode twice = %v, want ErrTOTPNotEnrolled", err)
+	}
+}
+
 func TestRegenerateRecoveryCodesRequiresThePassword(t *testing.T) {
 	t.Parallel()
 

@@ -324,6 +324,14 @@ func selectAdapter(cfg *config.Config, log *slog.Logger) (provider.Adapter, norm
 		if err != nil {
 			return nil, nil, err
 		}
+		// ConfigFromEnv returns what the environment SAID, with every unset
+		// optional still zero. The adapter defaults them internally, so without
+		// this line acfg is not the config the adapter runs on and the two
+		// reads below pick up empty strings — which is a fatal startup error
+		// for the format and a silent loss of the sharp-book flag for the
+		// reference book. Defaulting here makes acfg the single description of
+		// what this process asked the provider for. It is idempotent.
+		acfg = acfg.WithDefaults()
 		// The adapter's own collectors are built UNREGISTERED: it exports its own
 		// copies of the three sharpline_provider_* contract series and run() has
 		// already registered the seam-level set, which is the one that also

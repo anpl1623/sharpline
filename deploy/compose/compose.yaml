@@ -354,6 +354,17 @@ services:
       <<: [*env-base, *env-postgres, *env-redis, *env-kafka]
       SHARPLINE_HTTP_ADDR: ":8080"
       SHARPLINE_JWT_SIGNING_KEY:
+      # Seals TOTP shared secrets at rest. Absent means enrolment is REFUSED
+      # rather than performed without encryption; password login and refresh
+      # rotation are unaffected. See config.EnvTOTPKeyring.
+      SHARPLINE_TOTP_KEYRING:
+      # Exactly the hop in front of this service -- the proxy's pinned address,
+      # /32, and nothing else. This is what makes the per-IP limiter (CLAUDE.md
+      # §6) bucket on the real client instead of on the proxy, and what stops a
+      # client forging X-Forwarded-For into a fresh bucket: the header is
+      # believed only from this peer, and Caddy OVERWRITES X-Real-IP on the way
+      # through, so a client-supplied value cannot survive the hop.
+      SHARPLINE_TRUSTED_PROXIES: ${SHARPLINE_TRUSTED_PROXIES:-172.28.0.2/32}
     depends_on: *go-deps
     deploy:
       resources:
@@ -604,7 +615,12 @@ services:
     security_opt:
       - no-new-privileges:true
     networks:
-      - sharpline
+      sharpline:
+        # FIXED, because SHARPLINE_TRUSTED_PROXIES names this exact address.
+        # If it moves, `api` stops believing the proxy's X-Real-IP and silently
+        # buckets every client together again -- so the two values are a pair
+        # and must be edited together.
+        ipv4_address: 172.28.0.2
     logging: *logging
     deploy:
       resources:
@@ -618,6 +634,29 @@ networks:
   sharpline:
     name: sharpline
     driver: bridge
+    # The subnet is PINNED, and that is what makes the per-IP rate limiter's
+    # trusted-proxy set expressible at all.
+    #
+    # `api` must believe X-Real-IP from the proxy and from NOTHING ELSE. With a
+    # Docker-assigned subnet the proxy's address changes between runs, so the
+    # only writable trusted set would be the whole bridge -- i.e. "trust every
+    # container", which is every container that could be compromised, and which
+    # deploy/proxy/Caddyfile and internal/httpapi/middleware both warn against
+    # by name.
+    #
+    # Pinning the subnet lets the proxy take a fixed address below and lets
+    # SHARPLINE_TRUSTED_PROXIES name exactly that one host. This mirrors
+    # Kubernetes, where the trusted value is the ingress controller's pod CIDR
+    # rather than the whole pod network.
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+          # Dynamic assignment is confined to 172.28.1.0/24 so that 172.28.0.2
+          # stays free for the proxy below. Without ip_range Docker allocates
+          # sequentially from the bottom of the subnet, hands .2 to whichever
+          # container starts first, and the proxy then fails to come up with
+          # "Address already in use".
+          ip_range: 172.28.1.0/24
 
 volumes:
   postgres-data:

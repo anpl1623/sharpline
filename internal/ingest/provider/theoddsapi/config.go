@@ -181,6 +181,25 @@ const (
 // process starts, that one after the provider has already refused something.
 var ErrInvalidConfig = errors.New("theoddsapi: invalid configuration")
 
+// WithDefaults returns a copy of cfg with every unset optional field filled in.
+//
+// [NewClient] applies it internally, so an adapter built from a raw Config
+// still runs on the defaulted values. This exported form exists for the caller
+// that must READ those same values rather than merely hand them over —
+// cmd/ingest builds the raw-payload decoder from Config.OddsFormat and
+// Config.ReferenceBook, and those two must be the values the adapter actually
+// requests from the provider, not the empty strings a caller of
+// [ConfigFromEnv] holds before defaulting.
+//
+// Getting that wrong is not a cosmetic mismatch. An empty OddsFormat is a hard
+// startup failure in [NewDecoder]; an empty ReferenceBook is worse, because it
+// is silent — the decoder stamps the sharp-book designation onto nothing, and
+// every price replayed off odds.raw loses the flag the +EV surface is built on.
+//
+// It is idempotent: every branch fills a field only when it is unset, so
+// applying it twice is applying it once.
+func (c Config) WithDefaults() Config { return c.withDefaults() }
+
 // withDefaults returns a copy of cfg with every unset optional field filled in.
 func (c Config) withDefaults() Config {
 	out := c
