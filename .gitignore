@@ -175,3 +175,7 @@ desktop.ini
 # tenancy/subnet OCIDs, which identify the account and must not reach a public repo
 # (CLAUDE.md §12: secrets never in git). Delete this line if you want it tracked.
 provision_oracle_vm.sh
+
+# Generated per-rollout on the deploy VM: pins the GHCR image prefix and tag for
+# docker compose. Regenerated every deploy, never hand-edited, never committed.
+.env.deploy

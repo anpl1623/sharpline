@@ -311,7 +311,7 @@ services:
       <<: *go-build
       args:
         SERVICE: migrate
-    image: sharpline/migrate:local
+    image: ${SHARPLINE_IMAGE_PREFIX:-sharpline}/migrate:${SHARPLINE_IMAGE_TAG:-local}
     restart: "no"
     read_only: true
     user: "65532:65532"
@@ -345,7 +345,7 @@ services:
       <<: *go-build
       args:
         SERVICE: api
-    image: sharpline/api:local
+    image: ${SHARPLINE_IMAGE_PREFIX:-sharpline}/api:${SHARPLINE_IMAGE_TAG:-local}
     environment:
       # config.API = HTTP | Postgres | Redis | Kafka | JWT — the only service that
       # mints or verifies access tokens today, so the only one given the signing key.
@@ -378,7 +378,7 @@ services:
       <<: *go-build
       args:
         SERVICE: ingest
-    image: sharpline/ingest:local
+    image: ${SHARPLINE_IMAGE_PREFIX:-sharpline}/ingest:${SHARPLINE_IMAGE_TAG:-local}
     environment:
       # config.Ingest = HTTP | Postgres | Redis | Kafka.
       #
@@ -427,7 +427,7 @@ services:
       <<: *go-build
       args:
         SERVICE: pricer
-    image: sharpline/pricer:local
+    image: ${SHARPLINE_IMAGE_PREFIX:-sharpline}/pricer:${SHARPLINE_IMAGE_TAG:-local}
     environment:
       # config.Pricer = HTTP | Kafka. Pure math over the bus: it opens neither a
       # database connection nor a Redis client, so it is given neither. Its whole state
@@ -453,7 +453,7 @@ services:
       <<: *go-build
       args:
         SERVICE: stream
-    image: sharpline/stream:local
+    image: ${SHARPLINE_IMAGE_PREFIX:-sharpline}/stream:${SHARPLINE_IMAGE_TAG:-local}
     environment:
       # config.Stream = HTTP | Redis | Kafka. Subscription state lives in Redis so the
       # deployment scales without session affinity (CLAUDE.md §9).
@@ -474,7 +474,7 @@ services:
       <<: *go-build
       args:
         SERVICE: settle
-    image: sharpline/settle:local
+    image: ${SHARPLINE_IMAGE_PREFIX:-sharpline}/settle:${SHARPLINE_IMAGE_TAG:-local}
     environment:
       # config.Settle = HTTP | Postgres | Kafka. No Redis credential: settle grades
       # wagers and writes ledger rows, it does not touch the cache. No ODDS_API_KEY —
@@ -508,7 +508,7 @@ services:
         # hostnames — the browser cannot resolve `api`.
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-/api}
         NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-/ws}
-    image: sharpline/web:local
+    image: ${SHARPLINE_IMAGE_PREFIX:-sharpline}/web:${SHARPLINE_IMAGE_TAG:-local}
     restart: unless-stopped
     environment:
       NODE_ENV: production

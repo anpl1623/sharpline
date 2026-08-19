@@ -14,10 +14,18 @@
 
 name: deploy-vm
 
+# TRIGGER: after `ci` SUCCEEDS, never directly on push.
+#
+# The VM now PULLS images rather than building them, and `ci` is what publishes
+# them to GHCR. Both workflows used to fire on the same push and race: the VM
+# would try to pull a tag that had not been pushed yet. workflow_run makes the
+# dependency explicit -- a red `ci` deploys nothing, which is the behaviour you
+# want anyway.
 on:
-  push:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
     branches: [main]
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
       target_host:
@@ -25,14 +33,15 @@ on:
         type: string
         required: false
         default: "34.56.164.139"
-      rebuild_images:
-        description: "Force rebuild all container images"
-        type: boolean
+      image_tag:
+        description: "Image tag to deploy (default: resolved from the commit)"
+        type: string
         required: false
-        default: false
+        default: ""
 
 permissions:
   contents: read
+  packages: read
 
 concurrency:
   group: deploy-vm-${{ github.ref }}
@@ -56,12 +65,34 @@ jobs:
     needs: [directive]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # A workflow_run fires on failure too, so the conclusion must be checked
+    # explicitly. Without this a red `ci` would still roll out.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     env:
       VM_HOST: ${{ github.event.inputs.target_host || secrets.GCP_VM_HOST || '34.56.164.139' }}
       VM_USER: ${{ secrets.GCP_VM_USER || 'Andrewpleeter' }}
-      REBUILD: ${{ github.event.inputs.rebuild_images || 'false' }}
+      # workflow_run reports its OWN sha in github.sha, not the commit that was
+      # tested, so the deployed commit has to come from the triggering run.
+      DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
     steps:
       - uses: actions/checkout@v4
+
+      # `ci` tags every image `sha-<first 12>` (see the meta job in ci.yml).
+      # Recomputing it here rather than hardcoding keeps the two in step.
+      - name: resolve image tag
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.image_tag }}"
+          if [ -z "$tag" ]; then
+            tag="sha-${DEPLOY_SHA:0:12}"
+          fi
+          prefix=$(printf '%s' "$IMAGE_PREFIX" | tr '[:upper:]' '[:lower:]')
+          echo "IMAGE_TAG=${tag}" >> "$GITHUB_ENV"
+          echo "IMAGE_PREFIX=${prefix}" >> "$GITHUB_ENV"
+          echo "==> deploying ${prefix}/<service>:${tag}"
 
       - name: configure ssh credentials
         env:
@@ -81,12 +112,38 @@ jobs:
 
       - name: execute remote rollout
         if: env.SSH_AUTH_READY == 'true'
+        # The registry credentials arrive through `env:` and are referenced as shell
+        # variables rather than being interpolated with ${{ }} into the command
+        # string. Direct interpolation would place the token verbatim in the ssh
+        # process's argv on the runner, and a value containing a quote would break
+        # out of the surrounding shell quoting.
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
         run: |
           set -euo pipefail
+          SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -i ~/.ssh/id_deploy ${VM_USER}@${VM_HOST}"
           echo "==> Connecting to ${VM_USER}@${VM_HOST}..."
-          
-          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -i ~/.ssh/id_deploy "${VM_USER}@${VM_HOST}" \
-            "COMMIT_SHA='${{ github.sha }}' REBUILD='${REBUILD}' bash -s" << 'REMOTE_SCRIPT'
+
+          # Registry login is its own hop, with the token arriving on STDIN and
+          # going straight into --password-stdin. It is never an argument, so it
+          # appears in no process list on either side, and it is out of the
+          # environment before the rollout script runs.
+          # Only needed while the GHCR packages are private; make them public and
+          # this block and the GHCR_TOKEN secret can both be deleted.
+          if [ -n "${GHCR_TOKEN:-}" ]; then
+            echo "==> Authenticating to ghcr.io..."
+            printf '%s' "${GHCR_TOKEN}" \
+              | $SSH "sudo docker login ghcr.io -u '${GHCR_USER}' --password-stdin" \
+              || { echo "::error::ghcr.io login failed"; exit 1; }
+          else
+            echo "==> No GHCR_TOKEN set; assuming the packages are public."
+          fi
+
+          $SSH env COMMIT_SHA="${DEPLOY_SHA}" \
+                   IMAGE_PREFIX="${IMAGE_PREFIX}" \
+                   IMAGE_TAG="${IMAGE_TAG}" \
+                   bash -s << 'REMOTE_SCRIPT'
             set -euo pipefail
             cd ~/sharpline
             
@@ -95,21 +152,42 @@ jobs:
             git reset --hard
             git checkout -f "${COMMIT_SHA}"
             
-            echo "==> Building container stack..."
-            if [ "${REBUILD}" = "true" ]; then
-              sudo docker compose --env-file .env -f deploy/compose/compose.yaml build --no-cache
-            else
-              sudo docker compose --env-file .env -f deploy/compose/compose.yaml build --parallel
+            # The VM no longer compiles anything. `ci` builds multi-arch and pushes
+            # to GHCR with a registry-backed BuildKit cache (CLAUDE.md section 9);
+            # rebuilding here duplicated that work and blew the 20 minute job
+            # ceiling on a cold cache -- six Go binaries plus Next.js, with a single
+            # image taking 74s just to export its layers.
+            #
+            # SHARPLINE_IMAGE_PREFIX / _TAG are consumed by deploy/compose/compose.yaml,
+            # which defaults them to sharpline/<svc>:local so a developer's `make up`
+            # is completely unaffected.
+            #
+            # They go in a SECOND --env-file rather than the process environment,
+            # because every compose call here runs under sudo and the default
+            # sudoers policy is env_reset: `sudo -E` needs the SETENV privilege and
+            # fails outright without it. An env file needs no such privilege and no
+            # change to the VM's sudoers. It is regenerated every rollout and is not the
+            # hand-maintained .env holding the real secrets.
+            printf 'SHARPLINE_IMAGE_PREFIX=%s\nSHARPLINE_IMAGE_TAG=%s\n' \
+              "${IMAGE_PREFIX}" "${IMAGE_TAG}" > .env.deploy
+            
+            echo "==> Pulling ${IMAGE_PREFIX}/<service>:${IMAGE_TAG}..."
+            if ! sudo docker compose --env-file .env --env-file .env.deploy -f deploy/compose/compose.yaml pull --quiet; then
+              echo "::error::Pull failed. Either ci has not published ${IMAGE_TAG} yet, or the"
+              echo "::error::GHCR packages are private and no GHCR_TOKEN secret is set."
+              echo "::error::Deliberately NOT falling back to a VM-side build: that is what"
+              echo "::error::exceeded the job timeout, and a silent rebuild would hide this."
+              exit 1
             fi
             
             echo "==> Starting persistent data plane (Postgres, Redis, Kafka)..."
-            sudo docker compose --env-file .env -f deploy/compose/compose.yaml up -d postgres redis kafka
+            sudo docker compose --env-file .env --env-file .env.deploy -f deploy/compose/compose.yaml up -d postgres redis kafka
             
             echo "==> Running database schema migrations..."
-            sudo docker compose --env-file .env -f deploy/compose/compose.yaml run --rm migrate
+            sudo docker compose --env-file .env --env-file .env.deploy -f deploy/compose/compose.yaml run --rm migrate
             
             echo "==> Rolling out all platform microservices..."
-            sudo docker compose --env-file .env -f deploy/compose/compose.yaml up -d --remove-orphans
+            sudo docker compose --env-file .env --env-file .env.deploy -f deploy/compose/compose.yaml up -d --remove-orphans
             
             echo "==> Probing service readiness..."
             for i in $(seq 1 30); do
@@ -121,7 +199,7 @@ jobs:
             done
             
             echo "::error::Health check timeout after 60 seconds."
-            sudo docker compose --env-file .env -f deploy/compose/compose.yaml ps
+            sudo docker compose --env-file .env --env-file .env.deploy -f deploy/compose/compose.yaml ps
             exit 1
           REMOTE_SCRIPT
 
@@ -145,7 +223,8 @@ jobs:
             echo "| Property | Value |"
             echo "|---|---|"
             echo "| **Target Host** | \`${VM_HOST}\` |"
-            echo "| **Commit** | \`${{ github.sha }}\` |"
+            echo "| **Commit** | \`${DEPLOY_SHA}\` |"
+            echo "| **Image** | \`${IMAGE_PREFIX}/<service>:${IMAGE_TAG}\` |"
             echo "| **Web UI** | [http://${VM_HOST}](http://${VM_HOST}) |"
             echo "| **API Health** | [http://${VM_HOST}/api/healthz](http://${VM_HOST}/api/healthz) |"
             echo "| **API Ready** | [http://${VM_HOST}/api/readyz](http://${VM_HOST}/api/readyz) |"
