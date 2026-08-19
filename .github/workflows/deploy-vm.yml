@@ -93,6 +93,15 @@ jobs:
       # never needs rotating. The secrets.* fallback is kept only so an existing
       # secret keeps working if one was set.
       PUBLIC_URL: ${{ vars.SHARPLINE_PUBLIC_URL || secrets.SHARPLINE_PUBLIC_URL || format('http://{0}', secrets.GCP_VM_HOST || '34.56.164.139') }}
+      # The hostname the ORIGIN serves, which is a different question from the URL
+      # the smoke test hits above. compose passes it to the proxy and the Caddyfile
+      # reads it as {$SHARPLINE_PROXY_HOST}.
+      #
+      # Deliberately EMPTY by default. Naming a real domain here makes Caddy's
+      # automatic HTTPS attempt ACME issuance for it, and a challenge that cannot
+      # be reached from the internet burns Let's Encrypt rate limit on failures.
+      # Set the variable only once tcp:80 is actually open to the world.
+      PROXY_HOST: ${{ vars.SHARPLINE_PROXY_HOST }}
       IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
     steps:
       - uses: actions/checkout@v4
@@ -160,6 +169,7 @@ jobs:
           $SSH env COMMIT_SHA="${DEPLOY_SHA}" \
                    IMAGE_PREFIX="${IMAGE_PREFIX}" \
                    IMAGE_TAG="${IMAGE_TAG}" \
+                   PROXY_HOST="${PROXY_HOST}" \
                    bash -s << 'REMOTE_SCRIPT'
             set -euo pipefail
             cd ~/sharpline
@@ -187,6 +197,14 @@ jobs:
             # hand-maintained .env holding the real secrets.
             printf 'SHARPLINE_IMAGE_PREFIX=%s\nSHARPLINE_IMAGE_TAG=%s\n' \
               "${IMAGE_PREFIX}" "${IMAGE_TAG}" > .env.deploy
+            
+            # Only written when the variable is set. Left unset, the VM keeps
+            # whatever its own .env says, so this cannot silently change the
+            # served hostname -- and cannot trigger ACME -- until someone opts in.
+            if [ -n "${PROXY_HOST:-}" ]; then
+              echo "==> Origin will serve ${PROXY_HOST}"
+              printf 'SHARPLINE_PROXY_HOST=%s\n' "${PROXY_HOST}" >> .env.deploy
+            fi
             
             echo "==> Pulling ${IMAGE_PREFIX}/<service>:${IMAGE_TAG}..."
             if ! sudo docker compose --env-file .env --env-file .env.deploy -f deploy/compose/compose.yaml pull --quiet; then
