@@ -99,6 +99,32 @@ COPY --from=build --chown=node:node /app/public ./public
 COPY --from=build --chown=node:node /app/.next/standalone ./
 COPY --from=build --chown=node:node /app/.next/static ./.next/static
 
+# Strip the package manager from the RUNTIME image.
+#
+# A Next standalone server is started with `node server.js` (see CMD) and never
+# invokes npm; the healthcheck below uses busybox wget. But node:24-alpine ships
+# npm, and npm vendors its OWN dependency tree at
+# /usr/local/lib/node_modules/npm/node_modules -- which is where Trivy found
+# tar 7.5.16 (CRITICAL, gzip-bomb DoS), undici 6.26.0, ip-address 10.2.0 and
+# brace-expansion 5.0.6.
+#
+# Those are not this application's dependencies, so no change to package.json or
+# package-lock.json can fix them; `npm audit` does not even see them, which is
+# why it and Trivy disagreed. Deleting the package manager removes the findings
+# and the runtime attack surface in one move, and a production image that cannot
+# install packages is the better posture regardless (CLAUDE.md §9 hardening).
+# yarn goes for the same reason. It scans clean today, but it is a second
+# package manager with its own vendored tree sitting in a production image that
+# has no use for either.
+RUN rm -rf /usr/local/lib/node_modules/npm \
+           /usr/local/lib/node_modules/corepack \
+           /usr/local/bin/npm \
+           /usr/local/bin/npx \
+           /usr/local/bin/corepack \
+           /opt/yarn-v* \
+           /usr/local/bin/yarn \
+           /usr/local/bin/yarnpkg
+
 USER node
 EXPOSE 3000
 

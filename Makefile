@@ -1095,12 +1095,13 @@ lint: cache-init build-tools ## Run golangci-lint in the tools container
 .PHONY: fmt
 fmt: cache-init ## Format all Go source in a container (writes back through the mount)
 	docker run --rm $(DOCKER_AS_USER) $(DOCKER_GO_FLAGS) $(GO_IMAGE) \
-	  gofmt -l -w .
+	  sh -c 'gofmt -l -w $$(find . -name "*.go" -not -path "./.claude/*" -not -path "./.git/*")'
 
 .PHONY: fmt-check
 fmt-check: cache-init ## Fail if any Go source is unformatted
 	docker run --rm $(DOCKER_AS_USER) $(DOCKER_GO_FLAGS) $(GO_IMAGE) \
-	  sh -c 'out=$$(gofmt -l .); if [ -n "$$out" ]; then printf "unformatted:\n%s\n" "$$out"; exit 1; fi'
+	  sh -c 'out=$$(gofmt -l $$(find . -name "*.go" -not -path "./.claude/*" -not -path "./.git/*")); \
+	         if [ -n "$$out" ]; then printf "unformatted:\n%s\n" "$$out"; exit 1; fi'
 
 .PHONY: vet
 vet: cache-init ## Run the Go vet analyzer in a container

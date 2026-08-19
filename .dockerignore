@@ -178,3 +178,8 @@ tmp/
 ehthumbs.db
 Thumbs.db
 desktop.ini
+
+# Agent worktrees are sibling checkouts of this same repo living inside it.
+# They must never enter a build context: they would bust every cache layer on
+# an unrelated agent's edit, and they carry a second go.mod.
+.claude/
