@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -169,13 +170,17 @@ func newStore(t *testing.T) (*pgstore.Store, *postgres.DB) {
 	return store, db
 }
 
-var idCounter int
+// idCounter is shared by every generator in the package and read and written
+// from tests that call t.Parallel(), so the increment has to be atomic. A bare
+// idCounter++ is a read-modify-write that the race detector flags -- and it did,
+// on CI rather than locally, because GO_TEST_P serialises package BINARIES while
+// t.Parallel() still runs these tests concurrently inside one binary.
+var idCounter atomic.Int64
 
 func idGen(t *testing.T) func() (string, error) {
 	prefix := sanitize(t.Name())
 	return func() (string, error) {
-		idCounter++
-		return fmt.Sprintf("lim_%s_%d", prefix, idCounter), nil
+		return fmt.Sprintf("lim_%s_%d", prefix, idCounter.Add(1)), nil
 	}
 }
 
