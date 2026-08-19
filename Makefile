@@ -552,11 +552,33 @@ topics: ## Converge the Kafka topics for TF_ENV (idempotent; run automatically b
 
 .PHONY: up-dev
 up-dev: env ## Bring up the stack with hot-reload overrides + kafka-ui (dev profile)
+	$(COMPOSE_DEV) up --detach --build --remove-orphans --wait postgres redis kafka
+	@$(MAKE) --no-print-directory topics
 	$(COMPOSE_DEV) up --detach --build --remove-orphans
 	$(COMPOSE_DEV) ps
 
 .PHONY: up-obs
 up-obs: env ## Bring up the stack plus observability (otel/prometheus/grafana/jaeger)
+	@# STAGED FOR THE SAME REASON `up` IS, and it was not.
+	@#
+	@# Kafka runs with auto-topic-creation OFF and CLAUDE.md §9 puts topic
+	@# creation in Terraform, so on a fresh volume -- i.e. straight after
+	@# `make down-hard`, which is exactly when someone reaches for this target --
+	@# every topic is absent until `topics` converges them. `up` has always
+	@# handled that by bringing the data plane up first, converging the topics,
+	@# and only then starting the services. These two overlays did not, so
+	@# `make down-hard && make up-obs` started the whole backend against a
+	@# broker with no topics on it.
+	@#
+	@# That was survivable while every consumer retried its way out of it, and
+	@# phase 6 is where it stopped being: it was found by `stream` reporting
+	@# UNKNOWN_TOPIC_OR_PARTITION on price.computed and never recovering. The
+	@# Follower now waits for the topic (internal/platform/kafka/follower.go),
+	@# so this is no longer load-bearing for correctness -- but a target that
+	@# reaches a working system only because a service is patient is a target
+	@# that will mislead the next person, and `up` already sets the pattern.
+	$(COMPOSE_OBS) up --detach --build --remove-orphans --wait postgres redis kafka
+	@$(MAKE) --no-print-directory topics
 	$(COMPOSE_OBS) up --detach --build --remove-orphans
 	$(COMPOSE_OBS) ps
 

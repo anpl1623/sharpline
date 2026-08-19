@@ -180,6 +180,25 @@
 				request>headers>Cookie delete
 				request>headers>Proxy-Authorization delete
 				resp_headers>Set-Cookie delete
+
+				# Sec-WebSocket-Protocol carries a CREDENTIAL on the /ws route.
+				# A browser's `new WebSocket()` can set exactly one request
+				# header, so the stream gateway takes a bearer token as a
+				# subprotocol offer -- ["sharpline.v1", "sharpline.bearer.<jwt>"]
+				# -- precisely so it stays out of the URL and therefore out of
+				# this log's `uri` field. Leaving the header itself in the log
+				# would put the token back on the very line that change was made
+				# to keep it off. A credential in a log is a credential.
+				#
+				# Caddy lowercases header field names in the log map, so the
+				# key here is `Sec-Websocket-Protocol`, not the RFC 6455
+				# capitalisation.
+				#
+				# The RESPONSE header is deliberately not deleted: the gateway
+				# echoes only "sharpline.v1" and never the bearer offer, which
+				# internal/wsgw's SelectSubprotocol states as the reason it
+				# returns one value and only one.
+				request>headers>Sec-Websocket-Protocol delete
 			}
 		}
 	}

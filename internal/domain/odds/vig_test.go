@@ -965,10 +965,72 @@ type marketFailer interface {
 // closeOrFail is the shared assertion. It uses closeTo at relTolChain for the
 // reasons argued at the top of this file.
 func closeOrFail(f marketFailer, what string, got, want float64) {
-	if !closeTo(got, want, relTolChain) {
+	closeOrFailTol(f, what, got, want, relTolChain)
+}
+
+// closeOrFailTol is closeOrFail at a stated tolerance, for the one identity
+// whose attainable accuracy is a property of the market rather than of the
+// arithmetic. See shareSumTolerance.
+func closeOrFailTol(f marketFailer, what string, got, want, tol float64) {
+	if !closeTo(got, want, tol) {
 		f.Fatalf("%s = %.17g, want %.17g (|diff| = %.3g, tolerance %g)",
-			what, got, want, math.Abs(got-want), relTolChain)
+			what, got, want, math.Abs(got-want), tol)
 	}
+}
+
+// float64Eps is one unit in the last place at 1.0 — the smallest relative error
+// any correctly-rounded float64 operation can be held to.
+const float64Eps = 0x1p-52
+
+// shareSumTolerance is the accuracy the identity Σ share = 1 can actually be
+// held to on a market with this overround, and reports whether the identity is
+// worth checking at all.
+//
+// # Why this one identity needs a tolerance the others do not
+//
+// closeTo floors its scale at 1, so every other identity here is effectively
+// checked to an ABSOLUTE 1e-12. All of them compare quantities whose absolute
+// error is a few ulps of unity — around 1e-16 — so 1e-12 leaves four orders of
+// headroom no matter how near-fair the market is.
+//
+// Σ share does not work that way. Share is excess / Σ excess, and excess is
+// implied − fair: a difference of two numbers of order 1 that differ by order
+// (overround/n). That subtraction discards every leading bit the two operands
+// share, so an error of one ulp in either — the best correctly-rounded
+// arithmetic can promise — emerges as a RELATIVE error of about
+// eps/(overround/n) in the difference. The n shares then sum to a quantity of
+// order 1, carrying that inflated relative error with them into a comparison
+// whose scale is 1.
+//
+// So the attainable accuracy of this one identity degrades as the market
+// approaches fair, and a fixed 1e-12 asserts something the arithmetic cannot
+// deliver across the domain the generators explore. `rapid` duly found it: a
+// three-way market at q = (0.765625, 0.201202392578125, 0.033203125), overround
+// 2⁻¹⁵ ≈ 3.05e-5, whose uniform share sum came back 1.59e-12 low. Every other
+// identity on that same market — Σ fair = 1, Σ excess = overround, vig = 1−1/S —
+// held to 1e-12 exactly, which is the tell: the defect is in the conditioning of
+// this ratio, not in the devig.
+//
+// # What the bound is, and why it does not hide a real error
+//
+// The bound is n ulps of cancellation, carried through the division and summed
+// over n terms, with a factor of 8 for the handful of roundings on either side
+// of it. It is the LOOSER of that and relTolChain, so it changes nothing
+// wherever 1e-12 is attainable — which is every overround above about 5e-3, and
+// therefore every market any book has ever priced (a two-way market at -110/-110
+// has an overround of 4.5e-2, an order of magnitude clear of it).
+//
+// Below floorOverround the ratio is 0/0 and its neighbourhood is pure rounding,
+// so the identity is not checked at all; that is what the second return says,
+// and it is the same floor this check has always carried.
+func shareSumTolerance(n int, overround float64) (float64, bool) {
+	const floorOverround = 1e-6
+
+	scale := math.Abs(overround)
+	if scale <= floorOverround {
+		return 0, false
+	}
+	return math.Max(relTolChain, 8*float64(n)*float64Eps/scale), true
 }
 
 // marketOutcome is what checking one market produced.
@@ -1081,10 +1143,10 @@ func assertMarketInvariants(f marketFailer, prices []Decimal) marketOutcome {
 
 		// Share is a ratio of two quantities that both vanish as a market
 		// approaches fair, so it is only meaningfully checkable away from that
-		// limit. Below 1e-6 of overround the ratio is dominated by rounding and the
-		// assertion would be testing float noise rather than the code.
-		if math.Abs(m.Overround) > 1e-6 {
-			closeOrFail(f, a.String()+" Σ share = 1", sumSelection(vs, fieldShare), 1)
+		// limit, and the accuracy it can be held to there is set by how much
+		// cancellation the excess term suffered. shareSumTolerance decides both.
+		if tol, ok := shareSumTolerance(n, m.Overround); ok {
+			closeOrFailTol(f, a.String()+" Σ share = 1", sumSelection(vs, fieldShare), 1, tol)
 		}
 
 		if a == AttributionProportional {
@@ -1129,6 +1191,46 @@ func assertMarketInvariants(f marketFailer, prices []Decimal) marketOutcome {
 		}
 	}
 	return out
+}
+
+// TestNearFairMarketShareSumRegression pins the counterexample `rapid` found for
+// the Σ share identity, so the case survives as a deterministic test rather than
+// as a shrink that happened once.
+//
+// The market is three-way with implied probabilities that are all exact binary
+// fractions, so their sum — and therefore the overround, 2⁻¹⁵ ≈ 3.05e-5 — is
+// exact too, and every digit of disagreement below comes from the devig rather
+// than from the generator. At that overround the uniform attribution's excess
+// terms lose about eleven digits to cancellation, which is why the identity is
+// checked against shareSumTolerance and not against a flat 1e-12; before that
+// change this market failed by 1.59e-12 with nothing wrong in the arithmetic.
+//
+// The other identities are asserted on the same market by the shared helper, so
+// this also records that a near-fair market is not otherwise special: Σ fair = 1,
+// Σ excess = the overround and vig = 1 − 1/S all still hold to 1e-12 here.
+func TestNearFairMarketShareSumRegression(t *testing.T) {
+	t.Parallel()
+
+	q := []float64{0.765625, 0.201202392578125, 0.033203125}
+
+	prices := make([]Decimal, len(q))
+	for i, p := range q {
+		d, err := NewDecimal(1 / p)
+		if err != nil {
+			t.Fatalf("implied probability %v is not priceable: %v", p, err)
+		}
+		prices[i] = d
+	}
+
+	out := assertMarketInvariants(t, prices)
+	if !out.Margin.IsOverround() {
+		t.Fatalf("the recorded counterexample is overround by construction, but S = %.17g",
+			out.Margin.ImpliedSum)
+	}
+	if out.UniformUndefined {
+		t.Fatal("the uniform attribution is defined on this market; if it stopped being so, " +
+			"the Σ share assertion this case exists to guard is no longer reached")
+	}
 }
 
 // TestPropertyMarketMarginInvariants is the property-based test CLAUDE.md §4 calls

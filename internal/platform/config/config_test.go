@@ -40,6 +40,38 @@ func with(overrides map[string]string) map[string]string {
 	return env
 }
 
+// TestOptionalJWTSigningKeyIsActuallyCarried is the assertion the table above
+// cannot make: a table case that only asserts "no error" would still pass if
+// LoadFrom validated the key and then threw it away, which is exactly the shape
+// of the defect this exists to prevent.
+//
+// `stream` does not declare RequireJWT, so nothing about its startup fails when
+// the key is absent — and nothing about its startup failed when the key was
+// present and unread either. The gateway simply refused every credential
+// forever. So this reads the field.
+func TestOptionalJWTSigningKeyIsActuallyCarried(t *testing.T) {
+	t.Parallel()
+
+	key := strings.Repeat("k", 32)
+
+	for _, spec := range []config.Spec{config.Stream, config.API} {
+		t.Run(spec.Service, func(t *testing.T) {
+			t.Parallel()
+
+			cfg, err := config.LoadFrom(spec, config.MapLookup(
+				with(map[string]string{config.EnvJWTSigningKey: key})))
+			if err != nil {
+				t.Fatalf("LoadFrom(%s) = %v, want no error", spec.Service, err)
+			}
+			if cfg.JWTSigningKey != key {
+				t.Fatalf("%s: JWTSigningKey = %q, want the configured key; a service that "+
+					"verifies tokens cannot do so with a key the loader discarded",
+					spec.Service, cfg.JWTSigningKey)
+			}
+		})
+	}
+}
+
 func TestLoadFromValidation(t *testing.T) {
 	t.Parallel()
 
@@ -256,6 +288,26 @@ func TestLoadFromValidation(t *testing.T) {
 		{
 			name:         "short jwt signing key is rejected",
 			spec:         config.API,
+			env:          with(map[string]string{config.EnvJWTSigningKey: "too-short"}),
+			wantErr:      config.ErrInvalid,
+			wantMentions: []string{config.EnvJWTSigningKey, "32"},
+		},
+		{
+			// The three cases below pin the split between "this binary REQUIRES
+			// a key" and "this binary USES one if it is given". `stream`
+			// verifies an access token presented on the WebSocket handshake
+			// (ADR 0008) but serves the public odds board without one, so the
+			// key must be readable there without being mandatory. Collapsing
+			// the two questions is what made the gateway's auth path
+			// unreachable in every deployment: the key was read only where it
+			// was required, so `stream` never saw it.
+			name: "stream loads without a jwt signing key",
+			spec: config.Stream,
+			env:  with(map[string]string{config.EnvJWTSigningKey: ""}),
+		},
+		{
+			name:         "a short jwt signing key is rejected even where it is optional",
+			spec:         config.Stream,
 			env:          with(map[string]string{config.EnvJWTSigningKey: "too-short"}),
 			wantErr:      config.ErrInvalid,
 			wantMentions: []string{config.EnvJWTSigningKey, "32"},
