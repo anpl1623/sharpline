@@ -107,11 +107,13 @@ x-env-base: &env-base
   # Empty => telemetry export disabled. compose.obs.yaml points this at the collector.
   SHARPLINE_OTEL_ENDPOINT: ${SHARPLINE_OTEL_ENDPOINT:-}
 
-# api, ingest, settle, migrate  (config.RequirePostgres)
+# api, ingest, pricer, settle, migrate  (config.RequirePostgres)
 #
 # ingest is on this list because it hosts the Timescale line-history writer
 # (CLAUDE.md §3: odds.normalized → timescale writer), not because it queries the
-# catalogue.
+# catalogue. pricer joined in phase 9 because it hosts the SIGNALS STAGE, which
+# persists +EV, arbitrage and steam findings — the pricing pass itself still
+# touches no database.
 x-env-postgres: &env-postgres
   SHARPLINE_POSTGRES_DSN: postgres://${POSTGRES_USER:-sharpline}:${POSTGRES_PASSWORD:-sharpline-dev-postgres}@postgres:5432/${POSTGRES_DB:-sharpline}?sslmode=disable
 
@@ -439,11 +441,14 @@ services:
         SERVICE: pricer
     image: ${SHARPLINE_IMAGE_PREFIX:-sharpline}/pricer:${SHARPLINE_IMAGE_TAG:-local}
     environment:
-      # config.Pricer = HTTP | Kafka. Pure math over the bus: it opens neither a
-      # database connection nor a Redis client, so it is given neither. Its whole state
-      # is a fold of the compacted price.computed topic and rebuilds from one snapshot
-      # read on start — internal/pricing/doc.go argues why that must not become a cache.
-      <<: [*env-base, *env-kafka]
+      # config.Pricer = HTTP | Postgres | Kafka. The PRICING pass is still pure math
+      # over the bus with no cache: its whole state is a fold of the compacted
+      # price.computed topic and rebuilds from one snapshot read on start —
+      # internal/pricing/doc.go argues why that must not become a cache. The database
+      # credential is for the phase-9 SIGNALS STAGE, a second consumer group in the
+      # same binary that writes the analytics tables. Still no Redis client: nothing
+      # here rate-limits a provider or holds subscription state.
+      <<: [*env-base, *env-postgres, *env-kafka]
       SHARPLINE_HTTP_ADDR: ":8082"
       # Ordered sharp-book preference, most preferred first. It is only consulted for
       # books the provider has NOT designated on the wire; both adapters do designate

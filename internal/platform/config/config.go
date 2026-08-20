@@ -253,10 +253,24 @@ var (
 	// legitimate future use is a SHARED store once replicas exist and a
 	// rebalance moves partitions; the declaration comes back with the client,
 	// not before it.
+	//
+	// Postgres was added in phase 9. The pricing pass itself still touches no
+	// database — it is a fold of the compacted price.computed topic and must stay
+	// one, because internal/pricing's change detection depends on the pass being a
+	// pure function of the record. What needs the pool is the SIGNALS STAGE, a
+	// second consumer group in the same binary (cmd/pricer's package comment
+	// argues why it is a second consumer rather than a hook), which persists +EV,
+	// arbitrage and steam findings to the tables migrations/00009 creates.
+	//
+	// It is REQUIRED rather than optional for the same reason ingest's is: a
+	// pricer that started without a DSN would report itself ready, publish
+	// findings to the bus, and leave every analytics table empty — the query
+	// surface would answer 200 with an empty collection, which is
+	// indistinguishable from "the market is quiet".
 	Pricer = Spec{
 		Service:         "pricer",
 		DefaultHTTPAddr: ":8082",
-		Requires:        RequireHTTP | RequireKafka,
+		Requires:        RequireHTTP | RequirePostgres | RequireKafka,
 	}
 	// Ingest polls provider adapters and publishes normalized deltas. Redis
 	// backs the distributed rate limiter that protects the provider quota.

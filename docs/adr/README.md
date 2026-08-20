@@ -23,6 +23,7 @@ it has failed.
 | [0008](0008-websocket-gateway.md) | Groupless bus read, per-connection sequencing, a subprotocol-carried bearer, Redis for subscriptions only | Accepted | 2026-08-19 |
 | [0009](0009-frontend-data-plane.md) | Generated TypeScript types, client-side odds formatting, REST for the tree and WebSocket for movement | Accepted | 2026-08-19 |
 | [0010](0010-placement-and-settlement.md) | A derived wager id, self-exclusion in two layers, limits summed from the ledger, a named cash-out haircut, results from the pipeline's own storage | Accepted | 2026-08-20 |
+| [0011](0011-analytics-in-go.md) | The signals stage on `pricer`, CLV on `settle`, retention-based `signals.*` topics, `scheduled_start` as the close, a board ranked on ROI and CLV | Accepted | 2026-08-20 |
 
 ## Template
 

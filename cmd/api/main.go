@@ -508,6 +508,27 @@ func routeSets(
 		// own choosing.
 		CashOutQuotes: nil,
 		CashOuts:      nil,
+
+		// The phase 9 analytics surface: the +EV finder, live arbitrage, steam,
+		// per-customer CLV and the public leaderboard. All three ports are the
+		// SAME `store`, and all three are required rather than optional.
+		//
+		// There is nothing to degrade around here, unlike the two cash-out
+		// ports: these read tables the same migration set that creates `events`
+		// and `prices` also creates, over the same pool, through the same
+		// generated queries. A deployment cannot have the board without them, so
+		// a nil here is a wiring mistake and NewAPI refuses to start rather than
+		// serving a complete-looking product whose most distinctive feature
+		// answers 404.
+		//
+		// What CAN legitimately be empty is the DATA: `pricer` may not have
+		// detected anything yet and `settle` may not have graded a leg. Every
+		// one of these endpoints then answers with an empty list and an honest
+		// aggregate, which is the correct answer and is what the frontend
+		// renders an empty state for.
+		Signals:     store,
+		CLV:         store,
+		Leaderboard: store,
 		// Cache is nil: the Redis snapshot in front of Prices is an optimisation
 		// and every read goes to Postgres without it, which is correct and
 		// slower. It arrives with the market-state store rather than being

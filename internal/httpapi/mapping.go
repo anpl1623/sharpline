@@ -2,6 +2,8 @@ package httpapi
 
 import (
 	"cmp"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"slices"
@@ -502,4 +504,312 @@ func priceMovement(seen, current float64) gen.PriceMovement {
 		return gen.Lengthened
 	}
 	return gen.Shortened
+}
+
+// -----------------------------------------------------------------------------
+// Analytics -> wire
+//
+// Every function below is total and infallible, like the rest of this file. The
+// enums have already been parsed at the store boundary (internal/httpapi/pgstore
+// is where a raw column string becomes a domain or odds value, and where a
+// schema/Go divergence surfaces as a wrapped error), so nothing here can fail on
+// an unrecognised member — by the time a finding reaches this file it is already
+// well-typed.
+//
+// DURATIONS BECOME SECONDS, as float64. The domain carries time.Duration because
+// nanoseconds are the unit Go compares in; no consumer of a staleness figure
+// wants nanosecond resolution, and a browser rendering one would divide by 1e9
+// at three call sites. This is the same conversion wireEvent already makes for a
+// game clock.
+// -----------------------------------------------------------------------------
+
+// seconds renders a duration for the wire.
+//
+// Signed, and deliberately so: a quote age may be negative when a provider's
+// clock runs ahead of ours, and clamping it here would hide clock skew inside
+// the one number whose job is to expose staleness.
+func seconds(d time.Duration) float64 { return d.Seconds() }
+
+// copyFloat copies an optional float so the wire value cannot alias the read
+// model's. Cheap insurance: a caller that mutated a returned page would
+// otherwise mutate the store's row through a shared pointer.
+func copyFloat(p *float64) *float64 {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
+func wireEVSignal(s EVSignal) gen.EVSignal {
+	return gen.EVSignal{
+		SelectionId:     s.SelectionID.String(),
+		MarketId:        s.MarketID.String(),
+		MarketType:      gen.MarketType(s.MarketType.String()),
+		LeagueId:        s.LeagueID.String(),
+		BookId:          s.BookID.String(),
+		ReferenceBookId: s.ReferenceBookID.String(),
+
+		DevigMethod:    gen.DevigMethod(s.DevigMethod.String()),
+		OfferedDecimal: float64(s.OfferedDecimal),
+		OfferedImplied: s.OfferedImplied,
+		Line:           copyFloat(s.Line),
+
+		FairProbability: s.FairProbability,
+		FairDecimal:     float64(s.FairDecimal),
+
+		ExpectedValue:        s.ExpectedValue,
+		ExpectedValuePercent: s.ExpectedValuePercent,
+		Edge:                 s.Edge,
+		EdgePercent:          s.EdgePercent,
+		Kelly:                s.Kelly,
+		FractionalKelly:      s.FractionalKelly,
+		KellyFraction:        s.KellyFraction,
+
+		QuoteObservedAt: s.QuoteObservedAt.UTC(),
+		QuoteAgeSeconds: seconds(s.QuoteAge),
+
+		ThresholdEvPercent: s.ThresholdEVPercent,
+		MaxQuoteAgeSeconds: seconds(s.MaxQuoteAge),
+		DetectedAt:         s.DetectedAt.UTC(),
+	}
+}
+
+// wireArbitrageSignal maps a finding and its legs together.
+//
+// ReturnPercent is derived HERE rather than stored, for migration 00009's stated
+// reason about the margin family: it is a single operation on a number already
+// in the response, and a stored derivation is a stored opportunity for two
+// surfaces to disagree. The client could compute it; it is on the wire because
+// every surface that renders a return should render the same digits.
+func wireArbitrageSignal(s ArbitrageSignal) gen.ArbitrageSignal {
+	out := gen.ArbitrageSignal{
+		Id:         s.ID,
+		MarketId:   s.MarketID.String(),
+		MarketType: gen.MarketType(s.MarketType.String()),
+		LeagueId:   s.LeagueID.String(),
+		Line:       copyFloat(s.Line),
+
+		SelectionCount: s.SelectionCount,
+		ImpliedSum:     s.ImpliedSum,
+		ReturnFraction: s.ReturnFraction,
+		ReturnPercent:  s.ReturnFraction * 100,
+		DistinctBooks:  s.DistinctBooks,
+
+		ObservedSpreadSeconds: seconds(s.ObservedSpread),
+		OldestLegAgeSeconds:   seconds(s.OldestLegAge),
+		ObservedAt:            s.ObservedAt.UTC(),
+
+		MaxLegAgeSeconds:         seconds(s.MaxLegAge),
+		MaxObservedSpreadSeconds: seconds(s.MaxObservedSpread),
+		DetectedAt:               s.DetectedAt.UTC(),
+
+		Legs: make([]gen.ArbitrageLeg, 0, len(s.Legs)),
+	}
+	for _, l := range s.Legs {
+		out.Legs = append(out.Legs, gen.ArbitrageLeg{
+			LegIndex:      l.Index,
+			SelectionId:   l.SelectionID.String(),
+			Role:          gen.SelectionRole(l.Role.String()),
+			BookId:        l.BookID.String(),
+			DecimalOdds:   float64(l.DecimalOdds),
+			Line:          copyFloat(l.Line),
+			StakeFraction: l.StakeFraction,
+			ObservedAt:    l.ObservedAt.UTC(),
+			AgeSeconds:    seconds(l.Age),
+		})
+	}
+	return out
+}
+
+// wireSteamSignal maps a steam detection.
+//
+// A nil DevigMethod becomes the string `none`, which is the schema's own member
+// and the EXPECTED value rather than a fallback: a book's margin is very nearly
+// constant across a window of seconds, so devigging mostly subtracts the same
+// constant from both ends of a difference.
+func wireSteamSignal(s SteamSignal) gen.SteamSignal {
+	out := gen.SteamSignal{
+		MarketId:    s.MarketID.String(),
+		MarketType:  gen.MarketType(s.MarketType.String()),
+		LeagueId:    s.LeagueID.String(),
+		SelectionId: s.SelectionID.String(),
+
+		WindowStart:   s.WindowStart.UTC(),
+		WindowEnd:     s.WindowEnd.UTC(),
+		WindowSeconds: seconds(s.Window),
+		HopSeconds:    seconds(s.Hop),
+
+		Direction:                    gen.SteamDirection(s.Direction),
+		DeltaProbability:             s.DeltaProbability,
+		MagnitudeProbabilityPoints:   s.Magnitude,
+		VelocityProbabilityPerMinute: s.Velocity,
+		DevigMethod:                  steamBasis(s.DevigMethod),
+
+		LeadBookId:  s.LeadBookID.String(),
+		LeadMovedAt: s.LeadMovedAt.UTC(),
+
+		Followers:            make([]gen.SteamFollower, 0, len(s.Followers)),
+		FollowerCount:        s.FollowerCount,
+		ParticipatingBooks:   s.ParticipatingBooks,
+		CrossBookCorrelation: s.CrossBookCorrelation,
+
+		ThresholdVelocity:     s.ThresholdVelocity,
+		ThresholdMagnitude:    s.ThresholdMagnitude,
+		ThresholdCorrelation:  s.ThresholdCorrelation,
+		MinFollowers:          s.MinFollowers,
+		MaxFollowerLagSeconds: seconds(s.MaxFollowerLag),
+
+		DetectedAt: s.DetectedAt.UTC(),
+	}
+	for _, f := range s.Followers {
+		out.Followers = append(out.Followers, gen.SteamFollower{
+			BookId:           f.BookID.String(),
+			MovedAt:          f.MovedAt.UTC(),
+			LagSeconds:       seconds(f.Lag),
+			DeltaProbability: f.DeltaProbability,
+		})
+	}
+	return out
+}
+
+// steamBasis renders the optional devig method as the wire's five-member enum.
+func steamBasis(m *odds.DevigMethod) gen.SteamBasis {
+	if m == nil {
+		return gen.SteamBasisNone
+	}
+	return gen.SteamBasis(m.String())
+}
+
+func wireCLVEntry(e CLVEntry) gen.CLVEntry {
+	return gen.CLVEntry{
+		LegId:       e.LegID.String(),
+		WagerId:     e.WagerID.String(),
+		MarketId:    e.MarketID.String(),
+		MarketType:  gen.MarketType(e.MarketType.String()),
+		SelectionId: e.SelectionID.String(),
+		LeagueId:    e.LeagueID.String(),
+
+		TakenBookId:   e.TakenBookID.String(),
+		ClosingBookId: e.ClosingBookID.String(),
+		DevigMethod:   gen.DevigMethod(e.DevigMethod.String()),
+
+		TakenLine:   copyFloat(e.TakenLine),
+		ClosingLine: copyFloat(e.ClosingLine),
+		TakenAt:     e.TakenAt.UTC(),
+		ClosedAt:    e.ClosedAt.UTC(),
+
+		TakenFair:    e.TakenFair,
+		ClosingFair:  e.ClosingFair,
+		TakenPrice:   float64(e.TakenPrice),
+		ClosingPrice: float64(e.ClosingPrice),
+
+		ProbabilityClv: e.ProbabilityCLV,
+		PercentClv:     e.PercentCLV,
+		Magnitude:      e.Magnitude,
+
+		BeatClose: e.BeatClose,
+		LineMoved: e.LineMoved,
+		LegStatus: gen.LegStatus(e.Status.String()),
+		Voided:    e.Voided,
+		GradedAt:  e.GradedAt.UTC(),
+	}
+}
+
+// wireCLVAggregate maps the summary, keeping the null means NULL.
+//
+// BeatRate is derived here and is nil under exactly the same condition the means
+// are, rather than being computed as 0/0 or as 0. A rate over zero samples is
+// not zero, it does not exist, and a surface that rendered it as 0% would report
+// "never beat the close" about a customer who has no countable wagers at all.
+func wireCLVAggregate(a CLVAggregate) gen.CLVAggregate {
+	out := gen.CLVAggregate{
+		Samples:            a.Samples,
+		Counted:            a.Counted,
+		VoidExcluded:       a.VoidExcluded,
+		LineMovedExcluded:  a.LineMovedExcluded,
+		BeatCount:          a.BeatCount,
+		MeanProbabilityClv: copyFloat(a.MeanProbabilityCLV),
+		MeanPercentClv:     copyFloat(a.MeanPercentCLV),
+	}
+	if a.Counted > 0 {
+		rate := float64(a.BeatCount) / float64(a.Counted)
+		out.BeatRate = &rate
+	}
+	return out
+}
+
+func wireCLVLeagueSummary(s CLVLeagueSummary) gen.CLVLeagueSummary {
+	out := gen.CLVLeagueSummary{
+		LeagueId:           s.LeagueID.String(),
+		Counted:            s.Counted,
+		BeatCount:          s.BeatCount,
+		MeanProbabilityClv: s.MeanProbabilityCLV,
+		MeanPercentClv:     s.MeanPercentCLV,
+	}
+	// The statement's HAVING clause guarantees Counted > 0, so this division is
+	// safe. The guard is here anyway because "the query cannot return that" is a
+	// property of a file this one does not import.
+	if s.Counted > 0 {
+		out.BeatRate = float64(s.BeatCount) / float64(s.Counted)
+	}
+	return out
+}
+
+// wireLeaderboardEntry maps one ranked customer.
+//
+// `rank` is assigned by the caller from the returned order rather than being a
+// stored fact: it is a position under one basis, one window and one pair of
+// sample floors, and storing it would make it wrong the moment any of those
+// changed.
+//
+// THE ACCOUNT IDENTIFIER DOES NOT APPEAR. [publicHandle] derives the pseudonym;
+// see its doc comment for why a handle exists at all.
+func wireLeaderboardEntry(e LeaderboardEntry, rank int32) gen.LeaderboardEntry {
+	return gen.LeaderboardEntry{
+		Rank: rank,
+		User: publicHandle(e.UserID),
+
+		SettledWagers:  e.SettledWagers,
+		StakedMinor:    e.Staked.MinorUnits(),
+		NetReturnMinor: e.NetReturn.MinorUnits(),
+		Roi:            e.ROI,
+		RoiPercent:     e.ROI * 100,
+
+		ClvSamples:         e.CLVSamples,
+		BeatCount:          e.BeatCount,
+		BeatRate:           e.BeatRate,
+		MeanProbabilityClv: e.MeanProbabilityCLV,
+		MeanPercentClv:     e.MeanPercentCLV,
+	}
+}
+
+// publicHandle derives the pseudonym a leaderboard row is published under.
+//
+// # Why there is a handle at all
+//
+// The leaderboard is public (CLAUDE.md §6) and this system stores no display
+// name: `users` holds an email address and nothing else, so "show the user's
+// name" would mean publishing an email address, and "show the user id" would
+// publish an account identifier on an unauthenticated page. Neither is
+// acceptable, and a board with no row identity at all cannot be read — a
+// customer must be able to find themselves on it.
+//
+// # Why a hash, and what it is and is not
+//
+// SHA-256 truncated to 12 hex characters, prefixed. The properties that matter:
+// it is DETERMINISTIC, so the same customer is the same handle on every refresh
+// and across replicas; it is derived from a value that is already 256 bits of
+// crypto/rand (auth.NewOpaqueID), so it cannot be reversed by enumerating a
+// small input space the way a hashed email or a hashed sequential id could; and
+// it contains no clock and no per-process state, so two api pods agree.
+//
+// It is NOT a secret and is NOT an authentication token. Anybody who already
+// holds a user id can compute the handle for it — which is fine, because holding
+// the id is the harder half. The collision probability at 48 bits is
+// irrelevant at this scale, and a collision would merge two rows on a display,
+// not confuse two accounts anywhere it matters.
+func publicHandle(id domain.UserID) string {
+	sum := sha256.Sum256([]byte(id.String()))
+	return "sl_" + hex.EncodeToString(sum[:6])
 }

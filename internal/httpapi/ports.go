@@ -107,6 +107,8 @@ package httpapi
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/netip"
 	"time"
 
@@ -1077,3 +1079,665 @@ type TakeCashOut struct {
 type TicketPricer interface {
 	TicketDecimal(ctx context.Context, t betting.Ticket) (float64, error)
 }
+
+// -----------------------------------------------------------------------------
+// Analytics: the read model
+//
+// Phase 9 (CLAUDE.md §11) builds the analytics surface IN GO first, deliberately,
+// so that the phase 12 Flink SQL jobs have a reference implementation to be
+// validated against — "same inputs, same outputs, or the Flink job is wrong"
+// (CLAUDE.md §3). That has one consequence this package must honour and does:
+//
+// EVERYTHING BELOW IS A PERSISTED FINDING, NOT A COMPUTATION. No handler in this
+// package devigs a market, sizes a Kelly stake, sums an implied probability or
+// scores a closing line. `pricer` wrote the EV, arbitrage and steam rows;
+// `settle` wrote the CLV rows; this package ranks, filters, pages and renders
+// them. A second implementation of any of that arithmetic here would be a second
+// answer that can disagree with the one the detector recorded, and the whole
+// point of the phase is that there is exactly one set of semantics to reproduce.
+//
+// The corollary is that every threshold a finding was written under travels ON
+// the finding. A reader's filter and the detector's configuration are different
+// facts — a reader asking for less than the detector emitted gets what the
+// detector emitted and nothing more — and collapsing them would make a row
+// uninterpretable six months later when the configuration has moved.
+// -----------------------------------------------------------------------------
+
+// EVSignal is one offered price the pricer scored as positive expected value
+// against the sharp reference book (ADR 0006).
+//
+// Every field is as written, including the ones that look redundant.
+// KellyFraction is carried beside FractionalKelly so the fractional stake is
+// reproducible rather than a number a reader has to trust; ThresholdEVPercent
+// and MaxQuoteAge are carried so a row remains interpretable after the
+// detector's configuration changes.
+//
+// NOTHING HERE IS MONEY. ExpectedValue, Edge and Kelly are all rates over a
+// hypothetical unit stake, and there is no domain.Money field on this type
+// because there is no amount — this surface does not choose a bankroll.
+type EVSignal struct {
+	SelectionID     domain.SelectionID
+	MarketID        domain.MarketID
+	MarketType      domain.MarketType
+	LeagueID        domain.LeagueID
+	BookID          domain.BookID
+	ReferenceBookID domain.BookID
+
+	DevigMethod odds.DevigMethod
+
+	OfferedDecimal odds.Decimal
+	OfferedImplied float64
+
+	// Line is in the SELECTION's frame — inverted for an away spread, so it
+	// reads as the number a bettor on this selection took. Absent on moneyline
+	// and futures, which is a different fact from a line of zero.
+	Line *float64
+
+	FairProbability float64
+	FairDecimal     odds.Decimal
+
+	ExpectedValue        float64
+	ExpectedValuePercent float64
+	Edge                 float64
+	EdgePercent          float64
+	Kelly                float64
+	FractionalKelly      float64
+	KellyFraction        float64
+
+	QuoteObservedAt time.Time
+
+	// QuoteAge MAY BE NEGATIVE. A provider clock running ahead of ours stamps a
+	// quote in our future, and domain.Price.Age() reports that honestly rather
+	// than clamping it — clamping would hide a clock-skew problem inside a
+	// number whose whole job is to expose staleness.
+	QuoteAge time.Duration
+
+	ThresholdEVPercent float64
+	MaxQuoteAge        time.Duration
+
+	// DetectedAt is our clock and is NEVER an ordering key or part of an
+	// identity. These rows are replayable: a re-detection after a fix must land
+	// on the row it corrects, so nothing that identifies a finding may be a
+	// reading of a clock of ours.
+	DetectedAt time.Time
+}
+
+// EVSignalKey is the total ordering the +EV list is ranked and cursored by.
+//
+// ExpectedValuePercent alone is nowhere near total — ties are common, because
+// two books quoting the same price on the same selection produce the same
+// number — so the instant and then the two identifiers follow. The triple
+// (selection, book, quote instant) is unique in the table, so the quadruple is
+// total. All four compare DESCENDING, which is what lets the whole comparison be
+// one index range: PostgreSQL plans a row-value comparison as an index range
+// only when every column agrees in direction.
+type EVSignalKey struct {
+	ExpectedValuePercent float64
+	QuoteObservedAt      time.Time
+	SelectionID          domain.SelectionID
+	BookID               domain.BookID
+}
+
+// EVSignalQuery asks for one keyset page of +EV findings.
+//
+// ObservedAfter is REQUIRED and there is deliberately no way to express its
+// absence: `ev_signals` is a hypertable with no retention policy, so an
+// unbounded read consults an index on every chunk that has ever existed. This is
+// the same rule [HistoryQuery] states for `prices`, for the same reason.
+type EVSignalQuery struct {
+	// LeagueID scopes the page to one league. Zero means every league, which is
+	// served by a different index and therefore a different statement.
+	LeagueID domain.LeagueID
+
+	ObservedAfter time.Time
+	MinEVPercent  float64
+
+	// Books and MarketTypes are residual filters — they narrow rows the index
+	// range already selected rather than choosing the index. Empty means no
+	// filter, which is why they are slices rather than sets: the statement takes
+	// an array and tests `cardinality(...) = 0 OR col = ANY(...)`.
+	Books       []domain.BookID
+	MarketTypes []domain.MarketType
+
+	After *EVSignalKey
+	Limit int32
+}
+
+// EVSignalPage is one page of +EV findings plus whether another exists.
+type EVSignalPage struct {
+	Signals []EVSignal
+	HasMore bool
+}
+
+// ArbitrageLeg is one side of an arbitrage, at one book.
+type ArbitrageLeg struct {
+	Index       int32
+	SelectionID domain.SelectionID
+	Role        domain.SelectionRole
+	BookID      domain.BookID
+	DecimalOdds odds.Decimal
+
+	// Line is in the SELECTION's frame, unlike [ArbitrageSignal.Line].
+	Line *float64
+
+	// StakeFraction is this leg's share of the total outlay — the split that
+	// equalises the return whichever selection wins. A FRACTION, never an
+	// amount.
+	StakeFraction float64
+
+	ObservedAt time.Time
+
+	// Age is how old this leg's price was when the finding was written. It is
+	// carried PER LEG and not only as a maximum, because a two-leg arbitrage
+	// with one fresh side and one 90-second-old side is one book that has not
+	// moved yet, and that is visible here and nowhere else.
+	Age time.Duration
+}
+
+// ArbitrageSignal is one market whose best prices sum to under one implied
+// probability.
+//
+// # Why the staleness fields are not optional detail
+//
+// The phase-4 gate measured 68 apparent arbitrages over 1,065 records with the
+// leg-age bound binding almost constantly: most cross-book "arbitrage" is not an
+// opportunity, it is one book that has not moved yet. ObservedSpread,
+// OldestLegAge and each leg's own Age are therefore first-class fields that
+// every surface rendering a finding must show — a feed that hides them trains a
+// reader to ignore the one finding that is real.
+type ArbitrageSignal struct {
+	ID         string
+	MarketID   domain.MarketID
+	MarketType domain.MarketType
+	LeagueID   domain.LeagueID
+
+	// Line is the MARKET's line, in the home frame. This is the one place in
+	// this package's analytics model where a line is not in the selection frame,
+	// because the signal is about the market while its legs are about the
+	// selections — and each leg carries its own line in its own frame.
+	Line *float64
+
+	SelectionCount int32
+
+	// ImpliedSum is strictly below 1 by construction; that IS the arbitrage.
+	// Booking percentage, overround and vig are single-operation functions of
+	// it and are deliberately not carried as separate fields, because a stored
+	// derivation is a stored opportunity to disagree.
+	ImpliedSum     float64
+	ReturnFraction float64
+
+	// DistinctBooks may be 1, which is LEGAL and is the STRONGER finding: a
+	// single under-round market carries no execution risk from a second book
+	// moving between bets.
+	DistinctBooks int32
+
+	ObservedSpread time.Duration
+	OldestLegAge   time.Duration
+
+	// ObservedAt is the OLDEST leg's instant — the earliest moment at which
+	// every leg had been observed, and therefore the first moment the
+	// arbitrage can be said to have existed. Not the newest, and not a
+	// detection time.
+	ObservedAt time.Time
+
+	// MaxLegAge and MaxObservedSpread are the bounds the DETECTOR applied, as
+	// distinct from the bounds this read applied. Both are on the row so a
+	// finding stays interpretable after the detector is reconfigured.
+	MaxLegAge         time.Duration
+	MaxObservedSpread time.Duration
+
+	DetectedAt time.Time
+
+	Legs []ArbitrageLeg
+}
+
+// ArbitrageQuery asks for the live arbitrage set.
+//
+// There is no cursor and no key, deliberately. The bounds below make the live
+// set small by construction and it turns over in seconds, so a cursor would page
+// through a list that no longer exists. If the set ever outgrows a page the
+// answer is a tighter bound, not a cursor.
+type ArbitrageQuery struct {
+	LeagueID    domain.LeagueID
+	MarketTypes []domain.MarketType
+
+	ObservedAfter     time.Time
+	MaxLegAge         time.Duration
+	MaxObservedSpread time.Duration
+	MinReturnFraction float64
+	MinDistinctBooks  int32
+
+	Limit int32
+}
+
+// SteamDirection is which way a selection's implied probability moved.
+//
+// It is declared here rather than in internal/domain because steam is not a
+// domain concept — no wager, price or market carries one — and a type in the
+// domain that only one HTTP surface names would be domain vocabulary invented
+// for a renderer.
+type SteamDirection string
+
+// The two directions. `shorten` is a RISE in implied probability (the price got
+// shorter); `drift` is a fall. The words are on the wire so that direction is
+// never carried by colour alone, which DESIGN.md requires of every direction
+// indicator in this product.
+const (
+	SteamShorten SteamDirection = "shorten"
+	SteamDrift   SteamDirection = "drift"
+)
+
+// ParseSteamDirection resolves a stored direction, rejecting anything else.
+//
+// A schema/Go divergence must surface as a wrapped error at the read rather than
+// as a silent zero value — the same rule sqlc.yaml states for every enum column
+// in this system.
+func ParseSteamDirection(s string) (SteamDirection, error) {
+	switch SteamDirection(s) {
+	case SteamShorten:
+		return SteamShorten, nil
+	case SteamDrift:
+		return SteamDrift, nil
+	default:
+		return "", fmt.Errorf("httpapi: %q: %w", s, ErrUnknownSteamDirection)
+	}
+}
+
+// SteamFollower is one book that followed the lead book inside the window.
+type SteamFollower struct {
+	BookID           domain.BookID
+	MovedAt          time.Time
+	Lag              time.Duration
+	DeltaProbability float64
+}
+
+// SteamSignal is one correlated, book-led line move — the one genuinely new
+// detector phase 9 adds.
+//
+// # The units, which are not negotiable
+//
+// DeltaProbability, Magnitude and Velocity are all in IMPLIED PROBABILITY
+// POINTS, never in decimal odds. Decimal odds are non-linear in probability: a
+// 0.10 decimal move is 0.045 probability points at 1.50 and 0.001 at 10.00, so a
+// fixed decimal threshold means a different thing at every price and a detector
+// tuned on one price range fires on noise at another.
+//
+// # Why the correlation is the finding and the magnitude is not
+//
+// Ordinary drift is uncorrelated across books; a steam move is a correlated jump
+// the sharp book takes first and lagged books repeat. CrossBookCorrelation is
+// therefore what separates the two, and a large move with a low correlation is
+// noise however large it is. Magnitude is a filter; it is never the ranking.
+type SteamSignal struct {
+	MarketID   domain.MarketID
+	MarketType domain.MarketType
+	LeagueID   domain.LeagueID
+
+	// SelectionID is part of the identity because STEAM IS DIRECTIONAL. Keying
+	// by market alone would collapse the shortening side and the drifting side
+	// of the same move into one finding and lose half of them.
+	SelectionID domain.SelectionID
+
+	// The window is HALF-OPEN, [WindowStart, WindowEnd). WindowEnd is the value
+	// the feed is ordered and cursored on.
+	WindowStart time.Time
+	WindowEnd   time.Time
+	Window      time.Duration
+
+	// Hop is the step between consecutive windows and never exceeds Window:
+	// windows HOP rather than tumble, so a move straddling a boundary is still
+	// seen whole by some window.
+	Hop time.Duration
+
+	Direction        SteamDirection
+	DeltaProbability float64
+	Magnitude        float64
+	Velocity         float64
+
+	// DevigMethod is nil for the margin treatment the schema spells `none`, and
+	// nil is the EXPECTED value: a book's margin is very nearly constant across
+	// a window of seconds, so devigging mostly subtracts the same constant from
+	// both ends of a difference. A pointer rather than a bool beside a method
+	// because two fields could disagree and one cannot.
+	DevigMethod *odds.DevigMethod
+
+	LeadBookID  domain.BookID
+	LeadMovedAt time.Time
+
+	// Followers are ordered by Lag ascending. The lag IS the signal — it is what
+	// a reader has left to act on.
+	Followers          []SteamFollower
+	FollowerCount      int32
+	ParticipatingBooks int32
+
+	CrossBookCorrelation float64
+
+	ThresholdVelocity    float64
+	ThresholdMagnitude   float64
+	ThresholdCorrelation float64
+	MinFollowers         int32
+	MaxFollowerLag       time.Duration
+
+	DetectedAt time.Time
+}
+
+// SteamSignalKey is the total ordering the steam feed is sorted and cursored by.
+//
+// RECENCY FIRST, NOT MAGNITUDE. A steam alert is actionable only while the
+// follower books are still catching up, so an hour-old larger move is worth less
+// than a fresh smaller one. WindowEnd is not total on its own — many markets
+// close a window at the same instant — so the market and the selection follow,
+// and (market, selection, window) is unique.
+type SteamSignalKey struct {
+	WindowEnd   time.Time
+	MarketID    domain.MarketID
+	SelectionID domain.SelectionID
+}
+
+// SteamQuery asks for one keyset page of the steam feed.
+//
+// WindowEndAfter is REQUIRED, for [EVSignalQuery]'s reason: `steam_signals` is a
+// hypertable with no retention policy.
+type SteamQuery struct {
+	WindowEndAfter        time.Time
+	MinMagnitude          float64
+	MinParticipatingBooks int32
+	MarketTypes           []domain.MarketType
+
+	After *SteamSignalKey
+	Limit int32
+}
+
+// SteamSignalPage is one page of the steam feed plus whether another exists.
+type SteamSignalPage struct {
+	Signals []SteamSignal
+	HasMore bool
+}
+
+// CLVEntry is one graded leg scored against the market's close.
+//
+// # Both prices are FAIR prices, and that is the whole point
+//
+// A quoted price contains the market's estimate of the outcome AND the book's
+// margin; closing line value is a claim about the first only. Comparing raw
+// quoted prices reports value lost on a line that never moved whenever a book
+// merely widened its juice — odds/clv.go works the arithmetic through with the
+// two standard American juice prices. TakenPrice and ClosingPrice here are
+// 1/fair, not what the customer was charged.
+//
+// # LineMoved and Voided are shown and not counted
+//
+// odds/clv.go says of a line-moved result: "Show it next to the two lines in a
+// user interface; never rank anyone by it." This type is what a user interface
+// reads, so both flags travel and both are excluded by [CLVAggregate]. A PUSH is
+// NOT void and IS counted at full weight — it is a settlement outcome, not a
+// data problem, and excluding it would make CLV depend on the scoreboard, which
+// is the exact dependency CLV exists to remove.
+type CLVEntry struct {
+	LegID       domain.LegID
+	WagerID     domain.WagerID
+	MarketID    domain.MarketID
+	MarketType  domain.MarketType
+	SelectionID domain.SelectionID
+	LeagueID    domain.LeagueID
+
+	TakenBookID   domain.BookID
+	ClosingBookID domain.BookID
+
+	// DevigMethod is ONE method applied to BOTH sides. Devigging the two sides
+	// differently would put the difference between two models inside a number
+	// claiming to measure a line move.
+	DevigMethod odds.DevigMethod
+
+	TakenLine   *float64
+	ClosingLine *float64
+
+	TakenAt  time.Time
+	ClosedAt time.Time
+
+	TakenFair    float64
+	ClosingFair  float64
+	TakenPrice   odds.Decimal
+	ClosingPrice odds.Decimal
+
+	ProbabilityCLV float64
+	PercentCLV     float64
+	Magnitude      float64
+
+	// BeatClose is ProbabilityCLV > odds.CLVTieBand. A TIE IS NOT A BEAT.
+	BeatClose bool
+	LineMoved bool
+
+	// Status is never domain.LegStatusPending: a leg with no result has no
+	// closing line value and no row.
+	Status domain.LegStatus
+	Voided bool
+
+	GradedAt time.Time
+}
+
+// CLVKey is the total ordering a customer's CLV history is sorted and cursored
+// by. GradedAt alone is not total — a parlay's legs on one game grade in one
+// transaction — so the leg identifier, a primary key, follows.
+type CLVKey struct {
+	GradedAt time.Time
+	LegID    domain.LegID
+}
+
+// CLVQuery asks for one keyset page of a customer's graded legs.
+//
+// Unlike the signal feeds there is no ceiling on GradedFrom, and the asymmetry
+// is deliberate: `wager_leg_clv` is a plain table read through an index led by
+// the customer's own id, so a wide window is one index range rather than a scan
+// of every chunk in a hypertable. The argument that bounds a hypertable read
+// does not apply, so inventing a ceiling would just truncate somebody's history.
+type CLVQuery struct {
+	UserID     domain.UserID
+	GradedFrom time.Time
+	After      *CLVKey
+	Limit      int32
+}
+
+// CLVPage is one page of a customer's graded legs plus whether another exists.
+type CLVPage struct {
+	Entries []CLVEntry
+	HasMore bool
+}
+
+// CLVWindowQuery asks for a summary over a half-open [From, To) window.
+type CLVWindowQuery struct {
+	UserID domain.UserID
+	From   time.Time
+	To     time.Time
+}
+
+// CLVAggregate is the summary form of odds.AggregateCLV.
+//
+// THE THREE COUNTS ARE THE POINT. A mean over a filtered set is not auditable
+// without knowing what was filtered, and "this customer's CLV is +1.2%" means
+// something different over 200 legs than over 3. Samples, VoidExcluded and
+// LineMovedExcluded make the exclusion visible instead of invisible.
+//
+// MeanProbabilityCLV and MeanPercentCLV are POINTERS because "no measurable
+// wagers" and "measured, and it averaged zero" are different facts, and a
+// surface that rendered the first as 0.00% would report an average of no numbers
+// as break-even. odds.ErrCLVNoSamples makes the same distinction in the pure
+// package; this is its shape at a read boundary that must still answer.
+type CLVAggregate struct {
+	Samples           int64
+	Counted           int64
+	VoidExcluded      int64
+	LineMovedExcluded int64
+	BeatCount         int64
+
+	MeanProbabilityCLV *float64
+	MeanPercentCLV     *float64
+}
+
+// CLVLeagueSummary is the same summary cut by league — what a customer is
+// actually good at. Only leagues with at least one countable leg appear, which
+// is why no mean here is a pointer.
+type CLVLeagueSummary struct {
+	LeagueID           domain.LeagueID
+	Counted            int64
+	BeatCount          int64
+	MeanProbabilityCLV float64
+	MeanPercentCLV     float64
+}
+
+// LeaderboardBasis is which measure the public board is ranked on.
+//
+// There is deliberately no member for raw profit. CLAUDE.md §6 says "a public
+// leaderboard on ROI and CLV, not raw profit", and the reason is that raw profit
+// ranks stake size and variance: the top of a profit board is whoever staked the
+// most and got lucky. Making "profit" unrepresentable here is stronger than
+// documenting that it is not offered.
+type LeaderboardBasis string
+
+// The two bases. Both measures are on every row whichever one is ranked, so a
+// reader can see when they disagree — which is the interesting case.
+const (
+	LeaderboardByROI LeaderboardBasis = "roi"
+	LeaderboardByCLV LeaderboardBasis = "clv"
+)
+
+// ParseLeaderboardBasis resolves the `basis` parameter.
+func ParseLeaderboardBasis(s string) (LeaderboardBasis, error) {
+	switch LeaderboardBasis(s) {
+	case LeaderboardByROI:
+		return LeaderboardByROI, nil
+	case LeaderboardByCLV:
+		return LeaderboardByCLV, nil
+	default:
+		return "", fmt.Errorf("httpapi: %q: %w", s, ErrUnknownLeaderboardBasis)
+	}
+}
+
+// LeaderboardQuery asks for one ranked board.
+//
+// MinSettledWagers and MinClvSamples are PARAMETERS with no in-query default,
+// and the response echoes them, because a ranking without its sample floor is
+// not interpretable: one lucky maximum-stake bet at the top of a board is the
+// exact failure the floor exists to prevent, and a reader cannot tell whether it
+// has been prevented unless the number is on screen.
+type LeaderboardQuery struct {
+	Basis            LeaderboardBasis
+	MinSettledWagers int64
+	MinCLVSamples    int64
+	From             time.Time
+	To               time.Time
+	Limit            int32
+}
+
+// LeaderboardEntry is one ranked customer.
+//
+// # The only money on this surface, and it is evidence rather than ranking
+//
+// Staked and NetReturn are domain.Money because they are amounts. ROI is not —
+// it is a ratio, and being stake-normalised is precisely what stops a customer
+// who staked ten thousand and lost from outranking one who staked ten and won.
+// Both are returned because ROI is unreadable without them, and neither is what
+// the board sorts on when the basis is CLV.
+//
+// # Who is on the row
+//
+// UserID is the account identifier and MUST NOT reach the wire. This system
+// stores no display name — `users` holds an email address and nothing else — so
+// the wire carries a stable one-way pseudonym derived from this value instead.
+// The store returns the identifier because the derivation belongs at the
+// rendering boundary, where it is one function with one test, and not in SQL.
+type LeaderboardEntry struct {
+	UserID domain.UserID
+
+	// SettledWagers counts `won`, `lost`, `push` and `cashed_out`. `void` is
+	// excluded from this AND from the money below: it had no action, and
+	// counting the stake would inflate turnover and drag every ROI toward zero.
+	SettledWagers int64
+	Staked        domain.Money
+	NetReturn     domain.Money
+	ROI           float64
+
+	// CLVSamples counts legs that are neither voided nor line-moved. A customer
+	// with zero is ABSENT from the board rather than present with a zero, which
+	// is odds.ErrCLVNoSamples' distinction enforced by an inner join.
+	CLVSamples         int64
+	BeatCount          int64
+	BeatRate           float64
+	MeanProbabilityCLV float64
+	MeanPercentCLV     float64
+}
+
+// -----------------------------------------------------------------------------
+// Analytics: the ports
+// -----------------------------------------------------------------------------
+
+// Signals reads the findings `pricer` persisted.
+//
+// Three methods rather than one generic one, because the three feeds have
+// genuinely different shapes and pretending otherwise would hide that: +EV is
+// ranked by value and cursored, steam is ranked by recency and cursored, and
+// arbitrage is a bounded live set with no cursor at all. A single
+// `Findings(kind, filters)` would need a union of every filter and would make
+// every caller re-check which fields applied.
+type Signals interface {
+	// EVSignals returns one page of +EV findings, best expected value first.
+	EVSignals(ctx context.Context, q EVSignalQuery) (EVSignalPage, error)
+
+	// ArbitrageSignals returns the live arbitrage set with each finding's legs
+	// already attached, best guaranteed return first.
+	//
+	// The legs come back on the signal rather than through a second call so a
+	// caller cannot render a finding without its evidence: an arbitrage without
+	// its per-leg ages is exactly the misleading artefact decision 5 of the
+	// phase-9 brief exists to prevent.
+	ArbitrageSignals(ctx context.Context, q ArbitrageQuery) ([]ArbitrageSignal, error)
+
+	// SteamSignals returns one page of the steam feed, most recent window first.
+	SteamSignals(ctx context.Context, q SteamQuery) (SteamSignalPage, error)
+}
+
+// CLV reads the closing-line-value rows `settle` wrote.
+//
+// EVERY METHOD TAKES THE USER AND SCOPES BY IT, for the reason [Wagers] does:
+// there is no "read anyone's CLV" method here and there must not be. A CLV row
+// names a wager, and a lookup that did not scope would need an ownership check
+// at every call site.
+type CLV interface {
+	// UserCLV returns one keyset page of graded legs, most recently graded
+	// first. It INCLUDES line-moved and voided rows; the exclusion happens in
+	// UserCLVAggregate, because this is the display path and a customer is
+	// entitled to see the leg the aggregate dropped.
+	UserCLV(ctx context.Context, q CLVQuery) (CLVPage, error)
+
+	// UserCLVAggregate returns the summary over the window. It ALWAYS returns a
+	// value, never [ErrNotFound]: a customer with no history has honest zeros
+	// and nil means, which is a different answer from "no such customer" and is
+	// the only one this endpoint can give, since the caller is authenticated.
+	UserCLVAggregate(ctx context.Context, q CLVWindowQuery) (CLVAggregate, error)
+
+	// UserCLVByLeague returns the same summary cut by league, leagues with the
+	// most evidence first.
+	UserCLVByLeague(ctx context.Context, q CLVWindowQuery) ([]CLVLeagueSummary, error)
+}
+
+// Leaderboard reads the public board.
+//
+// One method taking the basis, rather than two, because the two statements
+// differ only in their ORDER BY and return the identical row: a caller that had
+// to pick a method could pick one and render the other's label.
+type Leaderboard interface {
+	Leaderboard(ctx context.Context, q LeaderboardQuery) ([]LeaderboardEntry, error)
+}
+
+// ErrUnknownSteamDirection and ErrUnknownLeaderboardBasis report a value that is
+// not a member of its enum.
+//
+// Declared here beside the two types rather than in spec.go, because unlike
+// [ErrNotFound] and [ErrConflict] these are not conditions a handler maps onto a
+// status: a bad basis in a QUERY STRING is a parameter error the parser reports
+// by name, and a bad direction in a DATABASE COLUMN is a schema/Go divergence
+// that must reach a log as a wrapped error rather than becoming a zero value.
+var (
+	ErrUnknownSteamDirection   = errors.New("httpapi: unknown steam direction")
+	ErrUnknownLeaderboardBasis = errors.New("httpapi: unknown leaderboard basis")
+)

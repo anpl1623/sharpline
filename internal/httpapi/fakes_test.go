@@ -464,6 +464,87 @@ func (f *fakeAudit) Record(_ context.Context, e AuditEntry) error {
 }
 
 // -----------------------------------------------------------------------------
+// Analytics (phase 9)
+// -----------------------------------------------------------------------------
+
+// fakeSignals, fakeCLV and fakeLeaderboard record what the handlers ASKED FOR
+// and return what the test told them to.
+//
+// The recorded query is the valuable half. These three ports carry every
+// threshold, window and filter the analytics surface applies, and the thing most
+// worth asserting about a handler here is not the body it rendered but the
+// bounds it passed down — a default window that quietly widened, or a percent
+// that reached the store without being converted to a fraction, is invisible in
+// a response and fatal in a query plan.
+//
+// NOTHING HERE FABRICATES A FINDING. The zero value returns an empty page, which
+// is the honest answer for a system with no detections, and every test that
+// wants rows supplies them explicitly.
+type fakeSignals struct {
+	evQuery    EVSignalQuery
+	arbQuery   ArbitrageQuery
+	steamQuery SteamQuery
+
+	ev    EVSignalPage
+	arb   []ArbitrageSignal
+	steam SteamSignalPage
+
+	err error
+}
+
+func (f *fakeSignals) EVSignals(_ context.Context, q EVSignalQuery) (EVSignalPage, error) {
+	f.evQuery = q
+	return f.ev, f.err
+}
+
+func (f *fakeSignals) ArbitrageSignals(_ context.Context, q ArbitrageQuery) ([]ArbitrageSignal, error) {
+	f.arbQuery = q
+	return f.arb, f.err
+}
+
+func (f *fakeSignals) SteamSignals(_ context.Context, q SteamQuery) (SteamSignalPage, error) {
+	f.steamQuery = q
+	return f.steam, f.err
+}
+
+type fakeCLV struct {
+	pageQuery   CLVQuery
+	windowQuery CLVWindowQuery
+
+	page      CLVPage
+	aggregate CLVAggregate
+	byLeague  []CLVLeagueSummary
+
+	err error
+}
+
+func (f *fakeCLV) UserCLV(_ context.Context, q CLVQuery) (CLVPage, error) {
+	f.pageQuery = q
+	return f.page, f.err
+}
+
+func (f *fakeCLV) UserCLVAggregate(_ context.Context, q CLVWindowQuery) (CLVAggregate, error) {
+	f.windowQuery = q
+	return f.aggregate, f.err
+}
+
+func (f *fakeCLV) UserCLVByLeague(_ context.Context, q CLVWindowQuery) ([]CLVLeagueSummary, error) {
+	f.windowQuery = q
+	return f.byLeague, f.err
+}
+
+type fakeLeaderboard struct {
+	query   LeaderboardQuery
+	entries []LeaderboardEntry
+	err     error
+}
+
+func (f *fakeLeaderboard) Leaderboard(_ context.Context, q LeaderboardQuery) ([]LeaderboardEntry, error) {
+	f.query = q
+	return f.entries, f.err
+}
+
+// -----------------------------------------------------------------------------
 // Wiring
 // -----------------------------------------------------------------------------
 
@@ -480,7 +561,12 @@ type deps struct {
 	wagers    *fakeWagers
 	pricer    *fakePricer
 	cashOuts  *fakeCashOuts
-	logger    *slog.Logger
+
+	signals     *fakeSignals
+	clv         *fakeCLV
+	leaderboard *fakeLeaderboard
+
+	logger *slog.Logger
 }
 
 func newDeps() *deps {
@@ -501,7 +587,12 @@ func newDeps() *deps {
 		// the behaviour under test rather than something a fake would hide.
 		pricer:   &fakePricer{inner: betting.IndependentPricer{}},
 		cashOuts: &fakeCashOuts{},
-		logger:   discardLogger(),
+
+		signals:     &fakeSignals{},
+		clv:         &fakeCLV{},
+		leaderboard: &fakeLeaderboard{},
+
+		logger: discardLogger(),
 	}
 }
 
@@ -526,8 +617,13 @@ func (d *deps) api(t *testing.T) *API {
 		// handler behind it.
 		CashOutQuotes: d.cashOuts,
 		CashOuts:      d.cashOuts,
-		Logger:        d.logger,
-		Now:           fixedClock(),
+		// The three phase 9 ports are REQUIRED, so there is no partial build to
+		// choose here the way there is for the cash-out pair.
+		Signals:     d.signals,
+		CLV:         d.clv,
+		Leaderboard: d.leaderboard,
+		Logger:      d.logger,
+		Now:         fixedClock(),
 		// A no-op stand-in for the real Authenticate + RequireIdentity chain.
 		// The route table's shape is what this package owns; the verification
 		// itself is internal/httpapi/middleware's and is tested there.

@@ -167,6 +167,19 @@ func TestLoadFromValidation(t *testing.T) {
 			env:  with(map[string]string{config.EnvPricerReferenceBooks: ""}),
 		},
 		{
+			// Phase 9 put the signals stage in this binary: a second consumer
+			// group over price.computed that persists +EV, arbitrage and steam
+			// findings. Without a pool it would report itself ready, publish to
+			// the bus, and leave every analytics table empty — a query surface
+			// answering 200 with an empty collection, indistinguishable from a
+			// quiet market. The declaration is what makes that impossible.
+			name:         "pricer requires postgres",
+			spec:         config.Pricer,
+			env:          with(map[string]string{config.EnvPostgresDSN: ""}),
+			wantErr:      config.ErrMissing,
+			wantMentions: []string{config.EnvPostgresDSN},
+		},
+		{
 			name:         "api requires postgres",
 			spec:         config.API,
 			env:          with(map[string]string{config.EnvPostgresDSN: ""}),
@@ -402,6 +415,7 @@ func TestPricerReferenceBooksParseIntoAnOrderedList(t *testing.T) {
 
 	cfg, err := config.LoadFrom(config.Pricer, config.MapLookup(map[string]string{
 		config.EnvKafkaBrokers:         "kafka:9092",
+		config.EnvPostgresDSN:          "postgres://sharpline:secret@postgres:5432/sharpline?sslmode=disable",
 		config.EnvPricerReferenceBooks: " pinnacle , sharpline , ,",
 	}))
 	if err != nil {
@@ -414,6 +428,7 @@ func TestPricerReferenceBooksParseIntoAnOrderedList(t *testing.T) {
 
 	empty, err := config.LoadFrom(config.Pricer, config.MapLookup(map[string]string{
 		config.EnvKafkaBrokers: "kafka:9092",
+		config.EnvPostgresDSN:  "postgres://sharpline:secret@postgres:5432/sharpline?sslmode=disable",
 	}))
 	if err != nil {
 		t.Fatalf("LoadFrom(pricer) with no preference list: %v", err)
@@ -431,9 +446,12 @@ func TestLoadFromDefaults(t *testing.T) {
 	// Only the variables a pricer genuinely requires; everything else absent.
 	// Redis is deliberately NOT here: the pricer opens no Redis client, its whole
 	// state is a fold of a compacted topic, and phase 2's rule is that a declared
-	// dependency must be one the binary actually opens.
+	// dependency must be one the binary actually opens. Postgres IS here, and by
+	// that same rule: phase 9 put the signals stage in this binary, which opens a
+	// pool and writes the analytics tables.
 	env := map[string]string{
 		config.EnvKafkaBrokers: "kafka:9092",
+		config.EnvPostgresDSN:  "postgres://sharpline:secret@postgres:5432/sharpline?sslmode=disable",
 	}
 
 	cfg, err := config.LoadFrom(config.Pricer, config.MapLookup(env))

@@ -73,15 +73,21 @@ import {
 } from '@/lib/api/errors';
 import type {
   SchemaAccount,
+  SchemaArbitrageSignalList,
   SchemaBalanceResponse,
   SchemaBoardPage,
   SchemaBookPage,
   SchemaCashOutQuote,
+  SchemaClvResponse,
+  SchemaEvSignalPage,
   SchemaEventDetail,
   SchemaHistoryResolution,
   SchemaHistorySeries,
+  SchemaLeaderboardBasis,
+  SchemaLeaderboardPage,
   SchemaLeaguePage,
   SchemaMarketComparison,
+  SchemaMarketType,
   SchemaPlacement,
   SchemaPlaceWagerRequest,
   SchemaSearchPage,
@@ -89,6 +95,7 @@ import type {
   SchemaSlipQuote,
   SchemaSlipQuoteRequest,
   SchemaSportPage,
+  SchemaSteamSignalPage,
   SchemaWager,
   SchemaWagerPage,
   SchemaWagerStatus,
@@ -390,6 +397,111 @@ export interface WagerListParams {
 }
 
 /**
+ * Parameters for the +EV finder.
+ *
+ * `minEvPercent` is applied ON TOP of the threshold each finding was written
+ * under. A reader asking for less than the detector emitted gets what the
+ * detector emitted; findings that were never written cannot be recovered, and
+ * the API does not pretend otherwise.
+ *
+ * `observedAfter` has a server-side default (six hours) and a server-side
+ * CEILING (seven days, the retention of the matching Kafka topic). It exists at
+ * all because `ev_signals` is a Timescale hypertable with no retention policy,
+ * so an unbounded read consults every chunk ever created.
+ *
+ * EVERY filter here is part of the cursor's scope, unlike `book` on the board.
+ * On the board `book` changes how a page is rendered; here it changes WHICH ROWS
+ * are in the set, so changing any of these mid-listing is a 400 rather than a
+ * silently different page. Keep them identical across pages.
+ */
+export interface EVSignalParams {
+  readonly league?: string | undefined;
+  readonly book?: readonly string[] | undefined;
+  readonly marketType?: readonly SchemaMarketType[] | undefined;
+  readonly minEvPercent?: number | undefined;
+  readonly observedAfter?: string | undefined;
+  readonly limit?: number | undefined;
+  readonly cursor?: string | undefined;
+}
+
+/**
+ * Parameters for the live arbitrage feed.
+ *
+ * The three staleness bounds are the point of this endpoint rather than
+ * decoration on it: most cross-book "arbitrage" is one book that has not moved
+ * yet, and a firehose of stale-price findings is worse than none. Their defaults
+ * are the DETECTOR's own bounds, and whatever was applied comes back on
+ * `bounds`, so a reader can see why a list is short.
+ *
+ * There is no `cursor`. The bounds make the live set small and it turns over in
+ * seconds, so paging it would walk a list that no longer exists.
+ */
+export interface ArbitrageSignalParams {
+  readonly league?: string | undefined;
+  readonly marketType?: readonly SchemaMarketType[] | undefined;
+  readonly minReturnPercent?: number | undefined;
+  readonly maxLegAgeSeconds?: number | undefined;
+  readonly maxSpreadSeconds?: number | undefined;
+  readonly minDistinctBooks?: number | undefined;
+  readonly observedAfter?: string | undefined;
+  readonly limit?: number | undefined;
+}
+
+/**
+ * Parameters for the steam feed.
+ *
+ * `minMagnitude` is in IMPLIED PROBABILITY POINTS, not decimal odds: `0.02` is
+ * two points. Decimal odds are non-linear in probability, so a decimal threshold
+ * would mean a different thing at every price.
+ *
+ * The feed is ordered by RECENCY and magnitude is only ever a filter — a steam
+ * move is actionable while the follower books are still catching up.
+ */
+export interface SteamSignalParams {
+  readonly marketType?: readonly SchemaMarketType[] | undefined;
+  readonly minMagnitude?: number | undefined;
+  readonly minParticipatingBooks?: number | undefined;
+  readonly windowEndAfter?: string | undefined;
+  readonly limit?: number | undefined;
+  readonly cursor?: string | undefined;
+}
+
+/**
+ * Parameters for the authenticated customer's CLV.
+ *
+ * `gradedFrom` bounds the paged rows AND, with `gradedTo`, the aggregate. The
+ * window is half-open. A `from` at or after its `to` is a 422 rather than an
+ * empty page, because an empty page is indistinguishable from a customer who has
+ * never had a leg graded.
+ */
+export interface AccountCLVParams {
+  readonly gradedFrom?: string | undefined;
+  readonly gradedTo?: string | undefined;
+  readonly limit?: number | undefined;
+  readonly cursor?: string | undefined;
+}
+
+/**
+ * Parameters for the public leaderboard.
+ *
+ * `basis` is `roi` or `clv` and there is deliberately no third option for raw
+ * profit — a profit ranking rewards stake size and variance, which is exactly
+ * the ranking CLAUDE.md refuses. Both measures are on every row whichever one is
+ * ranked.
+ *
+ * The two minimums are the sample floors; the response echoes whatever was
+ * applied, so a reader can see the top row is not one lucky bet.
+ */
+export interface LeaderboardParams {
+  readonly basis?: SchemaLeaderboardBasis | undefined;
+  readonly minSettledWagers?: number | undefined;
+  readonly minClvSamples?: number | undefined;
+  readonly from?: string | undefined;
+  readonly to?: string | undefined;
+  readonly limit?: number | undefined;
+}
+
+/**
  * A client-chosen key that makes a retry safe, and the reason the two money
  * methods take it as a REQUIRED positional argument rather than an option.
  *
@@ -410,6 +522,61 @@ function boardQuery(
     limit: params?.limit,
     cursor: params?.cursor,
     book: params?.book,
+  };
+}
+
+function evSignalQuery(
+  params: EVSignalParams | undefined,
+): Readonly<Record<string, QueryValue>> {
+  return {
+    league: params?.league,
+    book: params?.book,
+    market_type: params?.marketType,
+    min_ev_percent: params?.minEvPercent,
+    observed_after: params?.observedAfter,
+    limit: params?.limit,
+    cursor: params?.cursor,
+  };
+}
+
+function arbitrageQuery(
+  params: ArbitrageSignalParams | undefined,
+): Readonly<Record<string, QueryValue>> {
+  return {
+    league: params?.league,
+    market_type: params?.marketType,
+    min_return_percent: params?.minReturnPercent,
+    max_leg_age_seconds: params?.maxLegAgeSeconds,
+    max_spread_seconds: params?.maxSpreadSeconds,
+    min_distinct_books: params?.minDistinctBooks,
+    observed_after: params?.observedAfter,
+    limit: params?.limit,
+  };
+}
+
+function steamQuery(
+  params: SteamSignalParams | undefined,
+): Readonly<Record<string, QueryValue>> {
+  return {
+    market_type: params?.marketType,
+    min_magnitude: params?.minMagnitude,
+    min_participating_books: params?.minParticipatingBooks,
+    window_end_after: params?.windowEndAfter,
+    limit: params?.limit,
+    cursor: params?.cursor,
+  };
+}
+
+function leaderboardQuery(
+  params: LeaderboardParams | undefined,
+): Readonly<Record<string, QueryValue>> {
+  return {
+    basis: params?.basis,
+    min_settled_wagers: params?.minSettledWagers,
+    min_clv_samples: params?.minClvSamples,
+    from: params?.from,
+    to: params?.to,
+    limit: params?.limit,
   };
 }
 
@@ -460,6 +627,48 @@ export interface ApiClient {
     options?: BrowserCallOptions,
   ): Promise<SchemaLeaguePage>;
   listBooks(options?: BrowserCallOptions): Promise<SchemaBookPage>;
+
+  /**
+   * The +EV finder. Public: these are findings about public odds and they name
+   * no customer.
+   *
+   * Every value on a row is relative to ONE book — the reference book named by
+   * `reference_book_id` — and an expected value is meaningless without it, which
+   * is why it travels on the row rather than being deployment knowledge.
+   */
+  listEVSignals(
+    params?: EVSignalParams,
+    options?: BrowserCallOptions,
+  ): Promise<SchemaEvSignalPage>;
+
+  /**
+   * Live arbitrage, best guaranteed return first, with the staleness bounds
+   * applied AND echoed. Every finding carries its oldest leg's age and the
+   * spread between its legs' observations, and every leg carries its own age —
+   * so a reader can see whether a finding is actionable rather than trusting
+   * that it passed a filter.
+   */
+  listArbitrageSignals(
+    params?: ArbitrageSignalParams,
+    options?: BrowserCallOptions,
+  ): Promise<SchemaArbitrageSignalList>;
+
+  /** Recent steam moves, most recent window first. Never sorted by magnitude. */
+  listSteamSignals(
+    params?: SteamSignalParams,
+    options?: BrowserCallOptions,
+  ): Promise<SchemaSteamSignalPage>;
+
+  /**
+   * The public leaderboard, ranked on ROI or CLV and never on profit.
+   *
+   * Rows carry a derived pseudonym rather than an identity: this system stores
+   * no display name, so publishing one would mean publishing an email address.
+   */
+  getLeaderboard(
+    params?: LeaderboardParams,
+    options?: BrowserCallOptions,
+  ): Promise<SchemaLeaderboardPage>;
   register(
     email: string,
     password: string,
@@ -480,6 +689,20 @@ export interface ApiClient {
 
   /** The spendable and escrowed balances, folded from the ledger. */
   getBalance(options: BrowserCallOptions): Promise<SchemaBalanceResponse>;
+
+  /**
+   * The signed-in customer's closing line value: the graded legs, the aggregate
+   * over the window, and the same cut by league.
+   *
+   * `data` INCLUDES line-moved and voided legs; `aggregate` excludes both. That
+   * asymmetry is deliberate — a customer is entitled to see the leg the average
+   * dropped — and a client must not compute its own mean from `data`, or it will
+   * disagree with the number the leaderboard ranked them on.
+   */
+  getAccountCLV(
+    params: AccountCLVParams | undefined,
+    options: BrowserCallOptions,
+  ): Promise<SchemaClvResponse>;
 
   /**
    * Price a slip WITHOUT placing it. Writes nothing and moves no money — no
@@ -597,6 +820,41 @@ export function createApiClient(send: Transport): ApiClient {
       }),
 
     listSports: (options = {}) => send<SchemaSportPage>('/sports', options),
+
+    listEVSignals: (params, options = {}) =>
+      send<SchemaEvSignalPage>('/signals/ev', {
+        ...options,
+        query: evSignalQuery(params),
+      }),
+
+    listArbitrageSignals: (params, options = {}) =>
+      send<SchemaArbitrageSignalList>('/signals/arbitrage', {
+        ...options,
+        query: arbitrageQuery(params),
+      }),
+
+    listSteamSignals: (params, options = {}) =>
+      send<SchemaSteamSignalPage>('/signals/steam', {
+        ...options,
+        query: steamQuery(params),
+      }),
+
+    getLeaderboard: (params, options = {}) =>
+      send<SchemaLeaderboardPage>('/leaderboard', {
+        ...options,
+        query: leaderboardQuery(params),
+      }),
+
+    getAccountCLV: (params, options) =>
+      send<SchemaClvResponse>('/account/clv', {
+        ...options,
+        query: {
+          graded_from: params?.gradedFrom,
+          graded_to: params?.gradedTo,
+          limit: params?.limit,
+          cursor: params?.cursor,
+        },
+      }),
 
     listLeaguesInSport: (sportSlug, options = {}) =>
       send<SchemaLeaguePage>(`/sports/${encode(sportSlug)}/leagues`, options),

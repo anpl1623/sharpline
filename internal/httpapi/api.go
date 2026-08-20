@@ -54,6 +54,10 @@ type API struct {
 	cashOutQuotes CashOutQuotes
 	cashOuts      CashOuts
 
+	signals     Signals
+	clv         CLV
+	leaderboard Leaderboard
+
 	requireAuth []Middleware
 
 	log   *slog.Logger
@@ -124,6 +128,24 @@ type APIOptions struct {
 	// the same path still serves.
 	CashOuts CashOuts
 
+	// Signals, CLV and Leaderboard are the phase 9 analytics read surface, and
+	// all three are REQUIRED.
+	//
+	// Unlike Sessions and the two cash-out ports there is no adapter-availability
+	// question to degrade around: they read tables the same migration set that
+	// creates `events` and `prices` also creates, over the same pool, through
+	// the same generated queries. A deployment could not have one of these
+	// without the others and could not have the board without all three.
+	//
+	// Making them required is also what stops the analytics surface going dark
+	// by omission. CLAUDE.md §6 calls analytics "the differentiator"; a wire-up
+	// that forgot one of these ports would serve a complete-looking product
+	// whose most distinctive feature answered 404, and nothing in the logs or
+	// the tests would say why. A startup error is the loud version of that.
+	Signals     Signals
+	CLV         CLV
+	Leaderboard Leaderboard
+
 	// Cache is the optional Redis snapshot in front of Prices. nil disables it
 	// and every read goes to Postgres, which is correct — just slower.
 	Cache PriceCache
@@ -183,6 +205,15 @@ func NewAPI(opts APIOptions) (*API, error) {
 	}
 	if opts.Pricer == nil {
 		missing = append(missing, "Pricer")
+	}
+	if opts.Signals == nil {
+		missing = append(missing, "Signals")
+	}
+	if opts.CLV == nil {
+		missing = append(missing, "CLV")
+	}
+	if opts.Leaderboard == nil {
+		missing = append(missing, "Leaderboard")
 	}
 	if len(opts.RequireAuth) == 0 {
 		// Not a nil check with a default: a default here would make every
@@ -247,6 +278,10 @@ func NewAPI(opts APIOptions) (*API, error) {
 		cashOutQuotes: opts.CashOutQuotes,
 		cashOuts:      opts.CashOuts,
 
+		signals:     opts.Signals,
+		clv:         opts.CLV,
+		leaderboard: opts.Leaderboard,
+
 		requireAuth: slices.Clone(opts.RequireAuth),
 
 		log:   opts.Logger,
@@ -289,6 +324,14 @@ func (a *API) Routes() []Route {
 		// History
 		{Method: http.MethodGet, Path: "/v1/selections/{selectionId}/history", Handler: http.HandlerFunc(a.handleHistory)},
 
+		// Signals and the leaderboard. Public and unauthenticated, like the
+		// board: they are derived from public odds, and the leaderboard names
+		// nobody — its rows carry a derived pseudonym rather than an account.
+		{Method: http.MethodGet, Path: "/v1/signals/ev", Handler: http.HandlerFunc(a.handleEVSignals)},
+		{Method: http.MethodGet, Path: "/v1/signals/arbitrage", Handler: http.HandlerFunc(a.handleArbitrageSignals)},
+		{Method: http.MethodGet, Path: "/v1/signals/steam", Handler: http.HandlerFunc(a.handleSteamSignals)},
+		{Method: http.MethodGet, Path: "/v1/leaderboard", Handler: http.HandlerFunc(a.handleLeaderboard)},
+
 		// Account. Every one carries the authentication middleware; there is no
 		// route below that resolves a user id from a path or a body, so a
 		// handler CANNOT act on a user other than the one the token names.
@@ -298,6 +341,7 @@ func (a *API) Routes() []Route {
 		{Method: http.MethodPost, Path: "/v1/account/self-exclusion", Handler: http.HandlerFunc(a.handleSelfExclude), Middleware: authed},
 		{Method: http.MethodGet, Path: "/v1/account/limits", Handler: http.HandlerFunc(a.handleListLimits), Middleware: authed},
 		{Method: http.MethodPost, Path: "/v1/account/limits", Handler: http.HandlerFunc(a.handleSetLimit), Middleware: authed},
+		{Method: http.MethodGet, Path: "/v1/account/clv", Handler: http.HandlerFunc(a.handleAccountCLV), Middleware: authed},
 
 		// Betting. Authenticated for the same reason the account routes are,
 		// and with the same property: no path parameter, query parameter or

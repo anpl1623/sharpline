@@ -249,8 +249,18 @@ explains. Summary:
 | `odds.normalized` | 6 | `compact` | snapshot, no expiry | `market_id` |
 | `price.computed` | 6 | `compact` | snapshot, no expiry | `market_id` |
 | `wager.events` | 3 | `delete` | 90 d, unlimited bytes | wager-shaped |
+| `signals.ev` | 3 | `delete` | 7 d, ≤ 512 MiB/partition | `market_id` |
+| `signals.arb` | 3 | `delete` | 30 d, ≤ 256 MiB/partition | `market_id` |
+| `signals.steam` | 3 | `delete` | 30 d, ≤ 256 MiB/partition | `market_id` |
+| `signals.clv` | 3 | `delete` | 90 d, unlimited bytes | `wager_id` |
 
-21 application partitions. Adding a provider is one string in `raw_providers` — the
+The four `signals.*` topics are phase 9's analytics output — the +EV finder,
+arbitrage, steam and CLV. Three are named in CLAUDE.md §3's event-flow diagram;
+`signals.ev` is a flagged addition. **None of them is compacted**, because a
+finding is an event rather than a snapshot and the newest one supersedes nothing.
+`modules/kafka-topics/README.md` has the argument and the sizing.
+
+33 application partitions. Adding a provider is one string in `raw_providers` — the
 topic, its retention, its size cap and its partition count come out identical to the
 others by construction.
 

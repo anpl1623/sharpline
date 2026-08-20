@@ -74,15 +74,20 @@ export {
   buildQueryString,
 } from '@/lib/api/transport';
 export type {
+  AccountCLVParams,
   ApiClient,
+  ArbitrageSignalParams,
   BoardParams,
   BookFilterParams,
   BrowserCallOptions,
   CallOptions,
+  EVSignalParams,
   HistoryParams,
   IdempotencyKey,
+  LeaderboardParams,
   QueryValue,
   SearchParams,
+  SteamSignalParams,
   WagerListParams,
 } from '@/lib/api/transport';
 export { ApiError } from '@/lib/api/errors';

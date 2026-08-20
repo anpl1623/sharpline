@@ -92,6 +92,7 @@ func TestSessionlessBuildDropsExactlyTheSessionRoutes(t *testing.T) {
 		Accounts: d.accounts, Limits: d.limits, Audit: d.audit,
 		Betting: d.betting, Wagers: d.wagers, Pricer: d.pricer,
 		CashOutQuotes: d.cashOuts, CashOuts: d.cashOuts,
+		Signals: d.signals, CLV: d.clv, Leaderboard: d.leaderboard,
 		Logger: d.logger, Now: fixedClock(),
 		RequireAuth: []Middleware{func(next http.Handler) http.Handler { return next }},
 	})
@@ -259,6 +260,7 @@ func TestCashOutRoutesFollowTheirPorts(t *testing.T) {
 			Sessions: d.sessions,
 			Betting:  d.betting, Wagers: d.wagers, Pricer: d.pricer,
 			CashOutQuotes: quotes, CashOuts: takes,
+			Signals: d.signals, CLV: d.clv, Leaderboard: d.leaderboard,
 			Logger: d.logger, Now: fixedClock(),
 			RequireAuth: []Middleware{func(next http.Handler) http.Handler { return next }},
 		})

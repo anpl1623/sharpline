@@ -4,8 +4,17 @@
  *
  * 48px tall, `ground-1` on a `rule` hairline, and quiet: the header is the part
  * of the screen that must NOT compete with a moving price. Left to right —
- * wordmark, league strip, flexible space, search, book filter, odds format, and
- * below 768px the connection pip.
+ * wordmark, section nav, league strip, flexible space, search, book filter, odds
+ * format, and below 768px the connection pip.
+ *
+ * # Sections and leagues are two different navigations
+ *
+ * `SectionNav` answers "which surface" — the board, the signals, the leaderboard
+ * — and `LeagueNav` answers "which board". Folding the first into the second
+ * would make "Signals" read as a competition somebody could bet on, and would
+ * put the phase 9 analytics surface inside a strip that scrolls horizontally,
+ * where it could be carried off screen by a catalogue with enough leagues in
+ * it.
  *
  * # The wordmark is the only display-face element outside the landing poster
  *
@@ -44,6 +53,7 @@ import { LeagueNav } from '@/components/layout/league-nav';
 import type { LeagueNavItem } from '@/components/layout/league-nav';
 import { OddsFormatToggle } from '@/components/layout/odds-format-toggle';
 import { SearchBox } from '@/components/layout/search-box';
+import { SectionNav } from '@/components/layout/section-nav';
 import { StatusPip } from '@/components/layout/status-pip';
 import { serverApi } from '@/lib/api/server';
 import type { SchemaSportPage } from '@/lib/api/schema';
@@ -111,7 +121,7 @@ function LeagueStripFallback({ className }: { readonly className: string }) {
 }
 
 const INLINE_STRIP_CLASS = 'hidden h-full min-w-0 flex-1 md:block';
-const ROW_STRIP_CLASS = 'h-9 w-full px-3';
+const ROW_STRIP_CLASS = 'h-9 min-w-0 flex-1 px-3';
 
 export function SiteHeader() {
   return (
@@ -123,6 +133,13 @@ export function SiteHeader() {
         >
           SHARPLINE
         </Link>
+
+        {/* The three top-level sections sit between the wordmark and the league
+          * strip, not inside it: a league answers "which board", and these are
+          * different surfaces. They do not scroll — the strip beside them does,
+          * so the sections are always reachable however many leagues ingest
+          * discovers. Below 768px they move to the second row with the strip. */}
+        <SectionNav className="hidden shrink-0 md:block" />
 
         <Suspense fallback={<LeagueStripFallback className={INLINE_STRIP_CLASS} />}>
           <LeagueStrip className={INLINE_STRIP_CLASS} />
@@ -146,7 +163,12 @@ export function SiteHeader() {
         </div>
       </div>
 
-      <div className="border-t border-rule md:hidden">
+      {/* The second row below 768px. The sections are a fixed leading group and
+        * the league strip scrolls beside them, so the strip's horizontal scroll
+        * can never carry "Signals" off the screen. */}
+      <div className="flex items-stretch border-t border-rule md:hidden">
+        <SectionNav className="h-9 shrink-0 pl-3" />
+        <span className="my-2 w-px shrink-0 bg-rule" aria-hidden="true" />
         <Suspense fallback={<LeagueStripFallback className={ROW_STRIP_CLASS} />}>
           <LeagueStrip className={ROW_STRIP_CLASS} />
         </Suspense>

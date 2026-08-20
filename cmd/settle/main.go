@@ -30,6 +30,8 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/anpl1623/sharpline/internal/analytics/clv"
+	"github.com/anpl1623/sharpline/internal/analytics/clv/pgclv"
 	"github.com/anpl1623/sharpline/internal/platform/buildinfo"
 	"github.com/anpl1623/sharpline/internal/platform/config"
 	"github.com/anpl1623/sharpline/internal/platform/httpx"
@@ -178,6 +180,43 @@ func run() error {
 		return fmt.Errorf("%s: %w", service, err)
 	}
 
+	// THE CLOSING-LINE-VALUE PASS — a third adapter over the same pool, and a
+	// SECOND LOOP that this binary runs alongside the settlement one.
+	//
+	// internal/settlement/clv.go carries the argument in full, and the one
+	// sentence of it that governs this wiring is: CLV must not be able to fail a
+	// settlement. That is why the pass is constructed separately, run on its own
+	// goroutine, and — see the Checkers list below — deliberately absent from the
+	// readiness set. A wedged measurement must cost a missing report and nothing
+	// else.
+	//
+	// The measurer is built first because it OWNS the two parameters of the
+	// closing-price definition, and the pass reads them back off it rather than
+	// restating them. They are stamped onto every published record, so a value
+	// chosen in two places would eventually be two values and the phase-12
+	// validation would be comparing answers to two different questions.
+	clvStore, err := pgclv.NewStore(db)
+	if err != nil {
+		return fmt.Errorf("%s: %w", service, err)
+	}
+	measurer, err := clv.New(clv.Options{Store: clvStore})
+	if err != nil {
+		return fmt.Errorf("%s: %w", service, err)
+	}
+	clvPass, err := settlement.NewCLVPass(settlement.CLVOptions{
+		Measurer:  measurer,
+		Store:     clvStore,
+		Publisher: producer,
+		Logger:    log,
+		Registry:  registry,
+		// Read back off the measurer, never restated. See above.
+		ClosingLookback: measurer.ClosingLookback(),
+		TakenLookback:   measurer.TakenLookback(),
+	})
+	if err != nil {
+		return fmt.Errorf("%s: %w", service, err)
+	}
+
 	srv, err := httpx.NewServer(httpx.ServerOptions{
 		Service:  service,
 		Addr:     cfg.HTTPAddr,
@@ -198,6 +237,16 @@ func run() error {
 		// config.Settle does not declare RequireRedis, so nothing is being
 		// silently skipped — unlike the pricer, whose declaration and whose
 		// checkers disagree and which says so.
+		//
+		// THE CLV PASS IS DELIBERATELY ABSENT from this list, and its absence is a
+		// design decision rather than an omission. It is the second loop this
+		// binary runs, and internal/settlement/clv.go's premise is that a wedged
+		// measurement must not be able to stop a settlement. Listing it here would
+		// reintroduce exactly that coupling through the orchestrator: a failing
+		// CLV checker takes the replica out of rotation, and a replica out of
+		// rotation is a replica whose finished games sit ungraded. The pass
+		// reports itself through sharpline_settlement_clv_* instead, which is
+		// where a report's health belongs.
 		Checkers: []httpx.Checker{db, producer, svc},
 	})
 	if err != nil {
@@ -232,7 +281,7 @@ func run() error {
 		mu.Unlock()
 	}
 
-	wg.Add(2)
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
 		fail(srv.Run(ctx))
@@ -240,6 +289,15 @@ func run() error {
 	go func() {
 		defer wg.Done()
 		fail(svc.Run(ctx))
+	}()
+	go func() {
+		defer wg.Done()
+		// CLVPass.Run always returns nil, by design: a CLV pass has no failure
+		// that should take this process down with it, and this join is exactly the
+		// mechanism by which one otherwise could. The call is still wrapped in
+		// fail for symmetry with its two siblings, so that a future change to that
+		// signature is surfaced here rather than dropped on the floor.
+		fail(clvPass.Run(ctx))
 	}()
 	wg.Wait()
 

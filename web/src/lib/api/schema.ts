@@ -78,6 +78,65 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/account/clv": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The authenticated customer's closing line value.
+         * @description One row per graded leg, most recently graded first, plus the aggregate
+         *     and a per-league breakdown.
+         *
+         *     **What CLV is, and why it is computed on fair prices.** Closing line
+         *     value asks whether the price taken was better than the price the market
+         *     settled on immediately before the event started. Both sides are devigged
+         *     first, with the SAME method, because a quoted price contains the
+         *     market's estimate AND the book's margin and CLV is a claim about the
+         *     first only. Comparing raw quoted prices reports value lost on a line
+         *     that never moved whenever a book merely widened its juice.
+         *
+         *     **What "closing" means, exactly.** The closing snapshot is every
+         *     selection of the market priced at ONE book, each at its latest
+         *     observation at or before the event's SCHEDULED START, excluding any
+         *     observation inside a suspension episode. Scheduled start, not actual
+         *     kickoff and not a status change: it is the only instant that is
+         *     knowable in advance, stable under replay, and identical in Go and in
+         *     the phase 12 SQL. If any selection of the market yielded no such price,
+         *     the snapshot is incomplete and NO ROW IS WRITTEN -- absence here is
+         *     meaningful and is never a row of nulls.
+         *
+         *     **`line_moved` rows are shown and are NOT counted.** A spread taken at
+         *     -3 that closed at -3.5 is not the same question, and converting between
+         *     the two needs a model of game margins rather than arithmetic. Such a row
+         *     appears in `data` with `line_moved: true` and both lines, so a customer
+         *     can see what happened, and it is excluded from `aggregate` and from
+         *     every leaderboard. `voided` rows are excluded the same way; a market
+         *     that never closed has no closing line, so the quantity does not exist.
+         *     A PUSH is included at full weight -- it is a settlement outcome, not a
+         *     data problem, and excluding it would make CLV depend on the scoreboard.
+         *
+         *     **`aggregate.mean_probability_clv` and `mean_percent_clv` are null, not
+         *     zero, when nothing is countable.** A customer with three line-moved legs
+         *     and nothing else has no measurable CLV, and rendering that as `0.00%`
+         *     would report an average of no numbers as break-even. `counted`,
+         *     `void_excluded` and `line_moved_excluded` are all reported so the
+         *     exclusion is auditable rather than invisible.
+         *
+         *     **A CLV percentage is not money.** There is no currency amount anywhere
+         *     in this response.
+         */
+        get: operations["getAccountCLV"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/account/grant": {
         parameters: {
             query?: never;
@@ -527,6 +586,74 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/leaderboard": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The public leaderboard, ranked on ROI and CLV -- never on profit.
+         * @description Customers ranked either by return on investment or by mean closing line
+         *     value, over a window, subject to a minimum sample size on both.
+         *
+         *     **THIS BOARD DOES NOT RANK ON PROFIT, AND THAT IS A DECISION RATHER THAN
+         *     AN OVERSIGHT.** CLAUDE.md section 6 says "a public leaderboard on ROI
+         *     and CLV, not raw profit". Raw profit rewards stake size and variance:
+         *     the top of a profit board is whoever staked the most and got lucky, and
+         *     a reader learns nothing about skill from it. ROI is stake-normalised, so
+         *     a customer who staked ten thousand and lost structurally cannot outrank
+         *     one who staked ten and won, at any sample size. CLV is scored against
+         *     the market's own final estimate rather than against the scoreboard,
+         *     which is why it is the better predictor of the two over short histories.
+         *     Both are on every row whichever one is ranked, so a reader can see when
+         *     they disagree.
+         *
+         *     `net_return_minor` and `staked_minor` ARE money and are reported, since
+         *     ROI is unreadable without them. They are reported as evidence FOR the
+         *     ranking, not as the ranking.
+         *
+         *     **Minimum samples are parameters and are echoed in the response.** One
+         *     lucky maximum-stake bet must not top the board, so a customer needs
+         *     `min_settled_wagers` settled wagers and `min_clv_samples` countable CLV
+         *     legs to appear at all. Both are in `minimum_samples` on the response
+         *     beside the rows, so a reader can see what the board was filtered at
+         *     instead of assuming.
+         *
+         *     **A customer with no countable CLV samples is ABSENT, not present with a
+         *     zero.** The CLV join is an inner join, matching `odds.ErrCLVNoSamples`:
+         *     "no measurable wagers" and "measured, and it came out at zero" are
+         *     different facts and this board does not merge them.
+         *
+         *     **Which wagers count.** `won`, `lost`, `push` and `cashed_out`. A push
+         *     counts because it had action. `placed` and `open` are unresolved.
+         *     `void` is excluded from BOTH the numerator and the denominator: it had
+         *     no action, and counting the stake would inflate turnover and drag every
+         *     ROI toward zero.
+         *
+         *     **Ranking and tie-breaks, in full.** On `basis: roi`:
+         *     `roi` desc, `mean_percent_clv` desc, `settled_wagers` desc, `user`
+         *     ascending. On `basis: clv`: `mean_percent_clv` desc, `roi` desc,
+         *     `clv_samples` desc, `user` ascending. Both are total orders, so the
+         *     board is stable between refreshes.
+         *
+         *     **`user` is a derived pseudonym, not a name.** This system stores no
+         *     display name -- `users` holds an email address and nothing else -- so
+         *     publishing an identity here would publish an email address. The handle
+         *     is a stable one-way derivation of the account identifier: the same
+         *     customer is the same handle on every refresh, and nothing about the
+         *     account is recoverable from it.
+         */
+        get: operations["getLeaderboard"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/leagues/{leagueSlug}/board": {
         parameters: {
             query?: never;
@@ -645,6 +772,187 @@ export interface paths {
          *     about where the line ended.
          */
         get: operations["getSelectionHistory"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/signals/arbitrage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Live arbitrage, with the staleness discipline applied and visible.
+         * @description Markets whose best available prices sum to less than one implied
+         *     probability across the books quoting them, best guaranteed return
+         *     first, with every leg and every leg's age exposed.
+         *
+         *     **This endpoint is deliberately conservative, and the reason is a
+         *     measurement.** The phase 4 gate found 68 apparent arbitrages over 1,065
+         *     records with the leg-age bound binding almost constantly: most
+         *     cross-book "arbitrage" is not an opportunity, it is one book that has
+         *     not moved yet. A firehose of stale-price arbs is worse than no
+         *     arbitrage feed at all, because it trains a reader to ignore the one
+         *     that is real.
+         *
+         *     So three bounds apply, all of them named parameters with declared
+         *     defaults rather than magic numbers, and all of them applied ON TOP of
+         *     the bounds the detector already applied:
+         *
+         *       * `max_leg_age_seconds` -- how old the STALEST leg may be.
+         *       * `max_spread_seconds` -- how far apart the oldest and newest legs may
+         *         have been observed. This is the bound that actually binds: two
+         *         prices observed 90 seconds apart were never simultaneously
+         *         available, whatever their sum says.
+         *       * `min_distinct_books` -- how many books must be involved.
+         *
+         *     And `oldest_leg_age_seconds` and `observed_spread_seconds` are on EVERY
+         *     finding, alongside each leg's own `age_seconds`, so a reader can see
+         *     why a finding is or is not actionable rather than trusting that it
+         *     passed a filter.
+         *
+         *     **`distinct_books: 1` is legal and is the STRONGER finding.** One book
+         *     whose own market is under-round is a genuine arbitrage with no
+         *     execution risk from a second book's price moving between bets.
+         *
+         *     **Not paginated, deliberately.** The bounds above make the live set
+         *     small by construction and it turns over in seconds. A cursor would page
+         *     through a list that no longer exists. Refresh instead; if the set ever
+         *     outgrows a page, the answer is a tighter bound, not a cursor.
+         *
+         *     **`return_fraction` is not money.** It is the guaranteed return per unit
+         *     of total outlay, `(1 - implied_sum) / implied_sum`. What a reader would
+         *     actually stake is their own decision, and this API does not make it:
+         *     `stake_fraction` on each leg is the split, and the amount is not.
+         */
+        get: operations["listArbitrageSignals"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/signals/ev": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The positive expected value finder.
+         * @description Offered prices the pricer scored as +EV against the sharp reference
+         *     book, best expected value first.
+         *
+         *     **What "fair" means here.** Every number on a row is relative to ONE
+         *     book -- the reference book named by `reference_book_id`, which is the
+         *     book `GET /books` marks `is_reference` (ADR 0006). The pricer devigs
+         *     that book's complete market with `devig_method`, and the resulting
+         *     no-vig probability is `fair_probability`. `expected_value_percent` is
+         *     then the return per unit staked at `offered_decimal` under that
+         *     probability. An EV number is meaningless without the book it was
+         *     measured against, which is why the reference is on every row rather
+         *     than being deployment knowledge a reader has to already have.
+         *
+         *     `reference_book_id` MAY equal `book_id`. That is not a bug and it is not
+         *     self-reference: it means that book's own market is under-round, so its
+         *     price on this selection beats its own no-vig fair value.
+         *
+         *     **Staleness is on the row, not implied.** `quote_observed_at` is the
+         *     provider's instant for the offered price and `quote_age_seconds` is how
+         *     old it already was when the finding was written. `quote_age_seconds`
+         *     MAY BE NEGATIVE -- a provider clock running ahead of ours produces a
+         *     quote stamped in our future, and reporting that honestly is better than
+         *     clamping it to zero and hiding a clock-skew problem.
+         *     `max_quote_age_seconds` is the bound the detector applied.
+         *
+         *     **`expected_value_percent` is not money and must not be rendered as
+         *     money.** It is a rate of return on a hypothetical unit stake. Nothing
+         *     on this row is a currency amount; there is no `*_minor` field here.
+         *
+         *     **Ordering and paging.** Ranked by `expected_value_percent` descending,
+         *     broken by `quote_observed_at`, `selection_id` and `book_id`, all
+         *     descending, which makes the order total. The cursor is bound to
+         *     `league`, `observed_after`, `min_ev_percent`, `book` and `market_type`:
+         *     unlike the board, where `book` only changes how a page is RENDERED,
+         *     here every one of those changes WHICH ROWS are in the set, so changing
+         *     any of them mid-listing is a `400` rather than a silently different
+         *     page.
+         */
+        get: operations["listEVSignals"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/signals/steam": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Recent steam moves -- correlated line movement led by one book.
+         * @description Steam moves, most recent window first.
+         *
+         *     **What a steam move is here, precisely.** A hopping window over
+         *     line-movement velocity, keyed by market and SELECTION -- steam is
+         *     directional, and keying by market alone would collapse a shortening and
+         *     a drifting side into one finding. Within the window one book moves
+         *     first (`lead_book_id`, at `lead_moved_at`) and others follow within
+         *     `max_follower_lag_seconds`; `followers` lists them in ascending lag
+         *     order.
+         *
+         *     **What separates steam from ordinary drift is the SIZE of the move, not
+         *     the correlation.** This is worth stating because the opposite is the
+         *     intuitive answer and it is wrong: every book is watching one underlying
+         *     market, so books are correlated whatever that market does -- drifting
+         *     included -- and `cross_book_correlation` is therefore near 1 on quiet
+         *     windows too. What the correlation gate actually does is screen out a
+         *     move ONE book made alone, a tick-rounding artefact or a book's own bias.
+         *     The discriminator is `magnitude_probability_points` against
+         *     `threshold_magnitude`, which is calibrated past the knee of the
+         *     candidate-count distribution: below it the population is ordinary drift,
+         *     whose window change is Gaussian, and above it the steam amplitude
+         *     distribution, which is not.
+         *
+         *     **The units are implied probability points per minute, never decimal
+         *     odds.** A 0.10 move in decimal odds is 0.045 probability points at 1.50
+         *     and 0.001 at 10.00, so a threshold expressed in decimal means a
+         *     different thing at every price. `delta_probability`,
+         *     `magnitude_probability_points` and `velocity_probability_per_minute`
+         *     are all in probability, and `window_start`/`window_end` are a half-open
+         *     interval `[start, end)`.
+         *
+         *     **Ranked by RECENCY, not by magnitude.** A steam alert is actionable
+         *     only while the follower books are still catching up -- that lag is the
+         *     entire opportunity -- so an hour-old larger move is worth less than a
+         *     fresh smaller one. `min_magnitude` is a filter; it is never the sort.
+         *
+         *     **`devig_method: none` is legal and expected.** Steam is measured on the
+         *     change in a book's own implied probability over a short window, and a
+         *     book's margin is very nearly constant over that window, so devigging
+         *     usually subtracts a constant from both ends of a difference. When a
+         *     detector does devig, the method it used is named.
+         *
+         *     **No per-market cut on this path.** A market-scoped view is a window
+         *     read rather than a ranked page, and serving two different response
+         *     contracts from one operation is worse than not serving the second one
+         *     yet.
+         */
+        get: operations["listSteamSignals"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1008,6 +1316,175 @@ export interface components {
         };
         /** @enum {string} */
         AccountStatus: "active" | "suspended" | "self_excluded" | "closed";
+        /**
+         * @description The half-open window `[from, to)` an aggregate was computed over, echoed
+         *     because both bounds have defaults and a number without its window is not
+         *     interpretable.
+         */
+        AnalyticsWindow: {
+            /** Format: date-time */
+            from: string;
+            /** Format: date-time */
+            to: string;
+        };
+        /**
+         * @description The bounds THIS READ applied, echoed so a reader can see what was
+         *     filtered out rather than inferring it from an empty list. They are
+         *     applied on top of the bounds each finding already records.
+         */
+        ArbitrageBounds: {
+            /** Format: double */
+            max_leg_age_seconds: number;
+            /** Format: double */
+            max_spread_seconds: number;
+            /** Format: int32 */
+            min_distinct_books: number;
+            /** Format: double */
+            min_return_percent: number;
+            /** Format: date-time */
+            observed_after: string;
+        };
+        /** @description One side of an arbitrage, at one book. */
+        ArbitrageLeg: {
+            /**
+             * Format: double
+             * @description How old this leg's price was when the finding was written. Exposed
+             *     per leg, not just as the maximum, because a two-leg arbitrage where
+             *     one side is fresh and the other is 90 seconds old is one book that
+             *     has not moved yet, and that is visible here and nowhere else.
+             */
+            age_seconds: number;
+            book_id: components["schemas"]["EntityID"];
+            decimal_odds: components["schemas"]["DecimalOdds"];
+            /**
+             * Format: int32
+             * @description Display order, which is the market's own selection order.
+             */
+            leg_index: number;
+            /**
+             * Format: double
+             * @description The line in the SELECTION's frame, unlike `ArbitrageSignal.line`.
+             */
+            line?: number | null;
+            /** Format: date-time */
+            observed_at: string;
+            role: components["schemas"]["SelectionRole"];
+            selection_id: components["schemas"]["EntityID"];
+            /**
+             * Format: double
+             * @description This leg's share of the total outlay, the split that makes the
+             *     return equal whichever selection wins. A FRACTION, not an amount --
+             *     this API does not choose a bankroll.
+             */
+            stake_fraction: number;
+        };
+        ArbitrageSignal: {
+            /** Format: date-time */
+            detected_at: string;
+            /**
+             * Format: int32
+             * @description How many different books the legs came from. `1` is legal and is the
+             *     STRONGER finding: a single under-round market has no execution risk
+             *     from a second book moving between bets.
+             */
+            distinct_books: number;
+            /**
+             * @description The finding's identifier, a lowercase canonical UUID. Stable across
+             *     a recompute of the same finding: the row is keyed by market, instant
+             *     and a fingerprint of its legs, none of which is a clock reading of
+             *     ours.
+             *
+             *     Deliberately NOT `format: uuid`. That format makes oapi-codegen emit
+             *     `openapi_types.UUID`, which drags github.com/oapi-codegen/runtime
+             *     into a module whose serving path has no third-party dependency at
+             *     all -- the same trade `EmailAddress` declines for the same reason.
+             *     The pattern above is the validation, and the value is a string on
+             *     the wire either way.
+             */
+            id: string;
+            /**
+             * Format: double
+             * @description The sum of the legs' implied probabilities. Strictly below 1 by
+             *     construction -- that IS the arbitrage. Booking percentage, overround
+             *     and vig are all single-operation functions of this number and are
+             *     not repeated as separate fields.
+             */
+            implied_sum: number;
+            league_id: components["schemas"]["EntityID"];
+            legs: components["schemas"]["ArbitrageLeg"][];
+            /**
+             * Format: double
+             * @description The market's line in the HOME frame -- the market's own line, not a
+             *     selection's. This is the one place on this surface where a line is
+             *     not in the selection frame, because the signal is about the market
+             *     and its legs are about the selections; each leg carries its own line
+             *     in its own frame.
+             */
+            line?: number | null;
+            market_id: components["schemas"]["EntityID"];
+            market_type: components["schemas"]["MarketType"];
+            /**
+             * Format: double
+             * @description The leg-age bound the DETECTOR applied. `oldest_leg_age_seconds` never exceeds it.
+             */
+            max_leg_age_seconds: number;
+            /**
+             * Format: double
+             * @description The spread bound the DETECTOR applied. `observed_spread_seconds` never exceeds it.
+             */
+            max_observed_spread_seconds: number;
+            /**
+             * Format: date-time
+             * @description The OLDEST leg's instant -- the earliest moment at which every leg
+             *     in this finding had been observed, and therefore the moment the
+             *     arbitrage can first be said to have existed. Not the newest and not
+             *     a detection time.
+             */
+            observed_at: string;
+            /**
+             * Format: double
+             * @description The gap between the oldest and newest leg's observation. THE NUMBER
+             *     THAT MATTERS MOST on this object: two prices observed 90 seconds
+             *     apart were never simultaneously available, whatever their sum says.
+             */
+            observed_spread_seconds: number;
+            /**
+             * Format: double
+             * @description How old the stalest leg was when the finding was written. May be
+             *     negative, for the clock-skew reason `EVSignal.quote_age_seconds`
+             *     gives.
+             */
+            oldest_leg_age_seconds: number;
+            /**
+             * Format: double
+             * @description `(1 - implied_sum) / implied_sum`: the guaranteed return per unit of total outlay.
+             */
+            return_fraction: number;
+            /**
+             * Format: double
+             * @description `return_fraction` x 100. Derived here so every surface says the same number.
+             */
+            return_percent: number;
+            /**
+             * Format: int32
+             * @description How many outcomes the market has. Equal to the number of legs.
+             */
+            selection_count: number;
+        };
+        /**
+         * @description The live arbitrage set. `page.has_more` is always false and
+         *     `page.next_cursor` is always null: this list is bounded by its own
+         *     staleness rules rather than paged, and a cursor would page through a set
+         *     that no longer exists. The envelope is shared with every other list so a
+         *     client has one shape to handle.
+         */
+        ArbitrageSignalList: {
+            /** Format: date-time */
+            as_of: string;
+            bounds: components["schemas"]["ArbitrageBounds"];
+            data: components["schemas"]["ArbitrageSignal"][];
+            page: components["schemas"]["PageInfo"];
+        };
         BalanceResponse: {
             /** Format: date-time */
             as_of: string;
@@ -1164,6 +1641,180 @@ export interface components {
              */
             accepted_value_minor: components["schemas"]["MoneyMinor"];
         };
+        /**
+         * @description The summary over the window. Always present, even for a customer with no
+         *     history -- honest zeros rather than an absent object.
+         */
+        CLVAggregate: {
+            /**
+             * Format: int64
+             * @description How many counted rows beat the close. Reported so `mean` and `rate` can be checked against each other.
+             */
+            beat_count: number;
+            /**
+             * Format: double
+             * @description `beat_count / counted`. Null when `counted` is zero.
+             */
+            beat_rate?: number | null;
+            /**
+             * Format: int64
+             * @description The rows the means are over -- neither voided nor line-moved.
+             */
+            counted: number;
+            /** Format: int64 */
+            line_moved_excluded: number;
+            /**
+             * Format: double
+             * @description The unweighted mean of `percent_clv`. Null under the same condition.
+             */
+            mean_percent_clv?: number | null;
+            /**
+             * Format: double
+             * @description The UNWEIGHTED mean over the counted rows. Unweighted because CLV is
+             *     a property of the price and not of the stake, and stake-weighting
+             *     would let a bettor buy position by sizing up.
+             *
+             *     NULL when `counted` is zero, and it must not be rendered as `0.00%`:
+             *     "no measurable wagers" and "measured, and it averaged zero" are
+             *     different facts.
+             */
+            mean_probability_clv?: number | null;
+            /**
+             * Format: int64
+             * @description Every row in the window, exclusions included.
+             */
+            samples: number;
+            /** Format: int64 */
+            void_excluded: number;
+        };
+        /**
+         * @description One graded leg scored against the market's close. Both prices are FAIR
+         *     (devigged) prices under the same `devig_method`; the raw quoted prices
+         *     are not comparable, because a book widening its margin would read as
+         *     value lost on a line that never moved.
+         */
+        CLVEntry: {
+            /**
+             * @description `probability_clv > 1e-12`. A TIE IS NOT A BEAT. The band is
+             *     `odds.CLVTieBand`; it exists because two devig implementations can
+             *     differ in the last few bits, and it is ten orders of magnitude below
+             *     the smallest real price increment, so it can never absorb a genuine
+             *     one-tick move.
+             */
+            beat_close: boolean;
+            /**
+             * Format: date-time
+             * @description The closing observation's instant. Never earlier than `taken_at` --
+             *     a close that preceded the take is not a close and no row is written
+             *     for it.
+             */
+            closed_at: string;
+            /**
+             * @description The book whose closing market was used. Usually the sharp reference
+             *     book, and deliberately allowed to differ from `taken_book_id` --
+             *     that IS the standard construction. The closing snapshot is always
+             *     one book's COMPLETE market, never a best-price mosaic, because
+             *     devigging needs the whole outcome set.
+             */
+            closing_book_id: components["schemas"]["EntityID"];
+            closing_fair: components["schemas"]["Probability"];
+            /** Format: double */
+            closing_line?: number | null;
+            /** @description `1 / closing_fair`. */
+            closing_price: components["schemas"]["DecimalOdds"];
+            /**
+             * @description ONE method, applied to both sides. Devigging the two sides
+             *     differently would put the difference between two models into a
+             *     number claiming to measure a line move.
+             */
+            devig_method: components["schemas"]["DevigMethod"];
+            /** Format: date-time */
+            graded_at: string;
+            league_id: components["schemas"]["EntityID"];
+            leg_id: components["schemas"]["EntityID"];
+            /**
+             * @description Never `pending`: a leg with no result has no closing line value and
+             *     no row here.
+             */
+            leg_status: components["schemas"]["LegStatus"];
+            /**
+             * @description The line differs between the take and the close. Such a row is SHOWN
+             *     -- so a customer can see "you took -3, it closed -3.5" -- and is
+             *     excluded from `aggregate` and from every leaderboard, because the
+             *     two lines are answers to different questions and converting between
+             *     them needs a model of game margins rather than arithmetic.
+             */
+            line_moved: boolean;
+            /**
+             * Format: double
+             * @description `abs(percent_clv)`. Size without direction, for sorting a display.
+             */
+            magnitude: number;
+            market_id: components["schemas"]["EntityID"];
+            market_type: components["schemas"]["MarketType"];
+            /**
+             * Format: double
+             * @description `taken_price / closing_price - 1`, times 100. The same comparison as `probability_clv` and always the same sign.
+             */
+            percent_clv: number;
+            /**
+             * Format: double
+             * @description `closing_fair - taken_fair`. Positive means the price taken was
+             *     longer -- better -- than the close.
+             */
+            probability_clv: number;
+            selection_id: components["schemas"]["EntityID"];
+            /** Format: date-time */
+            taken_at: string;
+            /** @description The book the wager was struck at. */
+            taken_book_id: components["schemas"]["EntityID"];
+            taken_fair: components["schemas"]["Probability"];
+            /** Format: double */
+            taken_line?: number | null;
+            /** @description `1 / taken_fair`. The FAIR price, not the price the customer was charged. */
+            taken_price: components["schemas"]["DecimalOdds"];
+            /**
+             * @description `leg_status == "void"`. A PUSH IS NOT VOID and is counted at full
+             *     weight: it is a settlement outcome, not a data problem, and
+             *     excluding it would make CLV depend on the scoreboard -- the exact
+             *     dependency CLV exists to remove.
+             */
+            voided: boolean;
+            wager_id: components["schemas"]["EntityID"];
+        };
+        /**
+         * @description The same summary cut by league -- what a customer is actually good at.
+         *     Only leagues with at least one countable row appear, so no mean here is
+         *     nullable. Ordered by `counted` descending, then by league, so the
+         *     leagues with real evidence come first and the order is stable.
+         */
+        CLVLeagueSummary: {
+            /** Format: int64 */
+            beat_count: number;
+            /** Format: double */
+            beat_rate: number;
+            /** Format: int64 */
+            counted: number;
+            league_id: components["schemas"]["EntityID"];
+            /** Format: double */
+            mean_percent_clv: number;
+            /** Format: double */
+            mean_probability_clv: number;
+        };
+        CLVResponse: {
+            aggregate: components["schemas"]["CLVAggregate"];
+            /** Format: date-time */
+            as_of: string;
+            by_league: components["schemas"]["CLVLeagueSummary"][];
+            /**
+             * @description The graded legs, most recently graded first. INCLUDES line-moved and
+             *     voided rows, which `aggregate` excludes -- this is the display path,
+             *     and the flags are on every row so a client renders them distinctly.
+             */
+            data: components["schemas"]["CLVEntry"][];
+            page: components["schemas"]["PageInfo"];
+            window: components["schemas"]["AnalyticsWindow"];
+        };
         Competitor: {
             id?: components["schemas"]["EntityID"];
             name: string;
@@ -1175,6 +1826,13 @@ export interface components {
          * @example 1.909
          */
         DecimalOdds: number;
+        /**
+         * @description Exactly `odds.DevigMethod`. The four margin-removal models disagree
+         *     meaningfully on longshots, which is why every finding names the one that
+         *     produced its numbers rather than leaving it to be deployment knowledge.
+         * @enum {string}
+         */
+        DevigMethod: "multiplicative" | "additive" | "power" | "shin";
         /**
          * @description An email address.
          *
@@ -1282,6 +1940,128 @@ export interface components {
             scheduled_start: string;
             score?: components["schemas"]["Score"];
             status: components["schemas"]["EventStatus"];
+        };
+        /**
+         * @description One offered price scored as positive expected value against the sharp
+         *     reference book. Every row in this schema has `expected_value > 0` by
+         *     construction -- a non-positive finding is not written.
+         */
+        EVSignal: {
+            /** @description The book OFFERING the price. */
+            book_id: components["schemas"]["EntityID"];
+            /**
+             * Format: date-time
+             * @description When this system wrote the finding. Never an ordering key and never
+             *     part of an identity: these rows are replayable, and a re-detection
+             *     after a fix must land on the same row rather than creating a second
+             *     one, so nothing that identifies a finding may be a reading of our
+             *     own clock.
+             */
+            detected_at: string;
+            devig_method: components["schemas"]["DevigMethod"];
+            /**
+             * Format: double
+             * @description `fair_probability - offered_implied`: how much more likely the
+             *     reference book thinks this is than the offered price implies. A
+             *     probability difference, not a rate of return -- `expected_value` is
+             *     the rate.
+             */
+            edge: number;
+            /** Format: double */
+            edge_percent: number;
+            /**
+             * Format: double
+             * @description Expected return per unit staked, as a fraction. NOT MONEY: there is
+             *     no stake attached to this number and the endpoint does not choose
+             *     one.
+             */
+            expected_value: number;
+            /**
+             * Format: double
+             * @description `expected_value` x 100. The value the list is ranked on.
+             */
+            expected_value_percent: number;
+            /** @description `1 / fair_probability`. The price at which this bet would be exactly break-even. */
+            fair_decimal: components["schemas"]["DecimalOdds"];
+            /** @description The no-vig probability from the reference book, under `devig_method`. */
+            fair_probability: components["schemas"]["Probability"];
+            /**
+             * Format: double
+             * @description `kelly` x `kelly_fraction`. Never greater than `kelly`.
+             */
+            fractional_kelly: number;
+            /**
+             * Format: double
+             * @description The full Kelly stake as a fraction of bankroll. A SIZING SUGGESTION
+             *     under an assumed-correct probability, not advice and not a currency
+             *     amount; full Kelly is famously too aggressive to bet, which is why
+             *     the fractional figure travels beside it.
+             */
+            kelly: number;
+            /**
+             * Format: double
+             * @description The multiplier the detector applied, carried so `fractional_kelly`
+             *     is reproducible from `kelly` rather than being a number a reader has
+             *     to take on trust.
+             */
+            kelly_fraction: number;
+            league_id: components["schemas"]["EntityID"];
+            /**
+             * Format: double
+             * @description The handicap or total, in the SELECTION's frame -- inverted for an
+             *     away spread, so it reads as the number a bettor on this selection
+             *     took. Null on moneyline and futures.
+             */
+            line?: number | null;
+            market_id: components["schemas"]["EntityID"];
+            market_type: components["schemas"]["MarketType"];
+            /**
+             * Format: double
+             * @description The staleness bound the detector applied.
+             */
+            max_quote_age_seconds: number;
+            offered_decimal: components["schemas"]["DecimalOdds"];
+            /**
+             * @description `1 / offered_decimal`, WITH the offering book's margin still in it.
+             *     Not a fair probability and must not be labelled as one.
+             */
+            offered_implied: components["schemas"]["Probability"];
+            /**
+             * Format: double
+             * @description How old the offered price already was when the finding was written.
+             *     MAY BE NEGATIVE -- a provider clock ahead of ours stamps a quote in
+             *     our future, and reporting that honestly beats clamping it and hiding
+             *     clock skew.
+             */
+            quote_age_seconds: number;
+            /**
+             * Format: date-time
+             * @description The provider's instant for the offered price.
+             */
+            quote_observed_at: string;
+            /**
+             * @description The sharp book the fair value was devigged from (ADR 0006). May
+             *     equal `book_id`, which means that book's own market is under-round.
+             */
+            reference_book_id: components["schemas"]["EntityID"];
+            selection_id: components["schemas"]["EntityID"];
+            /**
+             * Format: double
+             * @description The minimum expected value the detector was configured to emit when
+             *     this row was written. `expected_value_percent` is always at least
+             *     this. Distinct from the reader's `min_ev_percent`.
+             */
+            threshold_ev_percent: number;
+        };
+        EVSignalPage: {
+            /**
+             * Format: date-time
+             * @description When this page was assembled. A client computes each finding's total
+             *     staleness against this rather than against its own clock.
+             */
+            as_of: string;
+            data: components["schemas"]["EVSignal"][];
+            page: components["schemas"]["PageInfo"];
         };
         /** @description Live clock state. Absent entirely on an event that has not started. */
         GameClock: {
@@ -1393,6 +2173,111 @@ export interface components {
             /** @description The query parameter, path parameter or JSON pointer at fault. */
             name: string;
             reason: string;
+        };
+        /**
+         * @description Which measure the board is ranked on. Deliberately NOT an option for
+         *     raw profit -- see the operation description.
+         * @default roi
+         * @enum {string}
+         */
+        LeaderboardBasis: "roi" | "clv";
+        LeaderboardEntry: {
+            /** Format: int64 */
+            beat_count: number;
+            /**
+             * Format: double
+             * @description `beat_count / clv_samples`.
+             */
+            beat_rate: number;
+            /**
+             * Format: int64
+             * @description Countable CLV legs -- neither voided nor line-moved. A customer with
+             *     zero is ABSENT from this board rather than present with a zero.
+             */
+            clv_samples: number;
+            /**
+             * Format: double
+             * @description The unweighted mean of `percent_clv`. What `basis: clv` ranks on.
+             */
+            mean_percent_clv: number;
+            /**
+             * Format: double
+             * @description Unweighted mean over the countable legs. Unweighted so nobody buys position by sizing up.
+             */
+            mean_probability_clv: number;
+            /**
+             * @description Net return across those wagers -- returns minus stakes, so it is
+             *     negative for a losing customer. MONEY, and reported as the evidence
+             *     behind `roi` rather than as anything the board is ranked on.
+             */
+            net_return_minor: components["schemas"]["MoneyMinor"];
+            /**
+             * Format: int32
+             * @description Position on THIS page under THIS basis, 1-based and dense. It is a
+             *     rendering convenience computed from the returned order, not a stored
+             *     fact, and it changes when `basis`, the window or the minimums change.
+             */
+            rank: number;
+            /**
+             * Format: double
+             * @description `net_return_minor / staked_minor`. NOT MONEY -- a ratio. Being
+             *     stake-normalised is exactly what stops a high-stake loser outranking
+             *     a low-stake winner at any sample size, which is why this and not
+             *     profit is the ranking.
+             */
+            roi: number;
+            /**
+             * Format: double
+             * @description `roi` x 100. Derived server-side so every surface says the same number.
+             */
+            roi_percent: number;
+            /**
+             * Format: int64
+             * @description Wagers in the window with a settled outcome: `won`, `lost`, `push`
+             *     or `cashed_out`. `void` is excluded from this count AND from the
+             *     money below -- it had no action.
+             */
+            settled_wagers: number;
+            /** @description Total staked across those wagers. MONEY. */
+            staked_minor: components["schemas"]["MoneyMinor"];
+            /**
+             * @description A stable pseudonym derived one-way from the account identifier. This
+             *     system stores no display name -- `users` holds an email address and
+             *     nothing else -- so a real identity here would be a published email
+             *     address. The same customer is the same handle on every refresh, and
+             *     the account is not recoverable from it.
+             */
+            user: string;
+        };
+        /**
+         * @description The sample-size floors this board was filtered at, echoed beside the rows
+         *     so a reader can see the ranking is not one lucky bet.
+         */
+        LeaderboardMinimums: {
+            /** Format: int64 */
+            clv_samples: number;
+            /** Format: int64 */
+            settled_wagers: number;
+        };
+        /**
+         * @description The ranked board. `page.has_more` is always false and `next_cursor` is
+         *     always null: a leaderboard is a top-N by construction, and paging to
+         *     rank 400 is not a thing anyone wants. The envelope is shared so a client
+         *     has one shape to handle.
+         */
+        LeaderboardPage: {
+            /** Format: date-time */
+            as_of: string;
+            basis: components["schemas"]["LeaderboardBasis"];
+            /**
+             * @description The ranked customers. AN EMPTY ARRAY IS A CORRECT ANSWER and must
+             *     render as a designed empty state: it means nobody has yet met the
+             *     minimum sample size in this window. Nothing here is ever seeded.
+             */
+            data: components["schemas"]["LeaderboardEntry"][];
+            minimum_samples: components["schemas"]["LeaderboardMinimums"];
+            page: components["schemas"]["PageInfo"];
+            window: components["schemas"]["AnalyticsWindow"];
         };
         League: {
             id: components["schemas"]["EntityID"];
@@ -2146,6 +3031,159 @@ export interface components {
             page: components["schemas"]["PageInfo"];
         };
         /**
+         * @description The margin treatment a steam detection was measured under. `none` --
+         *     raw implied probability, no devigging -- is legal and is the expected
+         *     value: a book's margin is very nearly constant across a window of
+         *     seconds, so devigging mostly subtracts the same constant from both ends
+         *     of a difference. The four other members are `odds.DevigMethod`.
+         * @enum {string}
+         */
+        SteamBasis: "none" | "multiplicative" | "additive" | "power" | "shin";
+        /**
+         * @description Which way the selection's implied probability moved. `shorten` is a RISE
+         *     in probability (the price got shorter, amber in the reference client);
+         *     `drift` is a fall. It always agrees in sign with `delta_probability` and
+         *     with `velocity_probability_per_minute`, and it is carried as a word so
+         *     that direction is never conveyed by colour alone.
+         * @enum {string}
+         */
+        SteamDirection: "shorten" | "drift";
+        /**
+         * @description A book that followed the lead book inside the window. The follow LAG is
+         *     the finding: ordinary drift is uncorrelated across books, and a
+         *     correlated jump that the sharp book takes first and others repeat is
+         *     what distinguishes steam from noise.
+         */
+        SteamFollower: {
+            book_id: components["schemas"]["EntityID"];
+            /**
+             * Format: double
+             * @description This book's own move, in implied probability points, same sign as the lead's.
+             */
+            delta_probability: number;
+            /**
+             * Format: double
+             * @description How long after `lead_moved_at` this book moved. Followers are ordered by this, ascending.
+             */
+            lag_seconds: number;
+            /** Format: date-time */
+            moved_at: string;
+        };
+        SteamSignal: {
+            /**
+             * Format: double
+             * @description How much the participating books moved together. THE FIELD THAT
+             *     SEPARATES STEAM FROM DRIFT: ordinary movement is uncorrelated across
+             *     books, so a large move with a low correlation is noise and is not
+             *     steam however large it is.
+             */
+            cross_book_correlation: number;
+            /**
+             * Format: double
+             * @description The lead book's change in implied probability across the window, in
+             *     PROBABILITY POINTS. Positive is a shortening price. Never zero.
+             */
+            delta_probability: number;
+            /** Format: date-time */
+            detected_at: string;
+            devig_method: components["schemas"]["SteamBasis"];
+            direction: components["schemas"]["SteamDirection"];
+            /**
+             * Format: int32
+             * @description Equal to `followers.length`.
+             */
+            follower_count: number;
+            followers: components["schemas"]["SteamFollower"][];
+            /**
+             * Format: double
+             * @description The hop between consecutive windows. Never greater than
+             *     `window_seconds` -- windows HOP rather than tumble, so a move
+             *     straddling a boundary is still seen whole by some window.
+             */
+            hop_seconds: number;
+            /** @description The book that moved first. */
+            lead_book_id: components["schemas"]["EntityID"];
+            /**
+             * Format: date-time
+             * @description Inside `[window_start, window_end)`.
+             */
+            lead_moved_at: string;
+            league_id: components["schemas"]["EntityID"];
+            /**
+             * Format: double
+             * @description `abs(delta_probability)`. The filterable size of the move.
+             */
+            magnitude_probability_points: number;
+            market_id: components["schemas"]["EntityID"];
+            market_type: components["schemas"]["MarketType"];
+            /**
+             * Format: double
+             * @description How long after the lead a book could still move and count as a
+             *     follower. The synthetic provider's book view lag runs to about 90
+             *     seconds, which is the scale this bound is set against.
+             */
+            max_follower_lag_seconds: number;
+            /**
+             * Format: int32
+             * @description How many followers the detector required.
+             */
+            min_followers: number;
+            /**
+             * Format: int32
+             * @description `follower_count + 1` -- the followers plus the lead.
+             */
+            participating_books: number;
+            /**
+             * @description Steam is DIRECTIONAL and is keyed by selection as well as market.
+             *     Keying by market alone would collapse the shortening side and the
+             *     drifting side of the same move into one finding and lose half of
+             *     them.
+             */
+            selection_id: components["schemas"]["EntityID"];
+            /**
+             * Format: double
+             * @description The cross-book correlation floor the detector applied.
+             */
+            threshold_correlation: number;
+            /**
+             * Format: double
+             * @description The magnitude floor the detector applied, in probability points.
+             */
+            threshold_magnitude: number;
+            /**
+             * Format: double
+             * @description The velocity floor the detector applied, in probability points per minute.
+             */
+            threshold_velocity: number;
+            /**
+             * Format: double
+             * @description Probability points per minute, signed to agree with
+             *     `delta_probability`. Measured on implied PROBABILITY and never on
+             *     decimal odds: decimal is non-linear in probability, so a fixed
+             *     decimal threshold means a different thing at 1.50 than at 10.00.
+             */
+            velocity_probability_per_minute: number;
+            /**
+             * Format: date-time
+             * @description The window is HALF-OPEN, `[window_start, window_end)`. This is the
+             *     value the list is ordered and cursored on.
+             */
+            window_end: string;
+            /**
+             * Format: double
+             * @description The window's width.
+             */
+            window_seconds: number;
+            /** Format: date-time */
+            window_start: string;
+        };
+        SteamSignalPage: {
+            /** Format: date-time */
+            as_of: string;
+            data: components["schemas"]["SteamSignal"][];
+            page: components["schemas"]["PageInfo"];
+        };
+        /**
          * Format: double
          * @description The price of a whole TICKET -- total return per unit staked with every
          *     leg winning.
@@ -2434,8 +3472,25 @@ export interface components {
          *     intended action and reuse it across retries of that action.
          */
         IdempotencyKey: string;
+        /**
+         * @description Restrict findings to one league, by slug. Omitted means every league.
+         *     An unknown slug is a `400` naming the parameter, not a silent empty
+         *     result -- a typo that quietly returns nothing is indistinguishable from
+         *     "there is nothing to report", which is the one answer an analytics
+         *     surface must never fake.
+         *
+         *     It is a query parameter here rather than a path segment (as it is on the
+         *     board) because it composes with the other filters on the same operation
+         *     instead of naming a different resource.
+         */
+        LeagueFilter: components["schemas"]["Slug"];
         LeagueSlug: components["schemas"]["Slug"];
         MarketID: components["schemas"]["EntityID"];
+        /**
+         * @description Restrict findings to these market types. Repeatable, and the values
+         *     union. Omitted means every type.
+         */
+        MarketTypeFilter: components["schemas"]["MarketType"][];
         /**
          * @description Adds a rendered `display` string to every price. `decimal_odds` is always
          *     present regardless, because it is the canonical value and the other two
@@ -2470,6 +3525,11 @@ export interface components {
 export type SchemaAccount = components['schemas']['Account'];
 export type SchemaAccountBalance = components['schemas']['AccountBalance'];
 export type SchemaAccountStatus = components['schemas']['AccountStatus'];
+export type SchemaAnalyticsWindow = components['schemas']['AnalyticsWindow'];
+export type SchemaArbitrageBounds = components['schemas']['ArbitrageBounds'];
+export type SchemaArbitrageLeg = components['schemas']['ArbitrageLeg'];
+export type SchemaArbitrageSignal = components['schemas']['ArbitrageSignal'];
+export type SchemaArbitrageSignalList = components['schemas']['ArbitrageSignalList'];
 export type SchemaBalanceResponse = components['schemas']['BalanceResponse'];
 export type SchemaBestPrice = components['schemas']['BestPrice'];
 export type SchemaBoardEntry = components['schemas']['BoardEntry'];
@@ -2480,8 +3540,13 @@ export type SchemaBookPage = components['schemas']['BookPage'];
 export type SchemaBookQuote = components['schemas']['BookQuote'];
 export type SchemaCashOutQuote = components['schemas']['CashOutQuote'];
 export type SchemaCashOutRequest = components['schemas']['CashOutRequest'];
+export type SchemaClvAggregate = components['schemas']['CLVAggregate'];
+export type SchemaClvEntry = components['schemas']['CLVEntry'];
+export type SchemaClvLeagueSummary = components['schemas']['CLVLeagueSummary'];
+export type SchemaClvResponse = components['schemas']['CLVResponse'];
 export type SchemaCompetitor = components['schemas']['Competitor'];
 export type SchemaDecimalOdds = components['schemas']['DecimalOdds'];
+export type SchemaDevigMethod = components['schemas']['DevigMethod'];
 export type SchemaEmailAddress = components['schemas']['EmailAddress'];
 export type SchemaEntityId = components['schemas']['EntityID'];
 export type SchemaError = components['schemas']['Error'];
@@ -2489,6 +3554,8 @@ export type SchemaEventDetail = components['schemas']['EventDetail'];
 export type SchemaEventKind = components['schemas']['EventKind'];
 export type SchemaEventStatus = components['schemas']['EventStatus'];
 export type SchemaEventSummary = components['schemas']['EventSummary'];
+export type SchemaEvSignal = components['schemas']['EVSignal'];
+export type SchemaEvSignalPage = components['schemas']['EVSignalPage'];
 export type SchemaGameClock = components['schemas']['GameClock'];
 export type SchemaGrantRequest = components['schemas']['GrantRequest'];
 export type SchemaGrantResponse = components['schemas']['GrantResponse'];
@@ -2496,6 +3563,10 @@ export type SchemaHistoryPoint = components['schemas']['HistoryPoint'];
 export type SchemaHistoryResolution = components['schemas']['HistoryResolution'];
 export type SchemaHistorySeries = components['schemas']['HistorySeries'];
 export type SchemaInvalidParam = components['schemas']['InvalidParam'];
+export type SchemaLeaderboardBasis = components['schemas']['LeaderboardBasis'];
+export type SchemaLeaderboardEntry = components['schemas']['LeaderboardEntry'];
+export type SchemaLeaderboardMinimums = components['schemas']['LeaderboardMinimums'];
+export type SchemaLeaderboardPage = components['schemas']['LeaderboardPage'];
 export type SchemaLeague = components['schemas']['League'];
 export type SchemaLeaguePage = components['schemas']['LeaguePage'];
 export type SchemaLegStatus = components['schemas']['LegStatus'];
@@ -2540,6 +3611,11 @@ export type SchemaSlipQuoteRequest = components['schemas']['SlipQuoteRequest'];
 export type SchemaSlug = components['schemas']['Slug'];
 export type SchemaSport = components['schemas']['Sport'];
 export type SchemaSportPage = components['schemas']['SportPage'];
+export type SchemaSteamBasis = components['schemas']['SteamBasis'];
+export type SchemaSteamDirection = components['schemas']['SteamDirection'];
+export type SchemaSteamFollower = components['schemas']['SteamFollower'];
+export type SchemaSteamSignal = components['schemas']['SteamSignal'];
+export type SchemaSteamSignalPage = components['schemas']['SteamSignalPage'];
 export type SchemaTicketDecimalOdds = components['schemas']['TicketDecimalOdds'];
 export type SchemaTotpCodeRequest = components['schemas']['TOTPCodeRequest'];
 export type SchemaTotpEnrolment = components['schemas']['TOTPEnrolment'];
@@ -2558,8 +3634,10 @@ export type ParameterBookFilter = components['parameters']['BookFilter'];
 export type ParameterCursor = components['parameters']['Cursor'];
 export type ParameterEventId = components['parameters']['EventID'];
 export type ParameterIdempotencyKey = components['parameters']['IdempotencyKey'];
+export type ParameterLeagueFilter = components['parameters']['LeagueFilter'];
 export type ParameterLeagueSlug = components['parameters']['LeagueSlug'];
 export type ParameterMarketId = components['parameters']['MarketID'];
+export type ParameterMarketTypeFilter = components['parameters']['MarketTypeFilter'];
 export type ParameterOddsFormatQuery = components['parameters']['OddsFormatQuery'];
 export type ParameterPageLimit = components['parameters']['PageLimit'];
 export type ParameterSelectionId = components['parameters']['SelectionID'];
@@ -2611,6 +3689,61 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            429: components["responses"]["TooManyRequests"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    getAccountCLV: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Opaque continuation token from a previous response's `page.next_cursor`.
+                 *     Do not construct or parse one. A cursor is bound to the ordering and the
+                 *     filters it was minted under and is rejected `400` if presented with
+                 *     different ones.
+                 */
+                cursor?: components["parameters"]["Cursor"];
+                /**
+                 * @description Lower bound on `graded_at`, RFC 3339, half-open with `graded_to`.
+                 *     Defaults to 90 days before the request is served.
+                 *
+                 *     There is no ceiling on how far back this may reach, unlike the
+                 *     signal feeds. `wager_leg_clv` is a plain table read through an index
+                 *     led by the customer's own id, so a wide window is one index range
+                 *     rather than a scan of every chunk in a hypertable.
+                 */
+                graded_from?: string;
+                /**
+                 * @description Upper bound on `graded_at`, exclusive. Defaults to the instant the
+                 *     request is served. It bounds `aggregate` and `by_league`; the paged
+                 *     `data` rows are bounded below only, because a cursor already names
+                 *     where the page ends.
+                 */
+                graded_to?: string;
+                /** @description Maximum rows in this page. */
+                limit?: components["parameters"]["PageLimit"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /**
+             * @description One page of graded legs with their CLV, plus the aggregate over the
+             *     window and the same cut by league.
+             */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CLVResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            422: components["responses"]["UnprocessableEntity"];
             429: components["responses"]["TooManyRequests"];
             500: components["responses"]["InternalError"];
         };
@@ -3190,6 +4323,57 @@ export interface operations {
             500: components["responses"]["InternalError"];
         };
     };
+    getLeaderboard: {
+        parameters: {
+            query?: {
+                /** @description Which measure to rank on. Both are on every row either way. */
+                basis?: components["schemas"]["LeaderboardBasis"];
+                /**
+                 * @description Lower bound on settlement and grading time, RFC 3339. Defaults to 90
+                 *     days before the request is served. The window is half-open,
+                 *     `[from, to)`.
+                 */
+                from?: string;
+                /** @description Maximum rows in this page. */
+                limit?: components["parameters"]["PageLimit"];
+                /**
+                 * @description Minimum COUNTABLE CLV legs -- neither voided nor line-moved -- inside
+                 *     the window for a customer to be ranked at all.
+                 */
+                min_clv_samples?: number;
+                /**
+                 * @description Minimum settled wagers -- `won`, `lost`, `push` or `cashed_out` --
+                 *     inside the window for a customer to be ranked at all.
+                 */
+                min_settled_wagers?: number;
+                /** @description Upper bound, exclusive. Defaults to the instant the request is served. */
+                to?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /**
+             * @description The ranked board, with the thresholds it was filtered at. An empty
+             *     `data` array is a correct answer: no customer has yet met the
+             *     minimum sample size in this window.
+             */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LeaderboardPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            422: components["responses"]["UnprocessableEntity"];
+            429: components["responses"]["TooManyRequests"];
+            500: components["responses"]["InternalError"];
+        };
+    };
     getLeagueBoard: {
         parameters: {
             query?: {
@@ -3372,6 +4556,211 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             422: components["responses"]["UnprocessableEntity"];
+            429: components["responses"]["TooManyRequests"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    listArbitrageSignals: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Restrict findings to one league, by slug. Omitted means every league.
+                 *     An unknown slug is a `400` naming the parameter, not a silent empty
+                 *     result -- a typo that quietly returns nothing is indistinguishable from
+                 *     "there is nothing to report", which is the one answer an analytics
+                 *     surface must never fake.
+                 *
+                 *     It is a query parameter here rather than a path segment (as it is on the
+                 *     board) because it composes with the other filters on the same operation
+                 *     instead of naming a different resource.
+                 */
+                league?: components["parameters"]["LeagueFilter"];
+                /** @description Maximum rows in this page. */
+                limit?: components["parameters"]["PageLimit"];
+                /**
+                 * @description Restrict findings to these market types. Repeatable, and the values
+                 *     union. Omitted means every type.
+                 */
+                market_type?: components["parameters"]["MarketTypeFilter"];
+                /**
+                 * @description Refuse a finding whose stalest leg was already older than this when
+                 *     the finding was written. Defaults to 120, which is
+                 *     `pricing.DefaultArbitrageConfig().MaxLegAge` -- the reader's default
+                 *     is the detector's own bound, so the default view is not silently
+                 *     narrower than what was detected.
+                 */
+                max_leg_age_seconds?: number;
+                /**
+                 * @description Refuse a finding assembled from legs observed more than this far
+                 *     apart. Defaults to 30, which is
+                 *     `pricing.DefaultArbitrageConfig().MaxLegSpread`.
+                 */
+                max_spread_seconds?: number;
+                /**
+                 * @description Minimum number of distinct books across the legs. `1` (the default)
+                 *     admits the single-book under-round finding, which is the stronger
+                 *     one; `2` insists on genuine cross-book arbitrage.
+                 */
+                min_distinct_books?: number;
+                /** @description Only findings whose guaranteed return is at least this, in percent of total outlay. */
+                min_return_percent?: number;
+                /**
+                 * @description Lower bound on `observed_at`, which is the OLDEST leg's instant, RFC
+                 *     3339. Defaults to 15 minutes before the request is served and may
+                 *     not be earlier than 30 days before it -- the retention of the
+                 *     `signals.arb` topic.
+                 */
+                observed_after?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The live arbitrage set, best return first. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ArbitrageSignalList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            429: components["responses"]["TooManyRequests"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    listEVSignals: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Restrict prices to these books, by slug. Repeatable. Omitted means every
+                 *     book. An unknown slug is a `400`, not a silent empty result -- a typo
+                 *     that quietly returns nothing is the worst possible outcome for a price
+                 *     comparison.
+                 */
+                book?: components["parameters"]["BookFilter"];
+                /**
+                 * @description Opaque continuation token from a previous response's `page.next_cursor`.
+                 *     Do not construct or parse one. A cursor is bound to the ordering and the
+                 *     filters it was minted under and is rejected `400` if presented with
+                 *     different ones.
+                 */
+                cursor?: components["parameters"]["Cursor"];
+                /**
+                 * @description Restrict findings to one league, by slug. Omitted means every league.
+                 *     An unknown slug is a `400` naming the parameter, not a silent empty
+                 *     result -- a typo that quietly returns nothing is indistinguishable from
+                 *     "there is nothing to report", which is the one answer an analytics
+                 *     surface must never fake.
+                 *
+                 *     It is a query parameter here rather than a path segment (as it is on the
+                 *     board) because it composes with the other filters on the same operation
+                 *     instead of naming a different resource.
+                 */
+                league?: components["parameters"]["LeagueFilter"];
+                /** @description Maximum rows in this page. */
+                limit?: components["parameters"]["PageLimit"];
+                /**
+                 * @description Restrict findings to these market types. Repeatable, and the values
+                 *     union. Omitted means every type.
+                 */
+                market_type?: components["parameters"]["MarketTypeFilter"];
+                /**
+                 * @description Only findings at or above this expected value, in percent. Applied
+                 *     ON TOP of `threshold_ev_percent`, which is what the detector was
+                 *     configured to emit; asking for less than the detector emitted
+                 *     returns what it emitted and nothing more.
+                 */
+                min_ev_percent?: number;
+                /**
+                 * @description Lower bound on `quote_observed_at`, RFC 3339. Defaults to 6 hours
+                 *     before the request is served, and may not be earlier than 7 days
+                 *     before it.
+                 *
+                 *     REQUIRED IN SUBSTANCE even though it has a default: `ev_signals` is
+                 *     a Timescale hypertable with no retention policy, so a read with no
+                 *     lower bound consults an index on every chunk that has ever existed.
+                 *     The 7 day ceiling is not arbitrary either -- it is the retention of
+                 *     the `signals.ev` Kafka topic, so the REST window and the replayable
+                 *     bus window are the same window.
+                 */
+                observed_after?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of +EV findings, best first. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EVSignalPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            429: components["responses"]["TooManyRequests"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    listSteamSignals: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Opaque continuation token from a previous response's `page.next_cursor`.
+                 *     Do not construct or parse one. A cursor is bound to the ordering and the
+                 *     filters it was minted under and is rejected `400` if presented with
+                 *     different ones.
+                 */
+                cursor?: components["parameters"]["Cursor"];
+                /** @description Maximum rows in this page. */
+                limit?: components["parameters"]["PageLimit"];
+                /**
+                 * @description Restrict findings to these market types. Repeatable, and the values
+                 *     union. Omitted means every type.
+                 */
+                market_type?: components["parameters"]["MarketTypeFilter"];
+                /**
+                 * @description Only moves of at least this size, in IMPLIED PROBABILITY POINTS
+                 *     (0.02 is two points). Applied on top of `threshold_magnitude`.
+                 */
+                min_magnitude?: number;
+                /**
+                 * @description Minimum number of books that took part -- the lead book plus its
+                 *     followers. Two is the floor a correlated move can be defined at.
+                 */
+                min_participating_books?: number;
+                /**
+                 * @description Lower bound on `window_end`, RFC 3339. Defaults to 2 hours before
+                 *     the request is served and may not be earlier than 30 days before it
+                 *     -- the retention of the `signals.steam` topic. `steam_signals` is a
+                 *     hypertable with no retention policy, so an unbounded read consults
+                 *     every chunk ever created.
+                 */
+                window_end_after?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of steam moves, most recent window first. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SteamSignalPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
             429: components["responses"]["TooManyRequests"];
             500: components["responses"]["InternalError"];
         };

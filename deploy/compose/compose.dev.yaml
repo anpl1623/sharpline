@@ -19,6 +19,12 @@ name: sharpline
 
 services:
 
+  # ---- data plane: host port exposed for local dev tooling -----------------------------
+
+  postgres:
+    ports:
+      - "5432:5432"
+
   # ---- frontend: Next dev server in a container, hot reload intact ---------------------
 
   web:
