@@ -48,6 +48,20 @@
  * It is attached as `Authorization: Bearer` and nowhere else. It never enters a
  * URL, a query string, a log line or an error. Only `BrowserCallOptions` carries
  * one — a server render has no user credential to supply, and the type says so.
+ *
+ * # Idempotency-Key is a HEADER, and the money endpoints require it
+ *
+ * `POST /wagers` and `POST /wagers/{id}/cashout` derive their resource
+ * identifier from `(user, Idempotency-Key)`, so a retried submit collides with
+ * the primary key it already wrote instead of booking a second bet. The key is
+ * therefore not optional and is not defaulted here: the two methods that need
+ * one take it as a required argument, so a caller cannot forget it and get an
+ * at-least-once money path by omission.
+ *
+ * It travels as a header rather than in the body for the reason the header
+ * belongs to the SUBMIT and not to the slip — reusing a key with a different
+ * body returns the ORIGINAL resource unchanged, which only makes sense if the
+ * key is framing rather than content.
  */
 
 import {
@@ -59,16 +73,25 @@ import {
 } from '@/lib/api/errors';
 import type {
   SchemaAccount,
+  SchemaBalanceResponse,
   SchemaBoardPage,
   SchemaBookPage,
+  SchemaCashOutQuote,
   SchemaEventDetail,
   SchemaHistoryResolution,
   SchemaHistorySeries,
   SchemaLeaguePage,
   SchemaMarketComparison,
+  SchemaPlacement,
+  SchemaPlaceWagerRequest,
   SchemaSearchPage,
   SchemaSessionResponse,
+  SchemaSlipQuote,
+  SchemaSlipQuoteRequest,
   SchemaSportPage,
+  SchemaWager,
+  SchemaWagerPage,
+  SchemaWagerStatus,
 } from '@/lib/api/schema';
 
 // -----------------------------------------------------------------------------
@@ -190,6 +213,16 @@ interface RequestSpec {
   readonly query?: Readonly<Record<string, QueryValue>> | undefined;
   readonly body?: unknown;
   readonly accessToken?: string | undefined;
+  /**
+   * Extra request headers. `Idempotency-Key` is the only one this frontend
+   * sends, and it is spelled at the call site rather than assembled here so a
+   * reader of `placeWager` can see the whole contract in one place.
+   *
+   * `Accept`, `Content-Type` and `Authorization` are owned by `request` and are
+   * applied AFTER these, so nothing passed here can overwrite the credential
+   * header or the content type with something the server would reject.
+   */
+  readonly headers?: Readonly<Record<string, string>> | undefined;
   readonly signal?: AbortSignal | undefined;
   readonly timeoutMs: number;
   readonly cache?: RequestCache | undefined;
@@ -205,7 +238,11 @@ export async function request<T>(spec: RequestSpec): Promise<T> {
     spec.query === undefined ? '' : buildQueryString(spec.query)
   }`;
 
-  const headers = new Headers({ Accept: 'application/json' });
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(spec.headers ?? {})) {
+    if (value !== '') headers.set(name, value);
+  }
+  headers.set('Accept', 'application/json');
   if (spec.body !== undefined) {
     headers.set('Content-Type', 'application/json');
   }
@@ -337,6 +374,34 @@ export interface SearchParams {
   readonly cursor?: string | undefined;
 }
 
+/**
+ * Wager history parameters.
+ *
+ * `status` is REPEATABLE and its values union: `?status=placed&status=open` is
+ * "everything still running". The filter is applied to the page the server
+ * scanned, so a filtered page may hold fewer than `limit` rows while `has_more`
+ * is still true — follow `next_cursor` until `has_more` is false rather than
+ * stopping at a short page.
+ */
+export interface WagerListParams {
+  readonly status?: readonly SchemaWagerStatus[] | undefined;
+  readonly limit?: number | undefined;
+  readonly cursor?: string | undefined;
+}
+
+/**
+ * A client-chosen key that makes a retry safe, and the reason the two money
+ * methods take it as a REQUIRED positional argument rather than an option.
+ *
+ * The wager identifier is derived from `(user, this key)`, so a replayed submit
+ * attempts the primary key it already inserted and the service answers with the
+ * EXISTING resource. Omitting the key is not "the default behaviour" — it is a
+ * `400`, and an endpoint that accepted a request without one would have an
+ * at-least-once money path. Making it a required argument is how that stops
+ * being a thing a caller can forget.
+ */
+export type IdempotencyKey = string;
+
 function boardQuery(
   params: BoardParams | undefined,
 ): Readonly<Record<string, QueryValue>> {
@@ -412,6 +477,68 @@ export interface ApiClient {
   ): Promise<SchemaSessionResponse>;
   logout(refreshToken: string, options?: BrowserCallOptions): Promise<void>;
   getAccount(options: BrowserCallOptions): Promise<SchemaAccount>;
+
+  /** The spendable and escrowed balances, folded from the ledger. */
+  getBalance(options: BrowserCallOptions): Promise<SchemaBalanceResponse>;
+
+  /**
+   * Price a slip WITHOUT placing it. Writes nothing and moves no money — no
+   * wager row, no ledger entry, no idempotency key — so a client may call it as
+   * often as the user edits the slip.
+   *
+   * A moved price is REPORTED here (`price_moved: true` with both numbers on the
+   * leg) rather than refused, because a quote whose whole job is to describe the
+   * current state should not fail when the state is interesting.
+   */
+  quoteSlip(
+    body: SchemaSlipQuoteRequest,
+    options: BrowserCallOptions,
+  ): Promise<SchemaSlipQuote>;
+
+  /**
+   * Book the ticket. `201` means booked now, `200` means booked earlier by this
+   * same key — both carry the same body, and `Placement.replayed` restates the
+   * distinction inside it so a client that only reads the body still knows.
+   */
+  placeWager(
+    body: SchemaPlaceWagerRequest,
+    idempotencyKey: IdempotencyKey,
+    options: BrowserCallOptions,
+  ): Promise<SchemaPlacement>;
+
+  listWagers(
+    params: WagerListParams | undefined,
+    options: BrowserCallOptions,
+  ): Promise<SchemaWagerPage>;
+
+  /** Somebody else's wager is a 404, not a 403. See the OpenAPI note. */
+  getWager(wagerId: string, options: BrowserCallOptions): Promise<SchemaWager>;
+
+  /**
+   * What the book will pay to close this ticket now.
+   *
+   * A snapshot at `quoted_at`, NOT an offer held open — there is deliberately no
+   * expiry field, and whatever takes the cash-out re-prices while holding the
+   * wager row.
+   */
+  getCashOutQuote(
+    wagerId: string,
+    options: BrowserCallOptions,
+  ): Promise<SchemaCashOutQuote>;
+
+  /**
+   * Take the cash-out at a value the customer was SHOWN.
+   *
+   * `acceptedValueMinor` must be the number on screen, not a freshly fetched
+   * one: echoing a re-read quote defeats the control entirely, and the service
+   * refuses with `409 price_moved` when the value has changed.
+   */
+  takeCashOut(
+    wagerId: string,
+    acceptedValueMinor: number,
+    idempotencyKey: IdempotencyKey,
+    options: BrowserCallOptions,
+  ): Promise<SchemaWager>;
 }
 
 type Transport = <T>(
@@ -420,6 +547,7 @@ type Transport = <T>(
     readonly method?: HttpMethod;
     readonly query?: Readonly<Record<string, QueryValue>> | undefined;
     readonly body?: unknown;
+    readonly headers?: Readonly<Record<string, string>> | undefined;
   },
 ) => Promise<T>;
 
@@ -510,6 +638,48 @@ export function createApiClient(send: Transport): ApiClient {
       }),
 
     getAccount: (options) => send<SchemaAccount>('/account', options),
+
+    getBalance: (options) =>
+      send<SchemaBalanceResponse>('/account/balance', options),
+
+    quoteSlip: (body, options) =>
+      send<SchemaSlipQuote>('/slip/quote', {
+        ...options,
+        method: 'POST',
+        body,
+      }),
+
+    placeWager: (body, idempotencyKey, options) =>
+      send<SchemaPlacement>('/wagers', {
+        ...options,
+        method: 'POST',
+        body,
+        headers: { 'Idempotency-Key': idempotencyKey },
+      }),
+
+    listWagers: (params, options) =>
+      send<SchemaWagerPage>('/wagers', {
+        ...options,
+        query: {
+          status: params?.status,
+          limit: params?.limit,
+          cursor: params?.cursor,
+        },
+      }),
+
+    getWager: (wagerId, options) =>
+      send<SchemaWager>(`/wagers/${encode(wagerId)}`, options),
+
+    getCashOutQuote: (wagerId, options) =>
+      send<SchemaCashOutQuote>(`/wagers/${encode(wagerId)}/cashout`, options),
+
+    takeCashOut: (wagerId, acceptedValueMinor, idempotencyKey, options) =>
+      send<SchemaWager>(`/wagers/${encode(wagerId)}/cashout`, {
+        ...options,
+        method: 'POST',
+        body: { accepted_value_minor: acceptedValueMinor },
+        headers: { 'Idempotency-Key': idempotencyKey },
+      }),
   };
 }
 

@@ -1,7 +1,8 @@
 // Command api serves the Sharpline REST API: auth, catalogue, account, bet
-// slip, wagers and history (CLAUDE.md §3). Phase 5 delivers auth, the catalogue
-// read surface and account; the bet slip and wagers arrive in phase 8 as
-// additional route sets and change nothing about the shape of this file.
+// slip, wagers and history (CLAUDE.md §3). Phase 5 delivered auth, the catalogue
+// read surface and account; phase 8 added the bet slip, placement, wager history
+// and cash-out pricing, which arrive as additional ports on the same handler set
+// and change nothing about the shape of this file.
 //
 // This file is the COMPOSITION ROOT and nothing else. Every policy it appears
 // to decide is argued somewhere else and imported here: the middleware order in
@@ -31,6 +32,8 @@ import (
 	"github.com/anpl1623/sharpline/internal/auth"
 	authpg "github.com/anpl1623/sharpline/internal/auth/pgstore"
 	"github.com/anpl1623/sharpline/internal/auth/redisguard"
+	"github.com/anpl1623/sharpline/internal/betting"
+	bettingpg "github.com/anpl1623/sharpline/internal/betting/pgstore"
 	"github.com/anpl1623/sharpline/internal/httpapi"
 	"github.com/anpl1623/sharpline/internal/httpapi/authsessions"
 	"github.com/anpl1623/sharpline/internal/httpapi/middleware"
@@ -262,7 +265,12 @@ func run() error {
 		return fmt.Errorf("%s: %w", service, err)
 	}
 
-	routeSets, err := routeSets(log, stack, store, sessions)
+	placement, pricer, err := bettingPort(log, db)
+	if err != nil {
+		return fmt.Errorf("%s: %w", service, err)
+	}
+
+	routeSets, err := routeSets(log, stack, store, sessions, placement, pricer)
 	if err != nil {
 		return fmt.Errorf("%s: %w", service, err)
 	}
@@ -458,6 +466,8 @@ func routeSets(
 	stack *middleware.Stack,
 	store *pgstore.Store,
 	sessions httpapi.Sessions,
+	placement httpapi.Betting,
+	pricer httpapi.TicketPricer,
 ) ([]httpapi.RouteSet, error) {
 	api, err := httpapi.NewAPI(httpapi.APIOptions{
 		Catalogue: store,
@@ -467,6 +477,37 @@ func routeSets(
 		Limits:    store,
 		Audit:     store,
 		Sessions:  sessions,
+
+		// The bet slip and wagers. `store` serves the wager READS (its
+		// statements are scoped by user, and the one that is not is compared
+		// against the caller immediately on read); `placement` owns the write
+		// transaction and every rule inside it.
+		Betting: placement,
+		Wagers:  store,
+
+		// The SAME pricer instance the placement service holds, which is what
+		// makes `/slip/quote` honest: a slip quotes at the number it will be
+		// booked at, or it is refused for having moved. Two pricers would make
+		// the quote a polite fiction and the difference would reach the customer
+		// as a price move that never happened.
+		Pricer: pricer,
+
+		// CashOutQuotes and CashOuts are nil, and both gaps are REPORTED rather
+		// than papered over — httpapi.NewAPI logs each at WARN with what is
+		// missing, and neither route is mounted.
+		//
+		// CashOutQuotes needs a betting.FairPrices source: devigged reference
+		// prices from the sharp book (ADR 0006). Nothing in this tree implements
+		// one yet, and wiring the service without it would mount a route that
+		// answers 500 on every call, which is strictly worse than an absent one.
+		//
+		// CashOuts needs the settlement write path. Taking a cash-out is a state
+		// transition on a placed ticket and belongs with the other transitions
+		// in internal/settlement, deliberately: a component able to both quote
+		// and take a cash-out could do both in one transaction at a price of its
+		// own choosing.
+		CashOutQuotes: nil,
+		CashOuts:      nil,
 		// Cache is nil: the Redis snapshot in front of Prices is an optimisation
 		// and every read goes to Postgres without it, which is correct and
 		// slower. It arrives with the market-state store rather than being
@@ -606,4 +647,80 @@ var (
 	_ httpx.Checker      = (*postgres.DB)(nil)
 	_ httpx.Checker      = (*redis.Client)(nil)
 	_ httpapi.Mux        = (*httpx.Server)(nil)
+
+	// The betting seams. internal/httpapi declares these interfaces and
+	// internal/betting does not know it exists — which is the point of
+	// consumer-declared interfaces and the reason no adapter sits between them.
+	// Asserting it here, at the composition root, is what turns "they happen to
+	// line up" into a compile error the day one of them moves.
+	_ httpapi.Betting       = (*betting.Service)(nil)
+	_ httpapi.CashOutQuotes = (*betting.Service)(nil)
+	_ httpapi.TicketPricer  = betting.IndependentPricer{}
+	_ betting.Store         = (*bettingpg.Store)(nil)
+	_ betting.Wagers        = (*bettingpg.Store)(nil)
 )
+
+// bettingPort builds the placement service and the ticket pricer.
+//
+// # What is deliberately left at internal/betting's defaults
+//
+// MaxQuoteAge, MaxFairPriceAge, the cash-out margin and the idempotency TTL are
+// all policy belonging to the package that enforces them, exactly as the
+// argon2id parameters and the refresh-token lifetimes are internal/auth's. A
+// second copy of any of them here is how one of the two ends up loosened by
+// somebody chasing a slow test — and the cash-out margin in particular is the
+// book's take, which must be one reviewable constant rather than a value a
+// composition root can quietly change.
+//
+// # Why the pricer is returned as well as installed
+//
+// httpapi's `/slip/quote` needs a ticket price and must not compute one. It gets
+// THIS INSTANCE, so a slip quotes at the number placement will book it at.
+// Returning it rather than constructing a second one is the whole guarantee;
+// betting.IndependentPricer is stateless, so a second value would behave
+// identically today and would silently stop doing so the moment a book supplies
+// a correlation model or a teaser ladder to one of them.
+//
+// # The Redis idempotency cache is nil, and correctness is unaffected
+//
+// internal/betting derives the wager id from (user, idempotency key), so a
+// replayed submit collides with wagers_pkey and the service reads the existing
+// ticket back. The cache only decides whether that costs a round trip or a
+// transaction; CLAUDE.md §3 calls Redis "never the source of truth" and this is
+// what that means in practice. It is wired the day an implementation exists, and
+// nothing about placement changes when it is.
+func bettingPort(log *slog.Logger, db *postgres.DB) (*betting.Service, betting.TicketPricer, error) {
+	store, err := bettingpg.New(db)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build the betting store: %w", err)
+	}
+
+	// IndependentPricer REFUSES to price a same-game parlay or a teaser rather
+	// than approximating either, and that refusal is the correct default: a
+	// wrong ticket price is frozen into a row the schema then makes immutable,
+	// so it is wrong forever and wrong in the direction nobody audits. A
+	// deployment with a correlation matrix or a posted teaser ladder supplies
+	// its own TicketPricer here and neither package changes.
+	pricer := betting.IndependentPricer{}
+
+	svc, err := betting.NewService(store, pricer, time.Now, betting.Options{
+		// Wagers is the read side of the same store, needed by the cash-out
+		// quote path. FairPrices is nil, so that path reports itself
+		// unconfigured rather than pricing off something it should not — see
+		// routeSets on why the route is then not mounted at all.
+		Wagers:     store,
+		FairPrices: nil,
+		Cache:      nil,
+		Logger:     log,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("build the betting service: %w", err)
+	}
+
+	log.Info("betting service wired",
+		slog.String("pricer", "independent (same-game parlays and teasers are refused, not approximated)"),
+		slog.Bool("idempotency_cache", false),
+		slog.Bool("cash_out_quotes", false),
+	)
+	return svc, pricer, nil
+}

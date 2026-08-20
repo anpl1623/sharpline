@@ -118,6 +118,13 @@ export function AccountMenu({ className }: AccountMenuProps) {
           <p className="mt-1 t-ui break-all text-ink">{label}</p>
         </div>
         <DropdownMenuSeparator />
+        {/* `asChild` so the item IS the link: a `<div role="menuitem">` with an
+            onSelect that navigates cannot be opened in a new tab, cannot be
+            copied, and has no href for a screen reader to announce. */}
+        <DropdownMenuItem asChild>
+          <Link href="/bets">Your bets</Link>
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
         <DropdownMenuItem
           onSelect={() => {
             void logout();

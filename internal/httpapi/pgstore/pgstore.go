@@ -33,7 +33,14 @@
 // and audit entries. Everything else here is a read. There is no balance write
 // and there is no path to one — CLAUDE.md §4 makes the balance a fold over
 // ledger_entries and money moves only through internal/betting's double-entry
-// transaction (phase 8).
+// transaction.
+//
+// Phase 8 added wager reads (wagers.go) and did not change that. Placement is
+// internal/betting's transaction, settlement is internal/settlement's, and this
+// package contains no INSERT or UPDATE against `wagers`, `legs`,
+// `ledger_transactions` or `ledger_entries` — nor could it usefully, since
+// migration 00006 freezes a ticket's booked terms with a trigger the moment it
+// is written.
 package pgstore
 
 import (
@@ -129,6 +136,7 @@ var (
 	_ httpapi.Accounts  = (*Store)(nil)
 	_ httpapi.Limits    = (*Store)(nil)
 	_ httpapi.Audit     = (*Store)(nil)
+	_ httpapi.Wagers    = (*Store)(nil)
 )
 
 // notFound maps pgx's no-rows signal onto the consumer's sentinel.
@@ -592,9 +600,21 @@ func (s *Store) Profile(ctx context.Context, user domain.UserID) (httpapi.Profil
 	if err != nil {
 		return httpapi.Profile{}, notFound("account profile", err)
 	}
-	status, err := auth.ParseUserStatus(r.Status)
+	p, err := profileFrom(r)
 	if err != nil {
 		return httpapi.Profile{}, fmt.Errorf("account profile: %w", err)
+	}
+	return p, nil
+}
+
+// profileFrom converts the row. One function because [Store.SelfExclude] reads
+// the same row inside its transaction and a second conversion would be a second
+// place for the TOTP biconditional — pending means started AND NOT confirmed —
+// to drift.
+func profileFrom(r gen.GetAccountProfileRow) (httpapi.Profile, error) {
+	status, err := auth.ParseUserStatus(r.Status)
+	if err != nil {
+		return httpapi.Profile{}, err
 	}
 	return httpapi.Profile{
 		ID:            r.ID,
@@ -604,6 +624,111 @@ func (s *Store) Profile(ctx context.Context, user domain.UserID) (httpapi.Profil
 		TOTPConfirmed: r.TotpConfirmed,
 		TOTPPending:   r.TotpEnrolmentStarted && !r.TotpConfirmed,
 	}, nil
+}
+
+// SelfExclude moves the account to `self_excluded` and writes the audit entry,
+// in ONE transaction.
+//
+// # Why the read and the write are in one transaction
+//
+// The audit row's before-state has to be the state the UPDATE actually acted
+// on. Reading the profile on one connection and updating on another would let a
+// concurrent change land in between, and the trail would then record a
+// transition that never happened — in the one table whose entire value is that
+// it did not.
+//
+// The read also answers "no such user" before the guarded UPDATE runs, which is
+// what makes a zero row count unambiguous. It is the same read-then-
+// guarded-write shape [Store.Set] uses for a limit change, and for the same
+// reason.
+//
+// # A zero row count is a SUCCESS
+//
+// UpdateUserStatus is written to refuse an already-narrowed source, so it
+// matches no row when the customer is already `self_excluded` or `closed`. That
+// is the outcome they asked for, not a failure, and reporting a 409 or a 500 to
+// somebody asking to be protected would be the worst available answer. The
+// profile as it stands is returned and NO SECOND AUDIT ROW IS WRITTEN: nothing
+// changed, and the trail records changes. A `closed` account reaches this only
+// hypothetically — auth.UserStatus.CanAuthenticate is false for it, so it
+// cannot present a token — and is reported honestly as `closed` rather than as
+// the status it did not reach.
+//
+// # What this deliberately cannot do
+//
+// It cannot widen. The statement admits `self_excluded` and `closed` as
+// destinations and nothing else, so it cannot lift a self-exclusion, an
+// operator's suspension or a closure regardless of what any caller passes.
+// Reinstatement is an operator action with a different actor, a different
+// authorisation and a different audit action, and it gets its own statement
+// when the admin console is built.
+func (s *Store) SelfExclude(ctx context.Context, req httpapi.SelfExclusion) (httpapi.Profile, error) {
+	var out httpapi.Profile
+	err := s.db.InTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		q := s.q.WithTx(tx)
+
+		row, err := q.GetAccountProfile(ctx, req.UserID)
+		if err != nil {
+			return notFound("account profile", err)
+		}
+		before, err := profileFrom(row)
+		if err != nil {
+			return err
+		}
+
+		n, err := q.UpdateUserStatus(ctx, gen.UpdateUserStatusParams{
+			Status: auth.UserStatusSelfExcluded.String(),
+			UserID: req.UserID,
+		})
+		if err != nil {
+			return fmt.Errorf("update user status: %w", err)
+		}
+		if n == 0 {
+			out = before
+			return nil
+		}
+
+		after := before
+		after.Status = auth.UserStatusSelfExcluded
+		out = after
+		return s.auditSelfExclusion(ctx, q, req, before, after)
+	})
+	if err != nil {
+		return httpapi.Profile{}, fmt.Errorf("self-exclude: %w", err)
+	}
+	return out, nil
+}
+
+// auditSelfExclusion writes the audit row for a self-exclusion, inside the
+// caller's transaction.
+//
+// The diff is the STATUS AND NOTHING ELSE. The email is not a changed field and
+// putting it here would copy a personal identifier into an append-only
+// hypertable that cannot be edited afterwards — migration 00007 keeps
+// `client_ip` as the single PII-bearing column deliberately, and adding a second
+// one as a side effect of an audit call site is exactly how that stops being
+// true.
+func (s *Store) auditSelfExclusion(
+	ctx context.Context,
+	q *gen.Queries,
+	req httpapi.SelfExclusion,
+	before, after httpapi.Profile,
+) error {
+	entry := httpapi.AuditEntry{
+		Context:    req.Audit,
+		ActorKind:  "user",
+		ActorID:    req.UserID.String(),
+		Action:     "user.self_exclude",
+		EntityType: "user",
+		EntityID:   req.UserID.String(),
+		Outcome:    "success",
+		Before:     map[string]any{"status": before.Status.String()},
+		After:      map[string]any{"status": after.Status.String()},
+	}
+	if err := s.recordWith(ctx, q, entry); err != nil {
+		return fmt.Errorf("audit self-exclusion: %w", err)
+	}
+	return nil
 }
 
 // -----------------------------------------------------------------------------

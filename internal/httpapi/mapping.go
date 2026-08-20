@@ -2,9 +2,12 @@ package httpapi
 
 import (
 	"cmp"
+	"fmt"
+	"math"
 	"slices"
 	"time"
 
+	"github.com/anpl1623/sharpline/internal/betting"
 	"github.com/anpl1623/sharpline/internal/domain"
 	"github.com/anpl1623/sharpline/internal/domain/odds"
 	"github.com/anpl1623/sharpline/internal/httpapi/gen"
@@ -276,4 +279,227 @@ func wirePage(limit int32, hasMore bool, next string) gen.PageInfo {
 // adding.
 func singlePage(n int) gen.PageInfo {
 	return gen.PageInfo{Limit: int32(n), HasMore: false}
+}
+
+// -----------------------------------------------------------------------------
+// Betting
+// -----------------------------------------------------------------------------
+
+// wireWager maps a placed ticket onto the wire.
+//
+// Every price on it is HISTORICAL. gen.Wager.DecimalOdds is the ticket price the
+// customer accepted and gen.WagerLeg.DecimalOdds is the price that leg was
+// booked at; neither tracks the market, and there is no field on either that
+// could. A client wanting the current line asks the catalogue for it.
+func wireWager(w Wager, books map[domain.BookID]Book, format odds.Format) gen.Wager {
+	out := gen.Wager{
+		Id:                   w.ID.String(),
+		Kind:                 gen.WagerKind(w.Kind.String()),
+		Status:               gen.WagerStatus(w.Status.String()),
+		StakeMinor:           w.Stake.MinorUnits(),
+		DecimalOdds:          float64(w.Decimal),
+		Display:              renderOdds(w.Decimal, format),
+		Rounding:             gen.Rounding(w.Rounding.String()),
+		PotentialPayoutMinor: w.PotentialPayout.MinorUnits(),
+		PotentialProfitMinor: w.PotentialProfit.MinorUnits(),
+		TeaserPoints:         w.TeaserPoints,
+		PlacedAt:             w.PlacedAt.UTC(),
+		UpdatedAt:            w.UpdatedAt.UTC(),
+		Legs:                 make([]gen.WagerLeg, 0, len(w.Legs)),
+	}
+	if w.RoundRobinID != nil {
+		id := w.RoundRobinID.String()
+		out.RoundRobinId = &id
+	}
+	// The pair travels together or not at all: migration 00006's
+	// wagers_return_pair_complete makes "one set, one null" unstorable, and
+	// emitting one without the other would invent a state the database refuses.
+	if w.Returned != nil && w.NetReturn != nil {
+		returned := w.Returned.MinorUnits()
+		net := w.NetReturn.MinorUnits()
+		out.ReturnedMinor = &returned
+		out.NetReturnMinor = &net
+	}
+	if at, ok := w.SettledAt(); ok {
+		settled := at.UTC()
+		out.SettledAt = &settled
+	}
+	for _, leg := range w.Legs {
+		out.Legs = append(out.Legs, wireWagerLeg(leg, books, format))
+	}
+	return out
+}
+
+func wireWagerLeg(l WagerLeg, books map[domain.BookID]Book, format odds.Format) gen.WagerLeg {
+	out := gen.WagerLeg{
+		Id:              l.ID.String(),
+		EventId:         l.EventID.String(),
+		MarketId:        l.MarketID.String(),
+		MarketType:      gen.MarketType(l.MarketType.String()),
+		SelectionId:     l.SelectionID.String(),
+		Role:            gen.SelectionRole(l.Role.String()),
+		Status:          gen.LegStatus(l.Status.String()),
+		BookId:          l.BookID.String(),
+		BookSlug:        bookSlug(books, l.BookID),
+		DecimalOdds:     float64(l.Decimal),
+		Display:         renderOdds(l.Decimal, format),
+		Line:            linePtr(l.Line),
+		TeasedLine:      linePtr(l.TeasedLine),
+		GradingLine:     linePtr(l.GradingLine()),
+		PriceObservedAt: l.PriceObservedAt.UTC(),
+	}
+	if l.GradedAt != nil {
+		at := l.GradedAt.UTC()
+		out.GradedAt = &at
+	}
+	return out
+}
+
+// linePtr renders a domain.Line as the wire's `number | null`.
+//
+// The distinction it preserves is the reason domain.Line is a struct rather than
+// a *float64 in the first place: an ABSENT line (a moneyline, a futures market)
+// and a line of 0.0 (a traded pick'em) are different facts, and collapsing them
+// would make a pick'em render as "no handicap". domain.Line.MarshalJSON draws
+// the line in the same place; this is that rule applied through the generated
+// wire type, which cannot hold a domain.Line.
+func linePtr(l domain.Line) *float64 {
+	v, ok := l.Value()
+	if !ok {
+		return nil
+	}
+	return &v
+}
+
+// wirePlacement maps the result of a placement onto the wire.
+//
+// The totals are summed HERE, over the tickets in this very response, rather
+// than reported by the service. Two reasons, and they are the same two the
+// board's overround argument makes: they are a pure fold over numbers the client
+// can see, so the arithmetic is checkable against the rows beside it; and a
+// separately-carried total could disagree with the tickets it claims to
+// describe, which is exactly the failure a receipt must not have.
+func wirePlacement(p betting.Placement, books map[domain.BookID]Book, format odds.Format) (gen.Placement, error) {
+	out := gen.Placement{
+		Wagers:   make([]gen.Wager, 0, len(p.Wagers)),
+		Replayed: p.Replayed,
+	}
+
+	stakes := make([]domain.Money, 0, len(p.Wagers))
+	payouts := make([]domain.Money, 0, len(p.Wagers))
+	for _, w := range p.Wagers {
+		out.Wagers = append(out.Wagers, wireWager(wagerFromDomain(w), books, format))
+		stakes = append(stakes, w.Stake())
+		payouts = append(payouts, w.PotentialPayout())
+	}
+
+	// domain.SumMoney rather than a `+=` loop: it reports overflow instead of
+	// wrapping, and a round robin can carry a thousand tickets. A wrapped total
+	// on a receipt would be a negative number where the customer's money went.
+	totalStake, err := domain.SumMoney(stakes...)
+	if err != nil {
+		return gen.Placement{}, fmt.Errorf("total stake across %d ticket(s): %w", len(stakes), err)
+	}
+	totalPayout, err := domain.SumMoney(payouts...)
+	if err != nil {
+		return gen.Placement{}, fmt.Errorf("total payout across %d ticket(s): %w", len(payouts), err)
+	}
+	totalProfit, err := totalPayout.Sub(totalStake)
+	if err != nil {
+		return gen.Placement{}, fmt.Errorf("total profit: %w", err)
+	}
+
+	out.TotalStakeMinor = totalStake.MinorUnits()
+	out.PotentialPayoutMinor = totalPayout.MinorUnits()
+	out.PotentialProfitMinor = totalProfit.MinorUnits()
+
+	if rr := p.RoundRobin; !rr.IsZero() {
+		set := wireRoundRobin(rr)
+		out.RoundRobin = &set
+	}
+	return out, nil
+}
+
+// wireRoundRobin maps the parent expansion.
+//
+// Its selection SET is deliberately not on the wire. Every selection it was
+// built from appears on at least one of the tickets in the same response — for
+// any 2 <= k <= n every index is in some k-subset — so a second copy here could
+// only ever disagree with the tickets it supposedly generated, and the copy is
+// the one nobody would notice was wrong. Migration 00006 declines to store it
+// for the same reason.
+func wireRoundRobin(rr domain.RoundRobin) gen.RoundRobinTicketSet {
+	sizes := rr.Sizes()
+	out := gen.RoundRobinTicketSet{
+		Id:                       rr.ID().String(),
+		SelectionCount:           int32(len(rr.Legs())),
+		Sizes:                    make([]int32, 0, len(sizes)),
+		StakePerCombinationMinor: rr.StakePerCombination().MinorUnits(),
+		CombinationCount:         int32(rr.CombinationCount()),
+	}
+	for _, size := range sizes {
+		out.Sizes = append(out.Sizes, int32(size))
+	}
+	return out
+}
+
+// wireCashOutQuote maps a cash-out quote onto the wire.
+//
+// The stake, the net return and the margin in cash are derived here from the
+// quote and the ticket rather than carried on either. All three are exact
+// integer subtractions over numbers already in this response, so a client can
+// check them — which is the whole point of quoting off the fair value and
+// naming the haircut instead of burying it in a price.
+func wireCashOutQuote(q betting.CashOutQuote, w Wager, pending int) (gen.CashOutQuote, error) {
+	margin, err := q.FairValue.Sub(q.Value)
+	if err != nil {
+		return gen.CashOutQuote{}, fmt.Errorf("cash-out margin: %w", err)
+	}
+	net, err := q.Value.Sub(w.Stake)
+	if err != nil {
+		return gen.CashOutQuote{}, fmt.Errorf("cash-out net return: %w", err)
+	}
+	return gen.CashOutQuote{
+		WagerId:              q.WagerID.String(),
+		StakeMinor:           w.Stake.MinorUnits(),
+		PotentialPayoutMinor: w.PotentialPayout.MinorUnits(),
+		SurvivalProbability:  q.SurvivalProbability,
+		FairValueMinor:       q.FairValue.MinorUnits(),
+		MarginBps:            int32(q.MarginBps),
+		MarginMinor:          margin.MinorUnits(),
+		ValueMinor:           q.Value.MinorUnits(),
+		NetReturnMinor:       net.MinorUnits(),
+		PendingLegCount:      int32(pending),
+		QuotedAt:             q.QuotedAt.UTC(),
+	}, nil
+}
+
+// priceMovement classifies a re-quote from the CUSTOMER's side.
+//
+// `lengthened` pays more per unit staked than they saw, `shortened` pays less.
+// Named that way rather than up/down because "the odds went up" is ambiguous in
+// exactly the direction that matters — an American price of -110 moving to -105
+// is a bigger number and a worse bet.
+//
+// The tolerance is RELATIVE and mirrors internal/betting's own. The two must
+// agree, and this one must never be TIGHTER: a quote that flagged a change the
+// placement path then treats as unchanged would put a "price changed, accept?"
+// prompt in front of a customer whose bet would have gone through untouched.
+// The magnitude is safe by an enormous margin — the smallest move a book can
+// quote is a tick, which at even money is a relative difference near 5e-3, five
+// million times this.
+func priceMovement(seen, current float64) gen.PriceMovement {
+	if seen <= 0 || current <= 0 {
+		// Not a comparable pair. Reporting "unchanged" would be a claim; the
+		// caller decides what to do with a leg it could not compare.
+		return gen.Unchanged
+	}
+	scale := math.Max(math.Abs(seen), math.Abs(current))
+	if math.Abs(seen-current)/scale <= priceMatchTolerance {
+		return gen.Unchanged
+	}
+	if current > seen {
+		return gen.Lengthened
+	}
+	return gen.Shortened
 }

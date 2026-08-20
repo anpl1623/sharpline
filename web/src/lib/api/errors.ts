@@ -18,13 +18,28 @@
  *
  * # Nothing here ever touches a credential
  *
- * `ApiError` carries a status, a code, a message, a request id and the invalid
- * parameter list. It never carries the request body, the URL's query string, or
- * a header, because an access token would end up in every error boundary, every
- * log line and every crash report the moment one of those was included.
+ * `ApiError` carries a status, a code, a message, a request id, the invalid
+ * parameter list and — on a `409 price_moved` — the moved numbers. It never
+ * carries the request body, the URL's query string, or a header, because an
+ * access token would end up in every error boundary, every log line and every
+ * crash report the moment one of those was included.
+ *
+ * # price_moves is on the error, not on a second shape
+ *
+ * A refused placement is the ONE case where the error body carries data the UI
+ * has to render rather than merely report: `price_moves` holds the number the
+ * customer was shown AND the number the service holds now, for every leg that
+ * moved. It rides on the one error envelope for the reason the OpenAPI document
+ * gives — a client that had to re-quote to discover WHAT moved would be racing
+ * the next move and would show the user a third number that was never the reason
+ * the request was refused.
  */
 
-import type { SchemaError, SchemaInvalidParam } from '@/lib/api/schema';
+import type {
+  SchemaError,
+  SchemaInvalidParam,
+  SchemaPriceMove,
+} from '@/lib/api/schema';
 
 /** The server's closed set of error codes. */
 export type ApiErrorCode = SchemaError['code'];
@@ -60,6 +75,8 @@ export interface ApiErrorInit {
   readonly message: string;
   readonly requestId?: string | null;
   readonly invalidParams?: readonly SchemaInvalidParam[] | undefined;
+  /** Present only on `409 price_moved`. See the file comment. */
+  readonly priceMoves?: readonly SchemaPriceMove[] | undefined;
   readonly cause?: unknown;
 }
 
@@ -74,6 +91,8 @@ export class ApiError extends Error {
   readonly code: AnyApiErrorCode;
   readonly requestId: string | null;
   readonly invalidParams: readonly SchemaInvalidParam[];
+  /** Empty on every error except `409 price_moved`. */
+  readonly priceMoves: readonly SchemaPriceMove[];
 
   constructor(init: ApiErrorInit) {
     super(init.message);
@@ -82,6 +101,7 @@ export class ApiError extends Error {
     this.code = init.code;
     this.requestId = init.requestId ?? null;
     this.invalidParams = init.invalidParams ?? [];
+    this.priceMoves = init.priceMoves ?? [];
     if (init.cause !== undefined) {
       this.cause = init.cause;
     }
@@ -108,6 +128,17 @@ export class ApiError extends Error {
   /** Whether this is an authentication failure the UI should react to. */
   get isUnauthenticated(): boolean {
     return this.status === 401;
+  }
+
+  /**
+   * Whether this refusal is "a number you were shown is no longer offered".
+   *
+   * The slip branches on it to render the accept/reject interstitial rather than
+   * an error, because it is not a fault: the market moved, which is the thing
+   * this product exists to show, and the customer gets to decide.
+   */
+  get isPriceMoved(): boolean {
+    return this.code === 'price_moved';
   }
 
   /**
@@ -157,6 +188,28 @@ function readInvalidParams(value: unknown): readonly SchemaInvalidParam[] {
 }
 
 /**
+ * The moved numbers off a `409 price_moved` envelope.
+ *
+ * Kept as loose as `readInvalidParams`: only the `scope` discriminant is
+ * checked, because it is what a client switches on and an entry without one
+ * cannot be rendered at all. Every other field is optional on the wire by
+ * design — a `ticket` move carries no `selection_id`, a `cash_out` move carries
+ * no decimals — so validating them here would reject the shapes the spec
+ * defines.
+ */
+function readPriceMoves(value: unknown): readonly SchemaPriceMove[] {
+  if (!Array.isArray(value)) return [];
+  const moves: SchemaPriceMove[] = [];
+  for (const entry of value) {
+    if (!isRecord(entry)) continue;
+    const scope = entry['scope'];
+    if (scope !== 'leg' && scope !== 'ticket' && scope !== 'cash_out') continue;
+    moves.push(entry as unknown as SchemaPriceMove);
+  }
+  return moves;
+}
+
+/**
  * Turns a decoded response body into an `ApiError`, defensively.
  *
  * A body that does not have the documented shape is not thrown away and is not
@@ -189,6 +242,7 @@ export function apiErrorFromBody(status: number, body: unknown): ApiError {
       : fallbackMessageFor(status),
     requestId: typeof requestId === 'string' ? requestId : null,
     invalidParams: readInvalidParams(envelope['invalid_params']),
+    priceMoves: readPriceMoves(envelope['price_moves']),
   });
 }
 

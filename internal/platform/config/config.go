@@ -131,6 +131,34 @@ const (
 	// Only the live tier is exposed. The other four are derived from it in the
 	// ADR's arithmetic and exposing all five invites an inconsistent ladder.
 	EnvIngestLiveInterval = "SHARPLINE_INGEST_LIVE_INTERVAL"
+
+	// EnvIngestResultsInterval overrides how often the results poller reads its
+	// work queue.
+	//
+	// It is exposed for the same reason EnvIngestLiveInterval is, applied to the
+	// other arrow: the interval is the FLOOR of the settlement lag, so it is
+	// literally what a customer waits between the final whistle and their ticket
+	// becoming settleable, and a deployment that cannot change it cannot trade
+	// that latency against the load it costs.
+	//
+	// It is cheap where the odds cadence is not — one indexed read against a
+	// partial index per tick, plus one provider call — so the number is chosen
+	// for the customer rather than for the bill. That asymmetry is exactly why
+	// it is a SEPARATE knob and not derived from the live cadence.
+	EnvIngestResultsInterval = "SHARPLINE_INGEST_RESULTS_INTERVAL"
+
+	// EnvIngestResultsDelay overrides how long after its scheduled start a
+	// contest is considered plausibly over, and therefore worth asking a results
+	// provider about.
+	//
+	// This is the one number in the results path that HAS to be wrong for some
+	// sport: a single horizon cannot be right for a 48-minute basketball game, a
+	// three-hour NFL broadcast and a five-day Test match at once, and the
+	// package's default errs deliberately WIDE. Erring wide costs a query the
+	// provider answers with silence; erring narrow costs every customer on a
+	// long fixture the difference. A deployment whose slate is all one sport
+	// should be able to tighten it without a rebuild, which is what this is for.
+	EnvIngestResultsDelay = "SHARPLINE_INGEST_RESULTS_DELAY"
 )
 
 // Deployment environments. SHARPLINE_ENV must be one of these; an unrecognised
@@ -309,6 +337,15 @@ type Config struct {
 	// scheduler's own default (90s). See EnvIngestLiveInterval.
 	IngestLiveInterval time.Duration
 
+	// IngestResultsInterval overrides the results poller's cadence. Zero means
+	// the poller's own default (1m). See EnvIngestResultsInterval.
+	IngestResultsInterval time.Duration
+
+	// IngestResultsDelay overrides the results poller's "plausibly over"
+	// horizon. Zero means the poller's own default (2h).
+	// See EnvIngestResultsDelay.
+	IngestResultsDelay time.Duration
+
 	// PricerReferenceBooks is the ordered sharp-book preference list, already
 	// split and trimmed. Nil means "catalogue designation only".
 	// See EnvPricerReferenceBooks.
@@ -344,6 +381,8 @@ func (c Config) LogValue() slog.Value {
 		slog.Bool("odds_api_key_set", c.OddsAPIKey != ""),
 		slog.Int64("synthetic_seed", c.SyntheticSeed),
 		slog.String("ingest_live_interval", c.IngestLiveInterval.String()),
+		slog.String("ingest_results_interval", c.IngestResultsInterval.String()),
+		slog.String("ingest_results_delay", c.IngestResultsDelay.String()),
 		slog.Any("pricer_reference_books", c.PricerReferenceBooks),
 	)
 }
@@ -547,22 +586,57 @@ func LoadFrom(spec Spec, lookup Lookup) (*Config, error) {
 		}
 	}
 
-	// SHARPLINE_INGEST_LIVE_INTERVAL — always optional, but must parse and be
-	// positive if present. A zero or negative interval is a hot loop against a
-	// metered API, so it is refused rather than clamped: a silently-corrected
-	// cadence is a bill nobody predicted.
-	if raw, ok := lookup(EnvIngestLiveInterval); ok && strings.TrimSpace(raw) != "" {
+	// The three ingest cadence knobs. Each is always optional, but must parse
+	// and be POSITIVE if present. Every one of them is a loop's period or a
+	// horizon a loop subtracts, and a non-positive value is refused rather than
+	// clamped for the reason the whole of this function fails fast: a silently
+	// corrected cadence is a bill, or a settlement delay, that nobody predicted.
+	//
+	// Zero is therefore never a legal SET value, only an absent one — which is
+	// what lets the field's zero value mean "the owning package's default"
+	// downstream without a second flag to say which of the two happened.
+	for _, k := range []struct {
+		env   string
+		why   string
+		field *time.Duration
+	}{
+		{
+			env:   EnvIngestLiveInterval,
+			why:   "a non-positive poll interval is an unbounded loop against a metered provider",
+			field: &cfg.IngestLiveInterval,
+		},
+		{
+			env:   EnvIngestResultsInterval,
+			why:   "a non-positive interval is an unbounded loop against the work-queue read",
+			field: &cfg.IngestResultsInterval,
+		},
+		{
+			env: EnvIngestResultsDelay,
+			// Zero would be legal to the poller — a provider trusted to say when
+			// a contest is over is entitled to be asked immediately — but it is
+			// refused HERE because an env var set to "0s" is indistinguishable
+			// downstream from one that was never set, and the two would mean
+			// opposite things. Asking about everything that has started is
+			// spelled as a small positive value, not as zero.
+			why: "a non-positive horizon cannot be distinguished from an unset one, " +
+				"which means the poller's own default instead",
+			field: &cfg.IngestResultsDelay,
+		},
+	} {
+		raw, ok := lookup(k.env)
+		if !ok || strings.TrimSpace(raw) == "" {
+			continue
+		}
 		d, err := time.ParseDuration(strings.TrimSpace(raw))
 		switch {
 		case err != nil:
 			problems = append(problems, fmt.Errorf("%w: %s=%q: not a Go duration (e.g. \"90s\", \"5m\")",
-				ErrInvalid, EnvIngestLiveInterval, raw))
+				ErrInvalid, k.env, raw))
 		case d <= 0:
-			problems = append(problems, fmt.Errorf("%w: %s=%q: must be positive; a non-positive poll "+
-				"interval is an unbounded loop against a metered provider",
-				ErrInvalid, EnvIngestLiveInterval, raw))
+			problems = append(problems, fmt.Errorf("%w: %s=%q: must be positive; %s",
+				ErrInvalid, k.env, raw, k.why))
 		default:
-			cfg.IngestLiveInterval = d
+			*k.field = d
 		}
 	}
 

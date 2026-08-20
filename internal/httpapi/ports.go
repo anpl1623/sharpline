@@ -59,6 +59,50 @@
 //
 //	Audit       Postgres (`audit_log` hypertable), written INSIDE the
 //	            transaction that performs the change it records.
+//
+//	Wagers      Postgres. The customer's own placed tickets, read back from
+//	            `wagers` and `legs`. Never cached and never derived from the
+//	            bus: a wager is the record of a promise, and the only correct
+//	            source for one is the row that recorded it.
+//
+//	Betting     internal/betting, which owns the placement transaction —
+//	            self-exclusion, responsible-gaming limits, price-move
+//	            detection, the balance fold and the double-entry stake
+//	            movement, all under one lock. This package does the HTTP
+//	            around it and NONE of the money.
+//
+//	CashOutQuotes / CashOuts
+//	            internal/betting prices an early close; whatever EXECUTES one
+//	            is a state transition on a placed ticket and belongs with the
+//	            other transitions. The two are separate ports so a deployment
+//	            can serve the quote without being able to take it.
+//
+//	TicketPricer
+//	            internal/betting again. Ticket pricing is not a function of
+//	            the leg prices in general, so the quote endpoint borrows the
+//	            SAME pricer the placement service uses rather than
+//	            multiplying decimals itself.
+//
+// # Why internal/betting's own types cross the Betting seam, when nothing else's do
+//
+// [Betting], [CashOutQuotes] and [TicketPricer] are declared here, by the
+// consumer, exactly like every other port — but their parameters are
+// internal/betting's value types rather than a read model of this package's
+// own, and that is deliberate rather than a lapse.
+//
+// The rule those three break is "the read model is the QUESTION's shape", and
+// the rule exists to stop a PRODUCER owning this package's vocabulary. Here the
+// producer is not a database adapter whose shape follows a column list; it is
+// the domain service whose whole purpose is the vocabulary — a betting.Slip IS
+// the question, expressed in domain value types with no pgtype, no wire tag and
+// no HTTP anywhere in it. A parallel httpapi.Slip would be a field-for-field
+// copy whose only job would be to be copied back, and the copy is where a field
+// eventually goes missing.
+//
+// The property the rule protects is kept by other means: because the interfaces
+// are declared HERE and narrowly, *betting.Service satisfies them without
+// knowing this package exists, and a test satisfies them with a struct literal.
+// internal/betting does not import internal/httpapi and never will.
 package httpapi
 
 import (
@@ -67,6 +111,7 @@ import (
 	"time"
 
 	"github.com/anpl1623/sharpline/internal/auth"
+	"github.com/anpl1623/sharpline/internal/betting"
 	"github.com/anpl1623/sharpline/internal/domain"
 	"github.com/anpl1623/sharpline/internal/domain/odds"
 )
@@ -427,9 +472,52 @@ type Ledger interface {
 	Balances(ctx context.Context, user domain.UserID) ([]Balance, error)
 }
 
-// Accounts reads the authenticated user's profile.
+// Accounts reads the authenticated user's profile, and applies the one change
+// a customer may make to it.
 type Accounts interface {
 	Profile(ctx context.Context, user domain.UserID) (Profile, error)
+
+	// SelfExclude moves the caller to `self_excluded` and writes the audit
+	// entry, in ONE transaction.
+	//
+	// # It only ever narrows, and that is structural rather than conventional
+	//
+	// The statement behind it can reach `self_excluded` and `closed` and no
+	// other status, and refuses a source that is already one of those. So this
+	// method cannot lift a self-exclusion, cannot lift an operator's suspension
+	// and cannot reinstate a closed account — no matter what an implementation
+	// passes and no matter what a bug upstream computes. Reinstatement is an
+	// operator action with a different actor and a different authorisation, and
+	// it gets its own statement when the admin console is built. It must not be
+	// added to this one.
+	//
+	// # A no-op is a success, not an error
+	//
+	// A customer who is already self-excluded has the outcome they asked for.
+	// The implementation returns the profile as it stands and no error, and
+	// writes NO audit row — nothing changed, and the trail records changes.
+	// Reporting a 409 or a 500 for "you are already protected" would be a
+	// failure message on the one endpoint where a customer is least able to
+	// deal with one.
+	//
+	// A user id that does not exist is [ErrNotFound], which the handler answers
+	// the same way [Accounts.Profile] does: the token verified but names nobody,
+	// which is a server-side inconsistency rather than the caller's fault.
+	SelfExclude(ctx context.Context, req SelfExclusion) (Profile, error)
+}
+
+// SelfExclusion is a customer's request to stop themselves wagering.
+//
+// It carries no status field. The destination is not the caller's to choose —
+// this endpoint means exactly one thing — and a field would invite an
+// implementation to pass 'active' and discover the database refusing it, rather
+// than the API making the wrong request unrepresentable.
+type SelfExclusion struct {
+	UserID domain.UserID
+
+	// Audit is the provenance stamped onto the audit entry written in the same
+	// transaction, exactly as on [SetLimit].
+	Audit AuditContext
 }
 
 // Limits reads and writes self-imposed responsible-gaming limits.
@@ -529,6 +617,33 @@ type AuditContext struct {
 	At time.Time
 }
 
+// forBetting projects the provenance onto internal/betting's own declaration of
+// the same idea, for the two money-moving requests that carry one.
+//
+// TWO DECLARATIONS RATHER THAN ONE SHARED TYPE, deliberately. internal/betting
+// cannot import this package — the arrow points the other way — and CLAUDE.md
+// §12 puts an interface at its consumer, which applies to the value types that
+// cross it. Hoisting AuditContext into a third package to be shared would make
+// a change to either side's provenance a change to a package both depend on,
+// which is the coupling the read-model argument at the top of this file spends
+// three paragraphs refusing.
+//
+// At IS DROPPED, and its absence on the far side is the point: internal/betting
+// has its own injected clock and insists that one placement has ONE instant —
+// placed_at, the limit windows, the staleness horizon and the ledger's
+// occurred_at are all one value read at the top of the operation. Handing it a
+// second instant from the handler would put two in a transaction whose whole
+// discipline is that there is one. [Limits.Set] takes it because that store has
+// no clock at all; this one does.
+func (ac AuditContext) forBetting() betting.AuditContext {
+	return betting.AuditContext{
+		RequestID: ac.RequestID,
+		ClientIP:  ac.ClientIP,
+		TraceID:   ac.TraceID,
+		SpanID:    ac.SpanID,
+	}
+}
+
 // Audit writes the audit log.
 //
 // Most writes go through the transaction that performs the change (see
@@ -573,3 +688,392 @@ type AuditEntry struct {
 // reading time.Now() in three places would put three different instants in one
 // response.
 type Clock func() time.Time
+
+// -----------------------------------------------------------------------------
+// Betting: the read model
+// -----------------------------------------------------------------------------
+
+// Wager is one placed ticket as the history and detail surfaces need it.
+//
+// # Why this is not domain.Wager
+//
+// [Betting] hands back domain.Wager values, because a wager that was just
+// BOOKED has necessarily passed every invariant domain.NewWager enforces — it
+// was constructed by one. A wager READ BACK out of Postgres has not, and cannot
+// be assumed to: the row may have been written by a build whose ticket pricer
+// this one no longer has (a teaser priced from a ladder that is no longer
+// configured), or by a future one, and domain.NewWager would refuse it.
+//
+// Refusing to RENDER a ticket the book has already accepted the customer's
+// money for is the wrong failure. A history page that 500s because one old row
+// no longer satisfies a constructor is worse in every way than one that shows
+// the row. So the read path carries this flat shape, with the enums parsed at
+// the boundary and nothing re-validated, and [wagerFromDomain] converts the
+// other direction for the placement response so that one wire mapper serves
+// both.
+//
+// Nothing here is mutable and nothing here is a live reference. In particular
+// [WagerLeg.Decimal] is the price AT PLACEMENT and is never re-resolved; see
+// the type's own comment.
+type Wager struct {
+	ID     domain.WagerID
+	UserID domain.UserID
+	Kind   domain.WagerKind
+	Status domain.WagerStatus
+
+	Stake domain.Money
+
+	// Decimal is the whole TICKET's accepted price, bounded by
+	// domain.MaxWagerDecimal (1e9) rather than by odds.MaxDecimalOdds (1e5): a
+	// 20-leg parlay of even-money legs is 2^20 and the market-price bound would
+	// wrongly reject it.
+	Decimal odds.Decimal
+
+	// Rounding is the rule stake x price was collapsed under, recorded so a
+	// later repricing uses the rule the ticket was written under.
+	Rounding domain.Rounding
+
+	PotentialPayout domain.Money
+	PotentialProfit domain.Money
+
+	// TeaserPoints is set exactly on a teaser; RoundRobinID exactly on a
+	// round-robin ticket. Both biconditionals are CHECK constraints in
+	// migration 00006, so a row carrying one without the other cannot exist.
+	TeaserPoints *float64
+	RoundRobinID *domain.RoundRobinID
+
+	// Returned and NetReturn are both set or both nil, and are non-nil exactly
+	// when Status is terminal. They are the only authority on what settlement
+	// paid: a partially-voided parlay returns less than PotentialPayout and a
+	// cash-out returns whatever price was taken.
+	Returned  *domain.Money
+	NetReturn *domain.Money
+
+	Legs []WagerLeg
+
+	PlacedAt time.Time
+
+	// UpdatedAt is the instant of the latest transition, from the acting
+	// service's clock — not row bookkeeping. There is no SettledAt field
+	// because it IS this value once Status is terminal, and a second copy of
+	// one instant is a second thing to keep in agreement.
+	UpdatedAt time.Time
+}
+
+// SettledAt reports the settlement instant, and whether the ticket has one.
+//
+// domain.Wager.SettledAt draws the line in the same place and the two must
+// agree; this is that method restated over the flat read model rather than a
+// second rule.
+func (w Wager) SettledAt() (time.Time, bool) {
+	if !w.Status.IsTerminal() {
+		return time.Time{}, false
+	}
+	return w.UpdatedAt, true
+}
+
+// WagerLeg is one selection on a placed ticket, holding THE PRICE AT PLACEMENT.
+//
+// BookID, Decimal, Line and PriceObservedAt are a copied domain.Price value, not
+// a reference into the price series. CLAUDE.md §4 is emphatic — "Legs hold the
+// price at placement time, never a live reference" — and migration 00006 makes
+// it structural: `legs` has no foreign key into the `prices` hypertable and a
+// trigger freezes those columns after insert. Nothing in this package may look
+// up a current price for a booked leg, and there is no field here through which
+// one could arrive.
+type WagerLeg struct {
+	ID          domain.LegID
+	EventID     domain.EventID
+	MarketID    domain.MarketID
+	MarketType  domain.MarketType
+	SelectionID domain.SelectionID
+	Role        domain.SelectionRole
+	Status      domain.LegStatus
+
+	BookID  domain.BookID
+	Decimal odds.Decimal
+
+	// Line is the line the quote was made at, from THIS SELECTION's own
+	// perspective — already inverted for an away spread. TeasedLine is the
+	// moved line a teaser leg grades at, kept BESIDE the real price rather than
+	// replacing it, because the book never traded at the teased number and a
+	// forged quote there would corrupt line history and destroy CLV.
+	Line       domain.Line
+	TeasedLine domain.Line
+
+	PriceObservedAt time.Time
+
+	// GradedAt is set exactly when Status is not pending. Per leg, because the
+	// legs of a parlay grade at different times.
+	GradedAt *time.Time
+}
+
+// GradingLine is the line this leg actually grades at.
+//
+// domain.Leg.GradingLine is the same rule; this restates it over the read model
+// so the wire mapper does not decide it.
+func (l WagerLeg) GradingLine() domain.Line {
+	if l.TeasedLine.Present() {
+		return l.TeasedLine
+	}
+	return l.Line
+}
+
+// wagerFromDomain projects a freshly-booked domain.Wager onto the read model.
+//
+// The placement path and the history path then converge on one wire mapper,
+// which is what stops a wager rendering differently depending on whether the
+// client just placed it or came back to it an hour later.
+func wagerFromDomain(w domain.Wager) Wager {
+	out := Wager{
+		ID:              w.ID(),
+		UserID:          w.UserID(),
+		Kind:            w.Kind(),
+		Status:          w.Status(),
+		Stake:           w.Stake(),
+		Decimal:         odds.Decimal(w.AcceptedDecimal()),
+		Rounding:        w.Rounding(),
+		PotentialPayout: w.PotentialPayout(),
+		PotentialProfit: w.PotentialProfit(),
+		PlacedAt:        w.PlacedAt(),
+		UpdatedAt:       w.UpdatedAt(),
+		Legs:            make([]WagerLeg, 0, w.LegCount()),
+	}
+	if points, ok := w.TeaserPoints(); ok {
+		out.TeaserPoints = &points
+	}
+	if rr, ok := w.RoundRobinID(); ok {
+		out.RoundRobinID = &rr
+	}
+	// Returned and NetReturn share one presence flag in the domain, so they are
+	// read through the same `ok` rather than tested separately — the pair is
+	// never half-set and this is what keeps that true on the way out.
+	if returned, ok := w.Returned(); ok {
+		net, _ := w.NetReturn()
+		out.Returned = &returned
+		out.NetReturn = &net
+	}
+	for _, leg := range w.Legs() {
+		out.Legs = append(out.Legs, legFromDomain(leg))
+	}
+	return out
+}
+
+func legFromDomain(l domain.Leg) WagerLeg {
+	out := WagerLeg{
+		ID:              l.ID(),
+		EventID:         l.EventID(),
+		MarketID:        l.MarketID(),
+		MarketType:      l.MarketType(),
+		SelectionID:     l.SelectionID(),
+		Role:            l.Role(),
+		Status:          l.Status(),
+		BookID:          l.Price().BookID(),
+		Decimal:         odds.Decimal(l.Price().Decimal()),
+		Line:            l.Price().Line(),
+		TeasedLine:      l.TeasedLine(),
+		PriceObservedAt: l.Price().ObservedAt(),
+	}
+	if at, ok := l.GradedAt(); ok {
+		out.GradedAt = &at
+	}
+	return out
+}
+
+// WagerKey is the total ordering wager history is sorted and cursored by.
+//
+// PlacedAt alone is NOT total: a round robin writes N tickets at one instant, so
+// a cursor naming only the instant cannot say which of them it points after. ID
+// is a primary key, so the pair is total. This is the same argument [EventKey]
+// makes about two fixtures kicking off together, and the round-robin case is why
+// it is not merely theoretical here.
+type WagerKey struct {
+	PlacedAt time.Time
+	ID       domain.WagerID
+}
+
+// WagerPageQuery asks for one keyset page of a customer's wagers, newest first.
+type WagerPageQuery struct {
+	UserID domain.UserID
+
+	// Statuses restricts the page. Empty means every status.
+	//
+	// THE FILTER IS APPLIED TO THE PAGE THE STORE SCANNED, not pushed into the
+	// statement, so a filtered page may hold fewer than Limit rows while
+	// HasMore is still true. The two statements that serve this read take no
+	// status parameter, and adding a third and fourth shape to the query file —
+	// each with its own entry in the index-plan gate — for a parameter that is
+	// usually absent buys less than it costs. A page that is occasionally short
+	// is a far smaller defect than a page that is occasionally wrong, which is
+	// what an OFFSET-based filter would give.
+	Statuses []domain.WagerStatus
+
+	After *WagerKey
+
+	// Limit is the page size. The store reads Limit+1 rows to answer HasMore
+	// without a second count query.
+	Limit int32
+}
+
+// WagerPage is one page of wagers plus whether another exists.
+//
+// HasMore is about the SCAN, not about the filtered result: it is true whenever
+// the store stopped short of exhausting the customer's history, so a client
+// follows NextCursor until it is false rather than stopping at a short page.
+type WagerPage struct {
+	Wagers  []Wager
+	HasMore bool
+
+	// Last is the ordering key of the last row SCANNED, which is what the next
+	// cursor is minted from. It is the last scanned row and not the last
+	// returned one: minting from a returned row would skip every filtered-out
+	// row between it and the scan's end.
+	Last WagerKey
+}
+
+// -----------------------------------------------------------------------------
+// Betting: the ports
+// -----------------------------------------------------------------------------
+
+// Wagers reads the authenticated customer's placed tickets.
+//
+// EVERY METHOD TAKES THE USER AND SCOPES BY IT. There is no "read any wager"
+// method here and there must not be: the identifier of a wager appears in a URL,
+// so a lookup that did not scope would need an ownership comparison at every
+// call site, and the one call site that forgot would serve another customer's
+// ticket. Scoping in the port makes forgetting unrepresentable.
+type Wagers interface {
+	// Wager returns one ticket with its legs, or [ErrNotFound].
+	//
+	// A wager that exists but belongs to somebody else returns [ErrNotFound] —
+	// the SAME error as a wager that does not exist, produced by the same
+	// branch, so nothing above can tell the two apart. That is deliberate and
+	// it is the one place this API uses 404 for an authorization outcome: a 403
+	// here would confirm the id exists, which is a wager-enumeration oracle
+	// over every customer of the book.
+	Wager(ctx context.Context, user domain.UserID, id domain.WagerID) (Wager, error)
+
+	// WagerPage returns one keyset page, newest first.
+	WagerPage(ctx context.Context, q WagerPageQuery) (WagerPage, error)
+}
+
+// Betting places wagers.
+//
+// One method, because placement is one transaction and this package has no
+// business decomposing it. Everything that decides whether a slip becomes a
+// ticket — the self-exclusion read against a locked row, the responsible-gaming
+// limit sums, the balance fold, the price re-read and the price-move
+// comparison, the round-robin expansion, the double-entry stake movement —
+// happens inside it, in that order, for reasons internal/betting's doc.go
+// argues at length. A handler that could call any of those separately could
+// call them in a different order.
+//
+// *betting.Service satisfies this without knowing this package exists.
+type Betting interface {
+	Place(ctx context.Context, req betting.PlaceRequest) (betting.Placement, error)
+
+	// Grant credits the customer's cash account with play money.
+	//
+	// It sits on THIS port rather than on a port of its own because it is the
+	// same kind of thing as a placement and shares its machinery exactly: one
+	// transaction, the users row locked first, the responsible-gaming limit
+	// sums evaluated inside it, a double-entry movement, and an identifier
+	// derived from (user, Idempotency-Key) so a replay collides with its own
+	// primary key. A separate port would suggest a separate discipline applies,
+	// and none does.
+	//
+	// It is the only path by which money ENTERS the system. Every other
+	// movement is zero-sum between accounts that already hold a balance, so
+	// without this one every balance is permanently zero.
+	Grant(ctx context.Context, req betting.GrantRequest) (betting.Grant, error)
+}
+
+// CashOutQuotes prices an early close.
+//
+// IT DOES NOT SCOPE BY USER, and that is not an oversight in the port: quoting
+// is pure pricing over a ticket, and the ticket's owner is not an input to it.
+// The handler establishes ownership FIRST, through [Wagers.Wager], and quotes
+// only a ticket that read back — so an unauthorised caller gets the 404 that
+// read produced and never reaches a pricing call at all.
+type CashOutQuotes interface {
+	CashOutQuote(ctx context.Context, id domain.WagerID) (betting.CashOutQuote, error)
+}
+
+// CashOuts EXECUTES an early close: it settles the ticket at `cashed_out`,
+// returns the value to the customer's cash account and releases the escrowed
+// stake, in one balanced transaction.
+//
+// # Why this is a separate port from [CashOutQuotes], and why it is OPTIONAL
+//
+// Taking a cash-out is a state transition on a placed ticket, and every other
+// transition — grading a leg, settling a wager, writing the payout — belongs to
+// internal/settlement. internal/betting states the reason for the split in its
+// own doc.go and it is not a layering preference: a component that could both
+// QUOTE and TAKE a cash-out could do both in one transaction at a price of its
+// own choosing, which is the shape an operator fraud takes.
+//
+// So this port exists, [API.Routes] mounts `POST /wagers/{id}/cashout` only when
+// it is non-nil, and a deployment without it serves the quote and answers the
+// spec's own 404 on the take. That is the same degradation [APIOptions.Sessions]
+// takes and it is chosen for the same reason: a route that exists and returns a
+// fabricated or unimplemented answer is worse than an absent one.
+//
+// # The audit requirement on whoever implements this
+//
+// A cash-out is a state-changing action, so CLAUDE.md §6 requires an audit
+// entry, and [TakeCashOut] carries the provenance for it. The entry MUST be
+// written inside the same transaction as the settlement, on the same pgx.Tx —
+// the arrangement internal/betting's Tx.RecordAudit and this package's
+// [Limits.Set] both use, and for the reason both of them state: a row that can
+// commit without its money movement, or a movement that can commit without its
+// row, is the gap the requirement exists to close.
+//
+// Unlike a placement or a grant, a cash-out MUTATES an existing ticket, so its
+// entry has a real before-image — the wager's status and, at minimum, the value
+// returned — and should carry one. The action is `wager.cash_out` and the
+// entity is the wager. Nothing in this repository implements this port yet, so
+// that is a contract on a future implementation and is written here rather than
+// asserted anywhere as done.
+type CashOuts interface {
+	TakeCashOut(ctx context.Context, req TakeCashOut) (domain.Wager, error)
+}
+
+// TakeCashOut is a request to close a ticket early at a quoted value.
+type TakeCashOut struct {
+	UserID  domain.UserID
+	WagerID domain.WagerID
+
+	// IdempotencyKey is the client's declaration that two submits are one
+	// request, with the same discipline placement uses: the transaction
+	// identifier is derived from it, so a replay collides with the row it
+	// already wrote instead of paying twice.
+	IdempotencyKey string
+
+	// AcceptedValue is the value the customer was SHOWN and agreed to. The
+	// implementation re-prices while holding the wager row and refuses when the
+	// number has changed — taking a cash-out at whatever the price happened to
+	// be when the request landed is the same defect as booking a bet at a moved
+	// line.
+	AcceptedValue domain.Money
+
+	Audit AuditContext
+}
+
+// TicketPricer prices a whole ticket from the legs it would be booked at.
+//
+// The slip-quote endpoint needs a ticket price and MUST NOT compute one. A
+// parlay's price is not the product of its legs in general — same-game legs
+// carry a correlation adjustment, a teaser's price is a posted ladder unrelated
+// to the underlying prices — so multiplying decimals here would be a second
+// implementation of the one number that gets frozen onto a ticket, and the two
+// would eventually disagree in the direction nobody audits.
+//
+// The composition root passes the SAME pricer to this port and to the placement
+// service, so a slip that quotes at X is placed at X or is refused for having
+// moved. Passing two different pricers would make the quote a polite fiction.
+//
+// betting.IndependentPricer satisfies this, and refuses the two shapes it
+// cannot price correctly rather than approximating them.
+type TicketPricer interface {
+	TicketDecimal(ctx context.Context, t betting.Ticket) (float64, error)
+}

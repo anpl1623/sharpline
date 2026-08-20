@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/anpl1623/sharpline/internal/auth"
+	"github.com/anpl1623/sharpline/internal/betting"
 	"github.com/anpl1623/sharpline/internal/domain"
 	"github.com/anpl1623/sharpline/internal/domain/odds"
 	"github.com/anpl1623/sharpline/internal/httpapi/middleware"
@@ -315,7 +316,13 @@ func (f *fakeLedger) Balances(context.Context, domain.UserID) ([]Balance, error)
 
 type fakeAccounts struct {
 	profiles map[domain.UserID]Profile
-	err      error
+
+	// excluded records every self-exclusion the handler asked for, in order, so
+	// a test can prove the handler forwarded the caller's own id and the request
+	// provenance rather than only that it answered 200.
+	excluded []SelfExclusion
+
+	err error
 }
 
 func (f *fakeAccounts) Profile(_ context.Context, id domain.UserID) (Profile, error) {
@@ -325,6 +332,41 @@ func (f *fakeAccounts) Profile(_ context.Context, id domain.UserID) (Profile, er
 	p, ok := f.profiles[id]
 	if !ok {
 		return Profile{}, ErrNotFound
+	}
+	return p, nil
+}
+
+// SelfExclude narrows the stored profile the way the real statement does, so a
+// test asserting on the response body is asserting on a transition rather than
+// on a canned value.
+//
+// The two behaviours that matter to the handler are both reproduced here, and
+// both are the store's contract rather than this fake's convenience:
+//
+//   - A NARROWING ONLY. An account that is already `self_excluded` or `closed`
+//     is returned as it stands, with no error — the customer has the outcome
+//     they asked for, and UpdateUserStatus matches no row. Nothing here can
+//     widen a status, so a test cannot accidentally assert that this endpoint
+//     reinstated somebody.
+//   - AN UNKNOWN USER IS ErrNotFound, which the handler maps to 404 the same way
+//     [fakeAccounts.Profile] does: the token verified but names nobody.
+func (f *fakeAccounts) SelfExclude(_ context.Context, req SelfExclusion) (Profile, error) {
+	f.excluded = append(f.excluded, req)
+	if f.err != nil {
+		return Profile{}, f.err
+	}
+	p, ok := f.profiles[req.UserID]
+	if !ok {
+		return Profile{}, ErrNotFound
+	}
+	// The guard is the STATEMENT's, spelled the same way: a source that is
+	// already self_excluded or closed matches no row. Deliberately not
+	// `CanWager()`, which is false for `suspended` too — the statement does move
+	// a suspended account, and a fake that refused to would make a test pass for
+	// a reason the database does not share.
+	if p.Status != auth.UserStatusSelfExcluded && p.Status != auth.UserStatusClosed {
+		p.Status = auth.UserStatusSelfExcluded
+		f.profiles[req.UserID] = p
 	}
 	return p, nil
 }
@@ -434,6 +476,10 @@ type deps struct {
 	limits    *fakeLimits
 	sessions  *fakeSessions
 	audit     *fakeAudit
+	betting   *fakeBetting
+	wagers    *fakeWagers
+	pricer    *fakePricer
+	cashOuts  *fakeCashOuts
 	logger    *slog.Logger
 }
 
@@ -446,7 +492,16 @@ func newDeps() *deps {
 		limits:    &fakeLimits{},
 		sessions:  &fakeSessions{},
 		audit:     &fakeAudit{},
-		logger:    discardLogger(),
+		betting:   &fakeBetting{},
+		wagers:    &fakeWagers{},
+		// The REAL pricer, not a stand-in. It is a pure function of the legs
+		// and it is what the composition root installs, so using it here means
+		// the quote tests assert the number a deployment would actually serve —
+		// and the two refusals it makes (same-game parlays, teasers) are part of
+		// the behaviour under test rather than something a fake would hide.
+		pricer:   &fakePricer{inner: betting.IndependentPricer{}},
+		cashOuts: &fakeCashOuts{},
+		logger:   discardLogger(),
 	}
 }
 
@@ -460,8 +515,19 @@ func (d *deps) api(t *testing.T) *API {
 		Limits:    d.limits,
 		Sessions:  d.sessions,
 		Audit:     d.audit,
-		Logger:    d.logger,
-		Now:       fixedClock(),
+		Betting:   d.betting,
+		Wagers:    d.wagers,
+		Pricer:    d.pricer,
+		// Both optional betting ports are wired in the full test build, because
+		// routes_test.go asserts that the mounted route table and openapi.yaml
+		// are the same set in both directions — and the spec declares both
+		// cash-out operations. A build that left either nil would fail that
+		// test for the right reason: the spec would be declaring a path with no
+		// handler behind it.
+		CashOutQuotes: d.cashOuts,
+		CashOuts:      d.cashOuts,
+		Logger:        d.logger,
+		Now:           fixedClock(),
 		// A no-op stand-in for the real Authenticate + RequireIdentity chain.
 		// The route table's shape is what this package owns; the verification
 		// itself is internal/httpapi/middleware's and is tested there.
@@ -673,4 +739,182 @@ const testAccessToken = "test-access-token"
 func bearer(r *http.Request) *http.Request {
 	r.Header.Set("Authorization", "Bearer "+testAccessToken)
 	return r
+}
+
+// -----------------------------------------------------------------------------
+// Betting
+// -----------------------------------------------------------------------------
+
+// fakeBetting stands in for internal/betting's placement service.
+//
+// It records the request and returns whatever the test set, which is the right
+// shape for THIS package's tests: every rule the real service enforces —
+// self-exclusion, limits, the balance fold, the price re-read — is tested in
+// internal/betting against its own fakes, and re-testing it here would assert
+// the same rule twice while proving nothing about the HTTP layer. What is
+// asserted here is the translation: that a slip parses into the value the
+// service expects, and that each sentinel becomes the right status.
+type fakeBetting struct {
+	placement betting.Placement
+	err       error
+
+	// grant and grantErr are the same pair for the issuance path. They are
+	// SEPARATE from placement/err so a test can fail one without disturbing the
+	// other — the two share a port but not a failure mode.
+	grant    betting.Grant
+	grantErr error
+
+	// last is the request as the handler built it, so a test can assert that a
+	// wire field reached the field it is supposed to reach.
+	last betting.PlaceRequest
+	// lastGrant is the same, for the grant path.
+	lastGrant betting.GrantRequest
+	// calls counts placements, which is how the idempotency tests prove the
+	// handler did not call twice.
+	calls int
+	// grantCalls is the same, for the grant path.
+	grantCalls int
+}
+
+func (f *fakeBetting) Place(_ context.Context, req betting.PlaceRequest) (betting.Placement, error) {
+	f.last = req
+	f.calls++
+	if f.err != nil {
+		return betting.Placement{}, f.err
+	}
+	return f.placement, nil
+}
+
+func (f *fakeBetting) Grant(_ context.Context, req betting.GrantRequest) (betting.Grant, error) {
+	f.lastGrant = req
+	f.grantCalls++
+	if f.grantErr != nil {
+		return betting.Grant{}, f.grantErr
+	}
+	return f.grant, nil
+}
+
+type fakeWagers struct {
+	wagers []Wager
+	err    error
+
+	// pageErr, when set, fails only the page read, so a test can separate a
+	// failing history from a failing detail read.
+	pageErr error
+}
+
+func (f *fakeWagers) Wager(_ context.Context, user domain.UserID, id domain.WagerID) (Wager, error) {
+	if f.err != nil {
+		return Wager{}, f.err
+	}
+	for _, w := range f.wagers {
+		if w.ID != id {
+			continue
+		}
+		// The real store compares the owner on the row it read and returns the
+		// SAME not-found a missing row produces. The fake does it the same way
+		// so a test cannot pass here and fail against Postgres.
+		if w.UserID != user {
+			return Wager{}, ErrNotFound
+		}
+		return w, nil
+	}
+	return Wager{}, ErrNotFound
+}
+
+// sortsAfterWagerCursor reports whether w falls strictly later in the page than
+// the cursor key, under the (placed_at DESC, id DESC) order the real store uses.
+//
+// It is the Go spelling of the row-value comparison in queries/betting.sql,
+// `(placed_at, id) < (@before_placed_at, @before_id)`, and it is written as a
+// named predicate rather than inline so the fake and the SQL can be read against
+// each other. The id tiebreak is load-bearing, not decorative: placed_at DESC
+// alone is not a total order, so two tickets placed in the same microsecond
+// would repeat or skip across a page boundary without it.
+func sortsAfterWagerCursor(w Wager, cursor WagerKey) bool {
+	if w.PlacedAt.Before(cursor.PlacedAt) {
+		return true
+	}
+	return w.PlacedAt.Equal(cursor.PlacedAt) && w.ID < cursor.ID
+}
+
+func (f *fakeWagers) WagerPage(_ context.Context, q WagerPageQuery) (WagerPage, error) {
+	if f.pageErr != nil {
+		return WagerPage{}, f.pageErr
+	}
+	if f.err != nil {
+		return WagerPage{}, f.err
+	}
+
+	want := map[domain.WagerStatus]struct{}{}
+	for _, status := range q.Statuses {
+		want[status] = struct{}{}
+	}
+
+	page := WagerPage{}
+	for _, w := range f.wagers {
+		if w.UserID != q.UserID {
+			continue
+		}
+		if q.After != nil && !sortsAfterWagerCursor(w, *q.After) {
+			continue
+		}
+		page.Last = WagerKey{PlacedAt: w.PlacedAt, ID: w.ID}
+		if len(want) > 0 {
+			if _, ok := want[w.Status]; !ok {
+				continue
+			}
+		}
+		if int32(len(page.Wagers)) == q.Limit {
+			page.HasMore = true
+			break
+		}
+		page.Wagers = append(page.Wagers, w)
+	}
+	return page, nil
+}
+
+// fakePricer delegates to the real IndependentPricer unless a test overrides it.
+type fakePricer struct {
+	inner   betting.TicketPricer
+	decimal *float64
+	err     error
+}
+
+func (f *fakePricer) TicketDecimal(ctx context.Context, t betting.Ticket) (float64, error) {
+	if f.err != nil {
+		return 0, f.err
+	}
+	if f.decimal != nil {
+		return *f.decimal, nil
+	}
+	return f.inner.TicketDecimal(ctx, t)
+}
+
+type fakeCashOuts struct {
+	quote    betting.CashOutQuote
+	quoteErr error
+
+	settled    domain.Wager
+	settledErr error
+	takes      int
+	lastTake   TakeCashOut
+}
+
+func (f *fakeCashOuts) CashOutQuote(_ context.Context, id domain.WagerID) (betting.CashOutQuote, error) {
+	if f.quoteErr != nil {
+		return betting.CashOutQuote{}, f.quoteErr
+	}
+	q := f.quote
+	q.WagerID = id
+	return q, nil
+}
+
+func (f *fakeCashOuts) TakeCashOut(_ context.Context, req TakeCashOut) (domain.Wager, error) {
+	f.takes++
+	f.lastTake = req
+	if f.settledErr != nil {
+		return domain.Wager{}, f.settledErr
+	}
+	return f.settled, nil
 }

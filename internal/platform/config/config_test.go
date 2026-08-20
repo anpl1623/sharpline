@@ -623,3 +623,74 @@ func TestIngestLiveIntervalIsOptionalAndValidated(t *testing.T) {
 		})
 	}
 }
+
+// TestIngestResultsKnobsAreOptionalAndValidated.
+//
+// The two results-path cadence knobs go through the same parse-and-refuse rule
+// as the live interval, and they are asserted here for a different reason. The
+// live interval's failure mode is a bill; theirs is a customer's stake sitting
+// in escrow with nothing to release it, which is invisible until somebody asks
+// why they have not been paid.
+//
+// The case that matters most is "0s". It parses, and a poller would happily take
+// it as "use the default" — because the field's zero value is exactly what an
+// UNSET variable produces — so the two would silently mean the same thing while
+// an operator believed they had set something. It is refused at the boundary.
+func TestIngestResultsKnobsAreOptionalAndValidated(t *testing.T) {
+	t.Parallel()
+
+	for _, knob := range []struct {
+		env  string
+		read func(*config.Config) time.Duration
+	}{
+		{config.EnvIngestResultsInterval, func(c *config.Config) time.Duration { return c.IngestResultsInterval }},
+		{config.EnvIngestResultsDelay, func(c *config.Config) time.Duration { return c.IngestResultsDelay }},
+	} {
+		t.Run(knob.env, func(t *testing.T) {
+			t.Parallel()
+
+			for _, tc := range []struct {
+				name    string
+				value   string
+				want    time.Duration
+				wantErr bool
+			}{
+				{name: "absent means the poller's own default", value: "", want: 0},
+				{name: "minutes parse", value: "30s", want: 30 * time.Second},
+				{name: "hours parse", value: "6h", want: 6 * time.Hour},
+				{name: "surrounding whitespace is tolerated", value: "  2m  ", want: 2 * time.Minute},
+
+				{name: "zero is refused", value: "0s", wantErr: true},
+				{name: "negative is refused", value: "-5m", wantErr: true},
+				{name: "a unitless number is refused", value: "60", wantErr: true},
+				{name: "nonsense is refused", value: "later", wantErr: true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					t.Parallel()
+
+					env := with(map[string]string{knob.env: tc.value})
+					cfg, err := config.LoadFrom(config.Ingest, config.MapLookup(env))
+
+					if tc.wantErr {
+						if err == nil {
+							t.Fatalf("%s=%q was accepted; it must fail startup", knob.env, tc.value)
+						}
+						if !errors.Is(err, config.ErrInvalid) {
+							t.Errorf("error does not wrap ErrInvalid: %v", err)
+						}
+						if !strings.Contains(err.Error(), knob.env) {
+							t.Errorf("the error does not name the variable, so an operator cannot find it: %v", err)
+						}
+						return
+					}
+					if err != nil {
+						t.Fatalf("%s=%q was rejected: %v", knob.env, tc.value, err)
+					}
+					if got := knob.read(cfg); got != tc.want {
+						t.Errorf("%s = %s, want %s", knob.env, got, tc.want)
+					}
+				})
+			}
+		})
+	}
+}

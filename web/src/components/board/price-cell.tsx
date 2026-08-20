@@ -1,7 +1,28 @@
 'use client';
 
 /**
- * ONE PRICE. The signature element of the whole product.
+ * ONE PRICE. The signature element of the whole product, and — since phase 8 —
+ * the way a selection gets onto the bet slip.
+ *
+ * # The cell is a TOGGLE, not a link
+ *
+ * It used to navigate to the event page. That was the right placeholder while
+ * there was nothing to bet with, and it is the wrong control now: clicking a
+ * price is how every book in the category adds a selection to a slip, and
+ * DESIGN.md keeps that convention deliberately ("innovating here buys nothing
+ * and costs literacy"). Nothing is lost by the change — the game cell already
+ * links to the event, on the board and in every league group — and one oddity
+ * goes away, because on the event page the price cell used to link to the page
+ * it was already on.
+ *
+ * A cell that is on the slip carries a 2px rule on its TRAILING edge, mirroring
+ * the delta rail on the leading one and spending no hue to do it (see
+ * `globals.css`). The state is also on `aria-pressed` and in the accessible
+ * name, so it is never carried by the mark alone.
+ *
+ * Only a QUOTED, OPEN price is a toggle. A suspended market and an unquoted
+ * selection are not focusable and have no action, which is what stops the slip
+ * from ever holding a leg the book is not currently offering.
  *
  * # The delta rail
  *
@@ -52,14 +73,13 @@
  * DESIGN.md asks for a 44px board tap target "carried by padding" and also for a
  * 36px row holding two stacked 15px cells. Those cannot both be true: two 44px
  * targets need 90px of row. This component takes the largest honest target
- * available — the link fills the full width of its column and the full half of
- * the row, which is about 25px tall at the 56px mobile row and about 15px at the
- * 36px desktop one — and does NOT overlap the two stacked links into each other,
- * which would make the upper cell steal the lower one's taps. The conflict is a
- * design decision, not something to paper over locally.
+ * available — the control fills the full width of its column and the full half
+ * of the row, which is about 25px tall at the 56px mobile row and about 15px at
+ * the 36px desktop one — and does NOT overlap the two stacked controls into each
+ * other, which would make the upper cell steal the lower one's taps. The
+ * conflict is a design decision, not something to paper over locally.
  */
 
-import Link from 'next/link';
 import { useEffect, useId, useRef, useState } from 'react';
 
 import type {
@@ -72,6 +92,7 @@ import { formatOdds } from '@/lib/odds/format';
 import { formatLine, formatLineNumber, marketTypeLabel } from '@/lib/odds/line';
 import { formatDurationWords } from '@/lib/time';
 import { useOddsFormat } from '@/lib/store/preferences';
+import { slipActions, useIsOnSlip } from '@/lib/store/slip';
 import { cn } from '@/lib/utils';
 import { usePriceCell } from '@/lib/ws/provider';
 import type { DeltaDirection } from '@/lib/ws/provider';
@@ -84,6 +105,12 @@ const GLYPH = 'flex w-[7px] shrink-0 items-center justify-center';
 
 export interface PriceCellProps {
   readonly eventId: string;
+  /**
+   * The event's display name, carried down so a slip leg can say what it is on
+   * without a lookup. A slip whose rows resolved their own labels would empty
+   * itself the moment the board paged away from the event.
+   */
+  readonly eventName: string;
   readonly marketId: string;
   readonly marketType: SchemaMarketType;
   readonly marketStatus: SchemaMarketStatus;
@@ -102,6 +129,7 @@ export interface PriceCellProps {
 
 export function PriceCell({
   eventId,
+  eventName,
   marketId,
   marketType,
   marketStatus,
@@ -113,6 +141,7 @@ export function PriceCell({
 }: PriceCellProps) {
   const oddsFormat = useOddsFormat();
   const descriptionId = useId();
+  const onSlip = useIsOnSlip(selectionId);
 
   const bookSlug = restPrice?.book_slug ?? null;
   const live = usePriceCell(marketId, selectionId, bookSlug);
@@ -132,7 +161,7 @@ export function PriceCell({
   const [mountedChangedAt] = useState<number | null>(() => changedAt);
   const moved = changedAt !== null && changedAt !== mountedChangedAt;
 
-  const railRef = useRef<HTMLAnchorElement | null>(null);
+  const railRef = useRef<HTMLButtonElement | null>(null);
   const lastRailAt = useRef<number | null>(changedAt);
 
   useEffect(() => {
@@ -169,6 +198,15 @@ export function PriceCell({
     marketStatus,
     hasPrice: decimal !== null,
   });
+
+  // Market, selection and price stay at the FRONT of the name — DESIGN.md's
+  // accessibility rule asks for exactly those three and a screen reader user
+  // arrowing across a row hears them first. The action is appended rather than
+  // substituted, because a toggle whose name is only "Add to bet slip" tells a
+  // listener nothing about what they are adding.
+  const actionName = onSlip
+    ? `${name}, on the bet slip. Activate to remove.`
+    : `${name}. Activate to add to the bet slip.`;
 
   // ---------------------------------------------------------------------------
   // No book has quoted this selection. An empty well is the correct answer.
@@ -228,17 +266,29 @@ export function PriceCell({
     );
   }
 
-  // The link IS the price cell. One node carries the accessible name, the focus
-  // ring, the delta rail and the geometry, because they all describe the same
-  // object: splitting them across a focusable wrapper and a styled child is how
-  // a cell ends up named but not focusable, or focusable but not named.
+  // The BUTTON is the price cell. One node carries the accessible name, the
+  // focus ring, the delta rail, the slip mark and the geometry, because they all
+  // describe the same object: splitting them across a focusable wrapper and a
+  // styled child is how a cell ends up named but not focusable, or focusable but
+  // not named.
+  //
+  // The book comes from the REST price and never from the stream. `usePriceCell`
+  // is keyed on that same `book_slug`, so the live number on screen and the
+  // `book_id` sent with the leg are the same book by construction — which is the
+  // property the API relies on when it says "best price" is a rendering decision
+  // the client already made and must not be re-derived server-side.
+  const bookId = restPrice?.book_id ?? null;
+  const bettable = bookId !== null && bookSlug !== null;
+
   return (
     <>
-      <Link
+      <button
         ref={railRef}
-        href={`/events/${eventId}`}
-        aria-label={name}
+        type="button"
+        aria-label={bettable ? actionName : name}
+        aria-pressed={onSlip}
         aria-describedby={descriptionId}
+        disabled={!bettable}
         /* The three price-cell states are marked so a caller can tell them
          * apart WITHOUT inferring it from styling. Only `quoted` is interactive:
          * a suspended market and an unquoted selection are deliberately not
@@ -249,12 +299,38 @@ export function PriceCell({
          * inference a data attribute exists to remove. */
         data-price-cell="quoted"
         data-direction={direction ?? undefined}
+        data-on-slip={onSlip}
         onFocus={() => {
           setAskedAt(Date.now());
+        }}
+        onClick={() => {
+          if (bookId === null || bookSlug === null) return;
+          // Read through `slipActions()` rather than a subscribed hook: this is
+          // a handler, so it needs the CURRENT store and not a snapshot, and
+          // subscribing to the action would re-render every cell on the board
+          // whenever the slip changed.
+          slipActions().toggle({
+            selectionId,
+            selectionName,
+            role: selectionRole,
+            marketId,
+            marketType,
+            eventId,
+            eventName,
+            bookId,
+            bookSlug,
+            // The number that is ON SCREEN at this instant, which is what the
+            // customer is agreeing to. Not `restPrice.decimal_odds` — the stream
+            // has very likely moved it since the page was assembled, and sending
+            // the assembly-time price would report a move the customer never saw.
+            seenDecimal: decimal,
+            seenLine: line,
+          });
         }}
         className={cn(
           SLOT,
           'price-cell ui-transition justify-between gap-1 hover:bg-ground-3',
+          onSlip && 'bg-ground-3',
         )}
       >
         <span aria-hidden="true" className="t-price-sm tabular whitespace-nowrap text-ink-muted">
@@ -264,7 +340,7 @@ export function PriceCell({
           {numeral}
           <DirectionGlyph direction={direction} />
         </span>
-      </Link>
+      </button>
       <span id={descriptionId} className="sr-only">
         {changeDescription({
           direction,

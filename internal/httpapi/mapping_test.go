@@ -200,3 +200,148 @@ func TestOutrightEventHasNoCompetitorFields(t *testing.T) {
 		t.Error("an event that has not started carries a score")
 	}
 }
+
+// TestWagerVocabularyMatches closes the same gap over phase 8's four enums.
+//
+// The stakes are higher here than on the catalogue's. A wager status that
+// serialised outside the spec's enum would break a generated client on exactly
+// the tickets that had just changed state — the settled ones — which is the
+// subset a customer is most likely to be looking at and the subset whose numbers
+// are money.
+func TestWagerVocabularyMatches(t *testing.T) {
+	t.Parallel()
+
+	t.Run("wager kind", func(t *testing.T) {
+		t.Parallel()
+		domainMembers := []domain.WagerKind{
+			domain.WagerKindStraight, domain.WagerKindParlay,
+			domain.WagerKindRoundRobin, domain.WagerKindTeaser,
+		}
+		specMembers := []gen.WagerKind{gen.Straight, gen.Parlay, gen.RoundRobin, gen.Teaser}
+		for _, m := range domainMembers {
+			if !gen.WagerKind(m.String()).Valid() {
+				t.Errorf("domain.WagerKind %q is not a member of the spec's enum", m)
+			}
+		}
+		if len(specMembers) != len(domainMembers) {
+			t.Errorf("the spec has %d wager kinds, the domain has %d", len(specMembers), len(domainMembers))
+		}
+		for _, m := range specMembers {
+			if _, err := domain.ParseWagerKind(string(m)); err != nil {
+				t.Errorf("spec WagerKind %q does not parse into the domain: %v", m, err)
+			}
+		}
+	})
+
+	t.Run("wager status", func(t *testing.T) {
+		t.Parallel()
+		domainMembers := []domain.WagerStatus{
+			domain.WagerStatusPlaced, domain.WagerStatusOpen, domain.WagerStatusWon,
+			domain.WagerStatusLost, domain.WagerStatusVoid, domain.WagerStatusPush,
+			domain.WagerStatusCashedOut,
+		}
+		specMembers := []gen.WagerStatus{
+			gen.WagerStatusPlaced, gen.WagerStatusOpen, gen.WagerStatusWon,
+			gen.WagerStatusLost, gen.WagerStatusVoid, gen.WagerStatusPush,
+			gen.WagerStatusCashedOut,
+		}
+		for _, m := range domainMembers {
+			if !gen.WagerStatus(m.String()).Valid() {
+				t.Errorf("domain.WagerStatus %q is not a member of the spec's enum", m)
+			}
+		}
+		if len(specMembers) != len(domainMembers) {
+			t.Errorf("the spec has %d wager statuses, the domain has %d", len(specMembers), len(domainMembers))
+		}
+		for _, m := range specMembers {
+			if _, err := domain.ParseWagerStatus(string(m)); err != nil {
+				t.Errorf("spec WagerStatus %q does not parse into the domain: %v", m, err)
+			}
+		}
+	})
+
+	t.Run("leg status", func(t *testing.T) {
+		t.Parallel()
+		domainMembers := []domain.LegStatus{
+			domain.LegStatusPending, domain.LegStatusWon, domain.LegStatusLost,
+			domain.LegStatusVoid, domain.LegStatusPush,
+		}
+		specMembers := []gen.LegStatus{
+			gen.LegStatusPending, gen.LegStatusWon, gen.LegStatusLost,
+			gen.LegStatusVoid, gen.LegStatusPush,
+		}
+		for _, m := range domainMembers {
+			if !gen.LegStatus(m.String()).Valid() {
+				t.Errorf("domain.LegStatus %q is not a member of the spec's enum", m)
+			}
+		}
+		if len(specMembers) != len(domainMembers) {
+			t.Errorf("the spec has %d leg statuses, the domain has %d", len(specMembers), len(domainMembers))
+		}
+		for _, m := range specMembers {
+			if _, err := domain.ParseLegStatus(string(m)); err != nil {
+				t.Errorf("spec LegStatus %q does not parse into the domain: %v", m, err)
+			}
+		}
+	})
+
+	// Rounding is on the wire because a payout must be reproducible from the
+	// stake and the price, and because a later repricing has to use the rule the
+	// ticket was written under. A spelling that did not parse back would make a
+	// stored ticket unreadable by its own settlement path.
+	t.Run("rounding", func(t *testing.T) {
+		t.Parallel()
+		domainMembers := []domain.Rounding{
+			domain.RoundHalfAwayFromZero, domain.RoundHalfToEven, domain.RoundTowardZero,
+		}
+		specMembers := []gen.Rounding{gen.HalfAwayFromZero, gen.HalfToEven, gen.TowardZero}
+		for _, m := range domainMembers {
+			if !gen.Rounding(m.String()).Valid() {
+				t.Errorf("domain.Rounding %q is not a member of the spec's enum", m)
+			}
+		}
+		if len(specMembers) != len(domainMembers) {
+			t.Errorf("the spec has %d rounding modes, the domain has %d", len(specMembers), len(domainMembers))
+		}
+		for _, m := range specMembers {
+			if _, err := domain.ParseRounding(string(m)); err != nil {
+				t.Errorf("spec Rounding %q does not parse into the domain: %v", m, err)
+			}
+		}
+		// The mode this API actually applies must itself be on the wire, or
+		// every wager would report a rounding the spec does not admit.
+		if !gen.Rounding(wagerRounding.String()).Valid() {
+			t.Errorf("the house rounding policy %q is not a spec member", wagerRounding)
+		}
+	})
+}
+
+// TestErrorCodeVocabularyIsClosed.
+//
+// Every code [API.failBetting] can emit must be a member of the spec's enum. A
+// code that is not would decode as an unknown string in a generated client and
+// would land in whatever branch that client wrote for "something else" — which
+// for a 403 self-exclusion is precisely the wrong branch.
+func TestErrorCodeVocabularyIsClosed(t *testing.T) {
+	t.Parallel()
+
+	emitted := []gen.ErrorCode{
+		gen.ErrorCodeSelfExcluded,
+		gen.ErrorCodeAccountNotActive,
+		gen.ErrorCodeInsufficientFunds,
+		gen.ErrorCodeLimitExceeded,
+		gen.ErrorCodePriceMoved,
+		gen.ErrorCodeMarketUnavailable,
+		gen.ErrorCodeCashOutUnavailable,
+		gen.ErrorCodeUnprocessable,
+		gen.ErrorCodeNotFound,
+		gen.ErrorCodeBadRequest,
+		gen.ErrorCodeInvalidCursor,
+		gen.ErrorCodeInternal,
+	}
+	for _, code := range emitted {
+		if !code.Valid() {
+			t.Errorf("error code %q is emitted by the betting surface but is not a spec member", code)
+		}
+	}
+}

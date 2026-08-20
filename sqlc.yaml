@@ -148,6 +148,23 @@ sql:
       # consumer, where catalogue.sql's are shared with ingest's polling
       # scheduler and must not grow the API's pagination parameters.
       - internal/platform/postgres/queries/api.sql
+      # Phase 8. Grading, settlement and cash-out: the UPDATE half of the
+      # betting domain. Separate from betting.sql because the two are governed
+      # by opposite mechanisms -- placement is INSERT work judged by DEFERRED
+      # constraint triggers at COMMIT, settlement is UPDATE work judged by
+      # IMMEDIATE row triggers per statement, and every statement in this file
+      # is `:execrows` guarded by its expected current status. That file's
+      # header has the full argument.
+      - internal/platform/postgres/queries/settlement.sql
+      # Phase 8. The RESULTS arm of ingest -- the second arrow of CLAUDE.md
+      # section 3's event flow, which draws `results` as an input to settle
+      # rather than as something carried on odds.normalized. Two statements: a
+      # work queue of contests that should have finished, and the guarded write
+      # of the outcome one came back with. Separate from catalogue.sql because
+      # that file's writes assert what an event IS on every poll across sixteen
+      # columns, and these assert what a contest FINALLY WAS, once, across four
+      # -- and must not be able to touch the other twelve.
+      - internal/platform/postgres/queries/results.sql
 
     gen:
       go:
@@ -367,6 +384,28 @@ sql:
             go_type: "github.com/anpl1623/sharpline/internal/domain.Money"
           - column: "user_limits.amount_minor"
             go_type: "github.com/anpl1623/sharpline/internal/domain.Money"
+
+          # NOT OVERRIDDEN, and it took a wrong turn to establish why:
+          # betting.sql's SumLedgerEntriesSince (phase 8, the responsible-gaming
+          # enforcement query) returns `total_minor`, which is money and comes
+          # back as a bare int64.
+          #
+          # A `column: "*.total_minor"` entry was tried here and does NOT work.
+          # sqlc matches an override against a column's TABLE identifier, and an
+          # aggregate expression has none, so no pattern -- wildcard or
+          # otherwise -- reaches it. The generated field is int64 whatever this
+          # table says.
+          #
+          # Which turns out to be the RIGHT type anyway, so the entry stays
+          # removed rather than being worked around. Every override above maps a
+          # STORED column, and each of those is already bounded by a CHECK to
+          # +/- domain.MaxSafeMoney (2^53-1). A SUM is not: a hundred thousand
+          # in-bounds entries can add up to something no Money may hold, and
+          # scanning that straight into a domain.Money would produce a silently
+          # invalid value in the one place that decides whether a customer has
+          # hit their own loss limit. internal/betting/pgstore passes it through
+          # domain.FromMinorUnits instead, which returns an error on exactly
+          # that overflow. The int64 is what forces that call to exist.
 
           # -------------------------------------------------------------------
           # Odds. DOUBLE PRECISION -> odds.Decimal, the canonical price type

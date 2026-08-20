@@ -144,6 +144,10 @@ tags:
     description: Registration, login, refresh-token rotation and logout.
   - name: account
     description: Profile, derived play-money balance, self-imposed limits, TOTP.
+  - name: betting
+    description: |
+      The bet slip, wager placement, wager history and cash-out. Every operation
+      is authenticated and acts only on the token's own user.
 
 security:
   - {}
@@ -658,6 +662,14 @@ paths:
         Email, status, when the account was created, and whether a TOTP second
         factor is enrolled and confirmed.
 
+        **`status` is what a client renders the account state from.**
+        `self_excluded` means the customer has stopped themselves through
+        `POST /account/self-exclusion`: reads keep working and the session stays
+        valid, but a placement or a top-up is refused `403 self_excluded`. A
+        client should disable those controls rather than let the user discover
+        it on submit. `suspended` and `closed` are operator states and block the
+        same actions.
+
         There is nothing else, because migration 00005 stores nothing else: no
         legal name, no address, no date of birth, no document, no country, no
         jurisdiction. Their absence is a design decision recorded in that
@@ -708,6 +720,185 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/BalanceResponse" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /account/grant:
+    post:
+      tags: [account]
+      operationId: grantPlayMoney
+      summary: Credit the authenticated user's balance with play money.
+      description: |
+        **This is the only way money enters the system, and it is play money.**
+        CLAUDE.md section 0 is explicit that this is a simulation: there is no
+        deposit, no payment processor and no custody of funds. A grant is not a
+        deposit and is not modelled as one -- it is the play-money analogue, the
+        customer topping their own chips back up, and it is spelled `grant`
+        everywhere for that reason.
+
+        Every other money movement in the system is zero-sum between accounts
+        that already hold a balance. Without this endpoint every balance is
+        permanently zero and nothing can be wagered, which is why migration 00006
+        says an empty ledger after `make up` is correct and that "money enters
+        through EntryKindGrant, written by the application".
+
+        The movement is double-entry like every other: `issuance` is debited and
+        the customer's `user_cash` is credited, the two halves sum to exactly
+        zero, and a deferred constraint trigger rejects the whole transaction at
+        COMMIT if they do not.
+
+        **The control on issuance is the customer's own limit, not an
+        authorisation.** A `grant` limit under `/account/limits` caps how much
+        may be credited per rolling period and is evaluated inside this
+        transaction against the same ledger sum the limit is defined over. A
+        per-request ceiling bounds a single call independently. A self-excluded
+        account cannot top up at all, and neither can a suspended or closed one.
+
+        **`Idempotency-Key` is REQUIRED**, and it matters more here than
+        anywhere else in the API. The ledger transaction's identifier is derived
+        from `(user, key)`, so a resubmitted grant collides with the primary key
+        it already wrote and credits nobody twice. A doubled wager is a visible
+        and refundable mistake; a doubled grant mints money into a ledger that
+        still balances afterwards, because both halves are written, so nothing
+        downstream would ever detect it.
+
+        **`201` means credited now. `200` means credited earlier**, and the body
+        reports what the ORIGINAL request credited -- not what this one asked
+        for. Presenting a used key with a different amount returns the original
+        movement unchanged, exactly as a replayed placement returns the original
+        ticket.
+
+        Audited: writes `ledger.grant` to the audit log against the ledger
+        transaction, with the amount in minor units, inside the same transaction
+        as the movement -- so the record of who minted the money commits with
+        the money. This is the path where that matters most: a grant is the only
+        operation in the system that CREATES value, and a doubled or
+        unattributed one leaves a ledger that still balances, so the trail is
+        the only place the anomaly would ever surface. A replay writes no entry,
+        because it writes no money.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GrantRequest" }
+      responses:
+        "200":
+          description: |
+            An idempotent replay. This key had already issued this grant; nothing
+            was written by this request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GrantResponse" }
+        "201":
+          description: Credited. The balance has risen by `amount_minor`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GrantResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: |
+            `self_excluded` -- a self-excluded customer may not top up. Reported
+            distinctly from the other blocked statuses for the same reason it is
+            on placement: it is the status the customer chose, and it earns a
+            different response in kind.
+
+            `account_not_active` -- suspended or closed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: |
+            `invalid_grant_amount` -- not a positive amount within the
+            per-request ceiling.
+
+            `limit_exceeded` -- a self-imposed `grant` limit would be breached,
+            with `invalid_params` naming the limit's kind and period.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /account/self-exclusion:
+    post:
+      tags: [account]
+      operationId: selfExclude
+      summary: Stop yourself wagering, permanently.
+      description: |
+        The strongest of the responsible-gaming controls in CLAUDE.md section 6,
+        and the only one that is not reversible. `POST /account/limits` caps how
+        much may be staked, lost or granted in a period; this ends wagering
+        outright.
+
+        **It cannot be undone through this API, and that is structural rather
+        than a matter of policy.** The statement behind it can move an account
+        to `self_excluded` or `closed` and to no other status, and it refuses a
+        source that is already one of those. So no request to this endpoint,
+        no bug in a caller and no operator using the public API can reinstate a
+        self-excluded account. Reinstatement is an operator action with a
+        different actor, a different authorisation and a different audit action,
+        and it belongs to the admin console -- which does not exist yet. A
+        customer who takes this step and changes their mind cannot be served by
+        this service today. That is stated plainly rather than softened, because
+        a control described as reversible is not this control.
+
+        **`confirm` must be the literal string `self_exclude`.** An action this
+        final must not be reachable by an empty body or a mis-wired button.
+
+        **It binds immediately for wagering.** The placement path reads
+        `users.status` inside the placement transaction, against a row it has
+        locked, so the next slip is refused `403 self_excluded` -- and so is the
+        next top-up. Two backstops sit behind that read: this package maps the
+        service's sentinel onto the response, and a BEFORE INSERT trigger on
+        `wagers` (migration 00008) refuses the row for any writer that reached
+        the table another way.
+
+        **One request can still slip through, and it is bounded.** A placement
+        that has already taken the lock on the customer's row completes; this
+        request waits behind it and applies afterwards. The window is one
+        in-flight transaction, it exists because the lock is what serialises the
+        two, and it cannot admit a bet submitted after this call returns.
+
+        **The access token stays valid.** Self-exclusion is not a logout and
+        does not invalidate refresh-token families: locking a customer out of
+        their own wager history and balance is not a protection, it is an
+        obstacle to the person the control is for. `GET /account` reports the
+        new `status` so a client can render the state, and the read surface
+        keeps working.
+
+        **Idempotent.** A customer who is already self-excluded gets `200` and
+        their profile, not an error -- they have the outcome they asked for --
+        and no second audit entry is written, because nothing changed.
+
+        Audited: writes `user.self_exclude` to the audit log, with the before
+        and after status, in the same transaction as the change.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SelfExclusionRequest" }
+      responses:
+        "200":
+          description: |
+            The account is self-excluded. The body is the profile as it now
+            stands; `status` is `self_excluded`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422":
+          description: |
+            `unprocessable` -- `confirm` was absent or was not `self_exclude`.
+            Nothing was changed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "429": { $ref: "#/components/responses/TooManyRequests" }
         "500": { $ref: "#/components/responses/InternalError" }
 
@@ -866,6 +1057,508 @@ paths:
         "429": { $ref: "#/components/responses/TooManyRequests" }
         "500": { $ref: "#/components/responses/InternalError" }
 
+  # ---------------------------------------------------------------------------
+  # Betting -- the slip, placement, history and cash-out
+  #
+  # FOUR RULES GOVERN EVERY OPERATION BELOW, AND THEY ARE WHY THE SHAPES LOOK
+  # THE WAY THEY DO.
+  #
+  # 1. A LEG'S PRICE IS THE PRICE AT PLACEMENT AND IS NEVER RE-RESOLVED.
+  #    CLAUDE.md section 4: "Legs hold the price *at placement time*, never a
+  #    live reference." Migration 00006 makes that structural -- `legs` copies
+  #    the book, the decimal, the line and the observed instant as VALUES, has
+  #    no foreign key into the `prices` hypertable, and a trigger freezes every
+  #    one of those columns after insert. So `decimal_odds` on a wager leg is a
+  #    historical fact about what the customer took, not a quote. It does not
+  #    move when the market does, and nothing on a placed wager will ever tell
+  #    you the current line. Ask `/markets/{marketId}/prices` for that.
+  #
+  # 2. THE CUSTOMER NEVER SUPPLIES A PRICE, ONLY THE PRICE THEY SAW.
+  #    Every leg submitted below carries `seen_decimal` and `seen_line` -- what
+  #    was on screen. Those two numbers are the LEFT-HAND SIDE OF A COMPARISON
+  #    and nothing else. The price that is booked is the one the service re-reads
+  #    inside the placement transaction, so "the customer sent us the odds they
+  #    wanted" is not a defect that can be introduced here; there is no request
+  #    field that becomes a booked price.
+  #
+  #    When the two disagree the placement is REFUSED with `409 price_moved`
+  #    carrying both numbers, and the client resubmits with `accepted_decimal`
+  #    (and `accepted_line`) naming the new quote. A LINE MOVE IS NEVER WAVED
+  #    THROUGH: "-3.5 at 1.91" and "-4 at 1.95" are different bets, so "better"
+  #    is undefined across one and `accept_better_price` does not cover it.
+  #
+  # 3. MONEY IS `*_minor` INTEGERS, HERE AS EVERYWHERE. Stakes, payouts,
+  #    profits, cash-out values and the cash-out margin's cash equivalent are
+  #    all integer minor units. No endpoint below accepts or emits a
+  #    major-unit number, a float amount or a string amount.
+  #
+  # 4. THE ROUNDING MODE IS NOT A REQUEST FIELD. `stake x price` is collapsed
+  #    to whole minor units under a rule, and money.go is blunt that "a silent
+  #    default is how a house edge appears in a ledger that nobody meant to put
+  #    one in". The rule is therefore house policy, applied server-side and
+  #    REPORTED on every quote and every wager as `rounding` -- never chosen by
+  #    the caller, because a caller who could pick the rounding mode could pick
+  #    the one that rounds their way.
+  # ---------------------------------------------------------------------------
+
+  /slip/quote:
+    post:
+      tags: [betting]
+      operationId: quoteSlip
+      summary: Price a bet slip without placing it.
+      description: |
+        What the frontend calls every time the slip changes. It validates the
+        slip against the same rules placement will apply, re-reads the current
+        quote on every leg, reports what moved, and returns the ticket price,
+        the potential payout and the potential profit.
+
+        **Nothing is written and no money moves.** No wager row, no leg, no
+        ledger entry, no idempotency key, no audit entry. Every number in the
+        response is read or computed; a client may call this as often as the
+        user edits the slip.
+
+        **A moved price is reported here, not refused.** `POST /wagers` answers
+        `409` when a leg has moved and the move was not accepted; this endpoint
+        answers `200` with `price_moved: true` and both numbers on the leg,
+        because a quote whose whole job is to describe the current state should
+        not fail when the state is interesting. The client renders the change
+        and the user decides.
+
+        **`placeable` is ADVISORY and `POST /wagers` is authoritative.** The
+        impediments reported here are read outside a transaction and can be
+        stale by the time the user presses Place. They exist so the button can
+        be disabled with a reason rather than failing on submit. The placement
+        service re-evaluates every one of them inside the placement transaction,
+        under a lock on the customer's own row, and that is the only evaluation
+        that decides anything.
+
+        **One check is deliberately NOT attempted here: responsible-gaming
+        limits.** Evaluating one is a period-scoped sum over `ledger_entries`
+        taken under the placement lock, and computing it a second time on a read
+        path would put two answers to a responsible-gaming control in the tree.
+        The one that matters is the one the transaction uses, so a slip that
+        would breach a self-imposed limit quotes as `placeable: true` here and
+        is refused `422 limit_exceeded` on submit. That is the safe direction to
+        be wrong in: the control still binds, and only the button's disabled
+        state is optimistic.
+
+        For a round robin, `stake_minor` is the stake on EACH generated ticket
+        and `total_stake_minor` is that times `ticket_count` -- which is how
+        books quote it and how customers think about it: a $5 round robin by 2s
+        on four selections risks $30, not $5.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/OddsFormatQuery"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SlipQuoteRequest" }
+      responses:
+        "200":
+          description: The priced slip. Check `placeable` and `price_moved` before enabling Place.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SlipQuote" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: A leg names a selection that does not exist.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: |
+            `market_unavailable` -- a market is suspended, closed or settled,
+            its event is no longer accepting wagers, or no book is quoting a leg
+            at all. The slip cannot be priced, so there is no quote to return
+            and no partial one worth returning.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: |
+            The slip cannot be a ticket under any prices: two legs on one
+            selection, a straight with more than one leg, a multi with fewer
+            than two, teaser points on a non-teaser, a round-robin size larger
+            than the selection count.
+
+            Also the two shapes this book REFUSES TO PRICE rather than misprice:
+            a same-game parlay, whose legs are correlated and which pricing as
+            independent would overprice in the customer's favour, and a teaser,
+            whose price is a posted ladder this deployment does not have.
+            Refusing is the right failure: a wrong ticket price is frozen into
+            an immutable row and is then wrong forever, in the direction nobody
+            audits.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /wagers:
+    get:
+      tags: [betting]
+      operationId: listWagers
+      summary: The authenticated user's wager history.
+      description: |
+        Newest first, keyset-paginated on `(placed_at, id)`. `placed_at` alone
+        is not a total order -- a round robin writes N tickets at one instant --
+        so the identifier is part of the key and a cursor is unambiguous.
+
+        Filterable by status. **The filter is applied to the page the server
+        scanned, so a filtered page may hold fewer than `limit` rows while
+        `has_more` is still true.** Follow `next_cursor` until `has_more` is
+        false rather than stopping at a short page. The alternative -- a
+        dedicated statement per filter shape -- would multiply the query file
+        and its index-plan gate for a parameter that is usually absent, and a
+        page that is occasionally short is a far smaller cost than a page that
+        is occasionally wrong.
+
+        Every wager here belongs to the token's own user. There is no user
+        parameter on this endpoint and none on `/wagers/{wagerId}` either.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WagerStatusFilter"
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/OddsFormatQuery"
+      responses:
+        "200":
+          description: One page of wagers, newest first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WagerPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    post:
+      tags: [betting]
+      operationId: placeWager
+      summary: Place the slip.
+      description: |
+        Books the ticket and moves the stake from the customer's cash account
+        into escrow, in ONE transaction with the wager and its legs. The
+        double-entry rule holds without exception: the two halves of
+        the stake movement sum to zero and a deferred constraint trigger rejects
+        the whole transaction at COMMIT if they do not (CLAUDE.md section 4).
+
+        **`Idempotency-Key` is REQUIRED.** The wager identifier is derived
+        deterministically from `(user, idempotency_key)` -- and, for a round
+        robin, additionally from the combination index -- so a replayed submit
+        attempts to INSERT the primary key it already inserted and is refused by
+        the database rather than by a lookup that could race. The service reads
+        the existing wager back and answers `200` with it.
+
+        That is why Redis can be, as CLAUDE.md section 3 requires, "never the
+        source of truth" while placement is still exactly-once: Redis holds a
+        short-TTL key that short-circuits the common replay before a transaction
+        opens, and when Redis is down the placement proceeds and the answer is
+        identical, because the derived primary key was doing the work all along.
+
+        **`201` means booked now. `200` means booked earlier.** Both carry the
+        same body. A client that retried after a timeout and cannot tell whether
+        its first attempt landed learns the truth from the status line.
+
+        **The key identifies the SUBMIT, not the slip.** The identifier is
+        derived from the key and the user and from nothing in the body, so
+        presenting a used key with a DIFFERENT slip returns the ORIGINAL wager
+        unchanged -- it does not book the new one and does not error. That is
+        the whole point of a derived identifier, and it is why a fresh key per
+        intended action matters: a reused key is not a second bet.
+
+        **Refusals, and which is which.** `403 self_excluded` for a
+        self-excluded account -- read inside the placement transaction against a
+        locked row, mapped here, and backstopped by a database trigger
+        (migration 00008) so no writer at all can book a bet for an excluded
+        customer. `403 account_not_active` for suspended or closed. `422
+        insufficient_funds` when the balance will not cover the stake. `422
+        limit_exceeded` when a self-imposed limit would be breached, with
+        `invalid_params` naming the limit's kind and period. `409 price_moved`
+        when a leg or the ticket price moved and the move was not accepted, with
+        both numbers in `price_moves`. `409 market_unavailable` when a market
+        suspended, an event stopped taking bets, a quote went stale or a book
+        stopped quoting between the slip and the submit.
+
+        Audited: writes `wager.place` to the audit log, ONE ENTRY PER BOOKED
+        TICKET, inside the placement transaction. A round robin books N tickets
+        and writes N entries -- three tickets is three state changes, each with
+        its own id, and "what happened to ticket AC" has to stay answerable.
+        Each entry carries the ticket's kind, stake, leg count, accepted price
+        and potential payout in minor units, together with the request id, the
+        client address and the trace ids.
+
+        The entry commits with the wager and the stake movement or none of the
+        three does. That is the only version of the requirement worth having: an
+        audit row that can commit without its wager, or a wager that can commit
+        without its audit row, is the gap the trail exists to close, and a
+        best-effort write after the response would leave it one crash away from
+        wrong. `POST /account/limits` works the same way for the same reason.
+
+        **A replay writes no entry.** `200` means this request changed nothing,
+        and an entry claiming it placed the wager would double-count the
+        placement for anyone summing the trail.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PlaceWagerRequest" }
+      responses:
+        "200":
+          description: |
+            An idempotent replay. This `Idempotency-Key` had already placed for
+            this user; the body is the wager as it stands NOW, which may since
+            have been graded or settled. Nothing was written by this request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Placement" }
+        "201":
+          description: Booked. The stake has moved from cash into escrow.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Placement" }
+        "400":
+          description: |
+            The body could not be understood, or the `Idempotency-Key` header is
+            missing, empty or longer than 255 bytes. A malformed key is `400`
+            and not `422` because the fault is in the request's framing rather
+            than in what it asks for.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: |
+            `self_excluded` -- reported distinctly from the other blocked
+            statuses because it is the one the customer chose, and it earns a
+            different response in kind: a suspended account is told to contact
+            support, a self-excluded one is told how their exclusion is managed.
+            Collapsing the two would make the responsible-gaming path read as a
+            punishment.
+
+            `account_not_active` -- suspended or closed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: A leg names a selection that does not exist.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: |
+            `price_moved` -- a leg, or the whole ticket, is no longer offered at
+            the number the customer saw. `price_moves` carries the seen and the
+            current value for each, so the client shows exactly what changed and
+            resubmits with `accepted_decimal` / `accepted_ticket_decimal` if the
+            user takes it.
+
+            `market_unavailable` -- a market suspended, closed or settled, the
+            event stopped accepting wagers, the current quote is too old to bet
+            against, or no book is quoting the selection.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: |
+            `insufficient_funds` -- the cash balance, folded from the ledger
+            under the placement lock, will not cover the total stake.
+
+            `limit_exceeded` -- a self-imposed limit would be breached.
+            `invalid_params` names the limit's kind and period.
+
+            `unprocessable` -- the slip cannot be a ticket under any prices, or
+            it is a shape this book refuses to price (a same-game parlay, a
+            teaser).
+
+            All three are `422` rather than `403`: the account is in good
+            standing and the request is well-formed, and the same slip at a
+            smaller stake, or tomorrow, is accepted. `403` is reserved for a
+            standing condition on the account itself.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /wagers/{wagerId}:
+    get:
+      tags: [betting]
+      operationId: getWager
+      summary: One wager with its legs.
+      description: |
+        **Somebody else's wager is `404`, not `403`.** The ownership comparison
+        happens in the adapter, on the row as it is read, and a mismatch becomes
+        the same not-found the missing row produces -- so there is no branch
+        anywhere above it that could tell the two apart.
+
+        This is the one place this API answers `404` for something that exists,
+        and the general rule it appears to break is stated in
+        `components/responses/NotFound`: 404 is never used to signal an
+        authorization failure. That rule's REASON was that this API had no
+        per-user catalogue and therefore nothing whose existence a 404 could
+        usefully conceal. Wagers are exactly such a catalogue, and here
+        concealment is the point: a `403` on another customer's wager id would
+        confirm the id exists, which is a wager-enumeration oracle over every
+        customer of the book.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WagerID"
+        - $ref: "#/components/parameters/OddsFormatQuery"
+      responses:
+        "200":
+          description: The wager and its legs.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Wager" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /wagers/{wagerId}/cashout:
+    get:
+      tags: [betting]
+      operationId: getCashOutQuote
+      summary: What the book will pay to close this wager now.
+      description: |
+        **The price is built from the FAIR value and then an explicitly named
+        haircut is subtracted, so the book's take is a number you can read.**
+
+            fair_value  = round(potential_payout x survival_probability)
+            value       = round(fair_value x (1 - margin_bps / 10000))
+            margin      = fair_value - value
+
+        `survival_probability` is the product of the devigged fair probabilities
+        of the legs still pending -- devigged against the sharp reference book
+        per ADR 0006 -- times the graded multiplier of the legs already decided.
+        `potential_payout` is what the book owes if the ticket wins, frozen at
+        placement. Their product is what the position is worth to hold, and
+        `margin_bps` is what the book charges to take it off the customer's
+        hands.
+
+        Quoting off the OFFERED price instead would take the same money and hide
+        it inside the vig, entangled with the market's own margin, where "what
+        did the book charge me to close early" would have no answer at all --
+        the two margins are not separable from the outside. A named constant can
+        be reviewed, alerted on and argued about. The take is identical either
+        way; only its auditability changes.
+
+        **When there is no quote there is no number.** `409` rather than a zero
+        or a null, with a fixed message naming which condition applies: the
+        wager is already terminal, a leg is void or pushed (which reprices the
+        ticket, and repricing is settlement's job -- quoting off a payout known
+        to be wrong is exactly the "plausible number of the right magnitude"
+        failure), a pending leg's reference price is missing or older than the
+        freshness window, or the computed value is not positive.
+
+        **A quote is a snapshot at `quoted_at`, not an offer held open.** There
+        is deliberately no expiry field: an expiry would imply the book is
+        standing behind the number until then, and it is not. Whatever takes the
+        cash-out re-prices while holding the wager row, exactly as placement
+        re-reads a leg's price rather than trusting the one on the slip.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WagerID"
+      responses:
+        "200":
+          description: The current cash-out quote.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CashOutQuote" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: |
+            `cash_out_unavailable`. The `message` names which condition applies.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    post:
+      tags: [betting]
+      operationId: takeCashOut
+      summary: Take the cash-out.
+      description: |
+        Settles the wager at `cashed_out`, returns the value to the customer's
+        cash account and releases the escrowed stake, in one balanced
+        transaction with the wager update.
+
+        **`accepted_value_minor` must be the value the customer was shown.** The
+        service re-prices while holding the wager row and refuses with `409
+        price_moved` if the number has changed, carrying the new one. Taking a
+        cash-out at whatever the price happened to be when the request landed is
+        the same defect as booking a bet at a moved line, and it is refused the
+        same way.
+
+        **`Idempotency-Key` is REQUIRED, with the same discipline as
+        placement.** A replay answers `200` with the wager as it already stands
+        rather than paying twice. There is no `201`: a cash-out creates no new
+        resource, it drives an existing one to a terminal state.
+
+        **Not yet audited, and unlike `POST /wagers` this one is still open.**
+        CLAUDE.md section 6 requires an audit-log entry on every state-changing
+        action; placement and `POST /account/grant` now write theirs inside
+        their own transactions, and this operation would write `wager.cash_out`
+        inside the settlement transaction on the same terms. No implementation
+        of that port exists in this repository yet -- see the deployment note
+        below -- so the requirement is recorded on the port rather than claimed
+        here. Stated rather than omitted, because a reader comparing this
+        against the two operations that ARE audited would otherwise assume
+        parity.
+
+        **Deployment note.** Executing a cash-out is a state transition on a
+        placed ticket, and every other one of those belongs to `settle` --
+        deliberately, because a component that could both quote and take a
+        cash-out could do both in one transaction at a price of its own
+        choosing. This operation is therefore mounted only when that port is
+        wired; a deployment without it answers the spec's own `404` here and
+        serves `GET` on the same path normally. `api` logs which shape it built
+        at startup.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/WagerID"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CashOutRequest" }
+      responses:
+        "200":
+          description: |
+            The wager, now `cashed_out`, with `returned_minor` set to the value
+            paid. Also the answer to an idempotent replay, in which case nothing
+            was written by this request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Wager" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: The account is suspended, closed or self-excluded.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: |
+            `price_moved` -- the value changed since the quote; `price_moves`
+            carries the new one.
+
+            `cash_out_unavailable` -- no quote is available; the `message` names
+            which condition applies.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
 components:
 
   securitySchemes:
@@ -966,6 +1659,58 @@ components:
       in: path
       required: true
       schema: { $ref: "#/components/schemas/EntityID" }
+
+    WagerID:
+      name: wagerId
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/EntityID" }
+
+    WagerStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: |
+        Restrict the page to these statuses. Repeatable, and the filter is a
+        union -- `?status=placed&status=open` is "everything still running".
+        Omitted means every status.
+
+        The filter is applied to the page the server scanned, so a filtered page
+        may be shorter than `limit` while `has_more` is still true. Follow
+        `next_cursor` until `has_more` is false.
+      style: form
+      explode: true
+      schema:
+        type: array
+        maxItems: 7
+        items: { $ref: "#/components/schemas/WagerStatus" }
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        A client-chosen key that makes a retry safe. REQUIRED on every operation
+        that moves money, and refused rather than defaulted: without a key the
+        resource identifier cannot be derived, so a retried submit -- which the
+        network produces eventually whether the client meant it or not -- books a
+        second bet. An endpoint that accepted a request with no key would have an
+        at-least-once money path.
+
+        The identifier is derived deterministically from `(user, this key)`, so a
+        replayed submit collides with the primary key it already wrote and the
+        service answers with the EXISTING resource instead of creating a second
+        one. That is a property of a unique index rather than of a lookup that
+        could race, which is why a retry is safe even when the first attempt's
+        response never reached the client.
+
+        The key identifies the SUBMIT, not the body: reusing one with a different
+        slip returns the ORIGINAL resource unchanged. Use a fresh key per
+        intended action and reuse it across retries of that action.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
 
   responses:
 
@@ -1205,10 +1950,17 @@ components:
             - invalid_totp_code
             - forbidden
             - account_not_active
+            - self_excluded
             - not_found
             - conflict
             - already_exists
+            - price_moved
+            - market_unavailable
+            - cash_out_unavailable
             - unprocessable
+            - insufficient_funds
+            - limit_exceeded
+            - invalid_grant_amount
             - rate_limited
             - internal
         message:
@@ -1225,6 +1977,20 @@ components:
           type: array
           maxItems: 32
           items: { $ref: "#/components/schemas/InvalidParam" }
+        price_moves:
+          type: array
+          maxItems: 32
+          items: { $ref: "#/components/schemas/PriceMove" }
+          description: |
+            Present only on `409 price_moved`, and the same device as
+            `invalid_params`: one optional field on the ONE error shape rather
+            than a second envelope, so a client still writes one decoder.
+
+            It carries the number the customer was shown AND the number the
+            service holds now, for every leg that moved. Both have to be here.
+            Reporting only "something moved" would force the client to re-quote
+            to find out what -- racing the next move, and showing the user a
+            third number that was never the reason the request was refused.
 
     InvalidParam:
       type: object
@@ -1802,6 +2568,81 @@ components:
           description: cash + escrow. The user's total position.
         as_of: { type: string, format: date-time }
 
+    GrantRequest:
+      type: object
+      required: [amount_minor]
+      additionalProperties: false
+      description: |
+        A play-money top-up. There is no `transaction_id` field and there will
+        not be one: the identifier is derived from `(user, Idempotency-Key)`,
+        which is what makes a replay collide with its own primary key instead of
+        crediting twice.
+      properties:
+        amount_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          description: |
+            Minor units, and strictly positive. Zero is refused rather than
+            accepted as a no-op: `ledger_entries` refuses a zero amount by CHECK,
+            so a "successful" zero grant would report a transaction the database
+            would have rejected.
+
+            Bounded per request at 1000000 minor units. A customer wanting more
+            submits again under a fresh key, bounded by their own `grant` limit
+            while doing so.
+          minimum: 1
+          maximum: 1000000
+
+    SelfExclusionRequest:
+      type: object
+      required: [confirm]
+      additionalProperties: false
+      description: |
+        A customer asking the system to stop them. There is no `status` field
+        and no `until` field: this endpoint means exactly one thing, and a
+        duration would be a cooling-off period wearing self-exclusion's name.
+      properties:
+        confirm:
+          type: string
+          enum: [self_exclude]
+          description: |
+            Must be the literal string `self_exclude`. It exists so that this
+            action cannot be taken by an empty body, a stray click on a
+            mis-wired button, or a request assembled by a client that did not
+            read what the endpoint does. A boolean would be weaker: `true` is
+            what a checkbox sends by accident.
+
+    GrantResponse:
+      type: object
+      required: [transaction_id, amount_minor, balance_minor, occurred_at, replayed]
+      additionalProperties: false
+      description: |
+        The movement, and the balance it produced.
+      properties:
+        transaction_id:
+          allOf: [{ $ref: "#/components/schemas/EntityID" }]
+          description: |
+            The derived ledger transaction. Returned so a client whose request
+            timed out can look the movement up rather than guess whether it
+            landed.
+        amount_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          description: |
+            What the transaction named here credited. On a replay this is what
+            the ORIGINAL request credited, which need not be what this request
+            asked for.
+        balance_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          description: |
+            The user's cash balance after the movement, folded over
+            `ledger_entries` inside the transaction that wrote it. Derived, never
+            stored.
+        occurred_at: { type: string, format: date-time }
+        replayed:
+          type: boolean
+          description: |
+            True when this key had already issued the grant and nothing was
+            written. Not an error; the status line says the same thing.
+
     Limit:
       type: object
       required: [id, kind, period, requested_at, effective_from, in_force]
@@ -1898,3 +2739,871 @@ components:
           type: string
           pattern: '^[0-9]{6}$'
           description: Compared in constant time against the expected code for the current and adjacent time steps.
+
+    # -------------------------------------------------------------------------
+    # Betting
+    #
+    # Every money field below is `*_minor` and every one is an integer. Read the
+    # note at the top of this document on why, and note the pair that is easiest
+    # to get wrong: `potential_payout_minor` is the TOTAL RETURN with the stake
+    # included, and `potential_profit_minor` is the NET WINNINGS. domain/wager.go
+    # names them as bluntly as it does because "conflating return with profit
+    # produces a plausible number of the right magnitude" -- which is the kind of
+    # wrong number nobody catches in review.
+    # -------------------------------------------------------------------------
+
+    WagerKind:
+      type: string
+      description: |
+        Exactly `domain.WagerKind`.
+
+        A `round_robin` is not one bet. "A 3-team round robin by 2s" is three
+        independent two-leg parlays -- AB, AC, BC -- each of which wins, loses
+        and settles on its own, so placing one produces N tickets of this kind
+        sharing a parent, and `Placement.wagers` carries all of them.
+      enum: [straight, parlay, round_robin, teaser]
+
+    WagerStatus:
+      type: string
+      description: |
+        Exactly `domain.WagerStatus`. `placed` and `open` are running and hold
+        escrow; the other five are terminal, and a terminal wager never
+        transitions again.
+
+        `void` and `push` both return the stake and are not the same fact:
+        `void` is the book cancelling the bet, `push` is the bet being graded as
+        a tie.
+      enum: [placed, open, won, lost, void, push, cashed_out]
+
+    LegStatus:
+      type: string
+      description: |
+        Exactly `domain.LegStatus`. Legs grade independently and at different
+        times, because they are on different games -- so a running parlay may
+        legitimately show a mix of `won`, `lost` and `pending`.
+      enum: [pending, won, lost, void, push]
+
+    Rounding:
+      type: string
+      description: |
+        Exactly `domain.Rounding`: the rule `stake x price` was collapsed under.
+
+        It is REPORTED and never accepted. A caller who could choose the
+        rounding mode could choose the one that rounds their way, so this is
+        house policy applied server-side. It travels on every quote and every
+        wager because a later recomputation -- a partially-voided parlay
+        repriced at settlement -- must use the rule the ticket was written
+        under, and because it is what makes `potential_payout_minor`
+        reproducible from `stake_minor` and `decimal_odds`.
+      enum: [half_away_from_zero, half_to_even, toward_zero]
+
+    TicketDecimalOdds:
+      type: number
+      format: double
+      exclusiveMinimum: true
+      minimum: 1.0
+      maximum: 1000000000.0
+      description: |
+        The price of a whole TICKET -- total return per unit staked with every
+        leg winning.
+
+        The upper bound is `domain.MaxWagerDecimal` (1e9) and NOT `DecimalOdds`'
+        1e5. The difference is deliberate rather than sloppy: 1e5 bounds a single
+        quoted market price, while a 20-leg parlay of even-money legs is 2^20 =
+        1.05e6 in decimal odds -- a perfectly ordinary ticket that the
+        market-price bound would wrongly reject.
+      example: 6.42
+
+    # ---- Submitting a slip --------------------------------------------------
+
+    SlipLeg:
+      type: object
+      required: [selection_id, book_id, seen_decimal]
+      additionalProperties: false
+      description: |
+        One selection on a slip, at one book, together with the quote the
+        customer had on screen.
+
+        `seen_decimal` and `seen_line` are NOT the price that gets booked. They
+        are the left-hand side of a comparison and nothing else.
+      properties:
+        selection_id: { $ref: "#/components/schemas/EntityID" }
+        book_id:
+          allOf: [{ $ref: "#/components/schemas/EntityID" }]
+          description: |
+            Which book's line the customer took. Required, not defaulted:
+            "best price" is a rendering decision the client already made when it
+            put a number on screen, and re-deriving it server-side could book a
+            different book's line than the one that was clicked.
+        seen_decimal:
+          allOf: [{ $ref: "#/components/schemas/DecimalOdds" }]
+          description: The decimal price that was on screen. Decimal only -- American and fractional are display formats, converted at the edge and discarded.
+        seen_line:
+          type: number
+          format: double
+          nullable: true
+          description: |
+            The line that was on screen, FROM THIS SELECTION'S OWN PERSPECTIVE
+            -- already inverted for an away spread, exactly as the board
+            rendered it. `null` on a moneyline or a futures market; a present
+            `0.0` is a traded pick'em, which is a different fact from "no line".
+
+            It is compared as strictly as the price is. A line move is a
+            different bet, so it is never waved through.
+
+    PlacementLeg:
+      type: object
+      required: [selection_id, book_id, seen_decimal]
+      additionalProperties: false
+      description: |
+        `SlipLeg` plus the accept-the-move fields, which mean nothing on a quote
+        and are therefore not on `SlipLeg`.
+      properties:
+        selection_id: { $ref: "#/components/schemas/EntityID" }
+        book_id: { $ref: "#/components/schemas/EntityID" }
+        seen_decimal: { $ref: "#/components/schemas/DecimalOdds" }
+        seen_line:
+          type: number
+          format: double
+          nullable: true
+        accepted_decimal:
+          allOf: [{ $ref: "#/components/schemas/DecimalOdds" }]
+          nullable: true
+          description: |
+            The re-quoted price the customer has explicitly agreed to, set when
+            resubmitting after a `409 price_moved`.
+
+            It is a SEPARATE field from `seen_decimal` rather than an overwrite
+            of it, and that is the design: overwriting would make "the customer
+            accepted a move" indistinguishable from "the customer never saw
+            one", so a client that simply echoed back whatever the server last
+            said would silently opt every user into every future move.
+
+            It must match the CURRENT quote, not the one that prompted it. An
+            acceptance of a price that has itself since moved is refused again,
+            with the newer numbers.
+        accepted_line:
+          type: number
+          format: double
+          nullable: true
+          description: |
+            The re-quoted line agreed to, alongside `accepted_decimal`. Naming
+            the line as well as the price is what makes an acceptance meaningful
+            across a line move: "yes, book me at 1.95" is not consent to a
+            different handicap, and a book that read it as consent would be
+            moving the customer's bet.
+
+    SlipQuoteRequest:
+      type: object
+      required: [kind, stake_minor, legs]
+      additionalProperties: false
+      properties:
+        kind: { $ref: "#/components/schemas/WagerKind" }
+        stake_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          description: |
+            Strictly positive. For a round robin this is the stake on EACH
+            generated ticket, not the total -- see `total_stake_minor` in the
+            response.
+        legs:
+          type: array
+          minItems: 1
+          maxItems: 25
+          items: { $ref: "#/components/schemas/SlipLeg" }
+          description: |
+            `maxItems` is `domain.MaxWagerLegs`, which is also
+            `odds.MaxParlayLegs` -- a longer ticket could not be priced either.
+            A straight takes exactly one leg; a parlay, teaser or round robin
+            takes at least two. A round robin additionally caps at
+            `domain.MaxRoundRobinLegs` (10), because its ticket count is a
+            binomial coefficient: at 20 selections it would be a million
+            tickets, which is not a large bet, it is a denial of service against
+            the settlement path.
+        teaser_points:
+          type: number
+          format: double
+          nullable: true
+          minimum: 0
+          exclusiveMinimum: true
+          maximum: 20.0
+          description: |
+            Present exactly on a teaser and refused on every other kind. The
+            points EVERY leg's line moves by, in the leg's own favour.
+        round_robin_sizes:
+          type: array
+          nullable: true
+          maxItems: 9
+          items: { type: integer, format: int32, minimum: 2, maximum: 10 }
+          description: |
+            Present exactly on a round robin. `[2]` is "by 2s", `[2, 3]` is "by
+            2s and 3s". Each size is at least 2 and at most the leg count.
+            Sorted and de-duplicated server-side, so `[3, 2, 3]` and `[2, 3]`
+            describe the same round robin.
+        seen_ticket_decimal:
+          allOf: [{ $ref: "#/components/schemas/TicketDecimalOdds" }]
+          nullable: true
+          description: |
+            The whole-ticket price the customer was last shown, if any. Supplied
+            only so the response can report ticket-level movement; a first quote
+            omits it. Never meaningful on a round robin, whose combinations are
+            separate tickets at separate prices.
+
+    PlaceWagerRequest:
+      type: object
+      required: [kind, stake_minor, legs]
+      additionalProperties: false
+      description: |
+        The same slip as `SlipQuoteRequest`, with `PlacementLeg` in place of
+        `SlipLeg` so a leg can carry an acceptance.
+
+        There is no `wager_id` field and there will not be one. The identifier is
+        derived from `(user, Idempotency-Key)` by a stable hash, which is what
+        makes a replay collide with its own primary key instead of producing a
+        second ticket. A client-chosen id would let one client collide with
+        another's.
+
+        There is no `rounding` field either -- see the note at the top of the
+        betting paths.
+      properties:
+        kind: { $ref: "#/components/schemas/WagerKind" }
+        stake_minor: { $ref: "#/components/schemas/MoneyMinor" }
+        legs:
+          type: array
+          minItems: 1
+          maxItems: 25
+          items: { $ref: "#/components/schemas/PlacementLeg" }
+        teaser_points:
+          type: number
+          format: double
+          nullable: true
+          minimum: 0
+          exclusiveMinimum: true
+          maximum: 20.0
+        round_robin_sizes:
+          type: array
+          nullable: true
+          maxItems: 9
+          items: { type: integer, format: int32, minimum: 2, maximum: 10 }
+        seen_ticket_decimal:
+          allOf: [{ $ref: "#/components/schemas/TicketDecimalOdds" }]
+          nullable: true
+          description: |
+            The whole-ticket price the customer was shown. REQUIRED in practice
+            for a parlay and a teaser, where the ticket price is not any leg's
+            price and the customer is quoted a separate number, and where
+            omitting it would let the ticket be booked at a price nobody agreed
+            to. Optional on a straight, where the ticket price must equal the
+            single leg's anyway; supplying it there costs one comparison and
+            catches a client computing the number itself. Never sent on a round
+            robin.
+        accepted_ticket_decimal:
+          allOf: [{ $ref: "#/components/schemas/TicketDecimalOdds" }]
+          nullable: true
+          description: The re-quoted ticket price explicitly agreed to, in the same shape as a leg's `accepted_decimal`.
+        accept_better_price:
+          type: boolean
+          default: false
+          description: |
+            Opt in to booking a LONGER price at an UNCHANGED line without a
+            further round trip.
+
+            Every real book takes an improvement without asking. This one does
+            not unless asked, and the reason is narrow: "accept when the new
+            price is longer" and "accept when the new price is shorter" are one
+            comparison operator apart, and the difference between them is
+            invisible in review and invisible in every test where the line does
+            not move. So the concession is real, but it is explicit and it is on
+            the slip, where a reader can see the customer asked for it -- which
+            is also how books actually model it, as a setting rather than a
+            silent policy.
+
+            It NEVER covers a shorter price and NEVER covers a line move.
+
+    # ---- The priced slip ----------------------------------------------------
+
+    PriceMovement:
+      type: string
+      description: |
+        Named from the customer's side rather than as `up`/`down`, because "the
+        odds went up" is ambiguous in exactly the direction that matters.
+        `lengthened` pays MORE per unit staked than the customer saw;
+        `shortened` pays less.
+      enum: [unchanged, lengthened, shortened]
+
+    SlipQuoteLeg:
+      type: object
+      required:
+        [selection_id, book_id, book_slug, market_id, market_type, market_status,
+         event_id, role, seen_decimal, current_decimal, movement, tradeable,
+         observed_at]
+      additionalProperties: false
+      description: |
+        One leg of a priced slip: what the customer saw, what the market says
+        now, and whether it can still be taken.
+      properties:
+        selection_id: { $ref: "#/components/schemas/EntityID" }
+        book_id: { $ref: "#/components/schemas/EntityID" }
+        book_slug: { $ref: "#/components/schemas/Slug" }
+        market_id: { $ref: "#/components/schemas/EntityID" }
+        market_type: { $ref: "#/components/schemas/MarketType" }
+        market_status: { $ref: "#/components/schemas/MarketStatus" }
+        event_id: { $ref: "#/components/schemas/EntityID" }
+        event_status: { $ref: "#/components/schemas/EventStatus" }
+        role: { $ref: "#/components/schemas/SelectionRole" }
+        seen_decimal:
+          allOf: [{ $ref: "#/components/schemas/DecimalOdds" }]
+          description: Echoed from the request -- the number the customer saw.
+        seen_line:
+          type: number
+          format: double
+          nullable: true
+          description: Echoed from the request.
+        current_decimal:
+          allOf: [{ $ref: "#/components/schemas/DecimalOdds" }]
+          description: The newest quote from this book on this selection.
+        current_display:
+          type: string
+          nullable: true
+          description: |
+            `current_decimal` rendered in the requested `odds_format`. Null when
+            the format is `decimal`, which is canonical and always present.
+        current_line:
+          type: number
+          format: double
+          nullable: true
+          description: |
+            The line the current quote is made at, from this selection's own
+            perspective. Null on a market that carries none; `0.0` is a real
+            traded pick'em.
+        movement: { $ref: "#/components/schemas/PriceMovement" }
+        line_moved:
+          type: boolean
+          description: |
+            Reported separately from `movement` because it is a different
+            question. `movement` compares two prices; this compares two BETS. A
+            spread of -4 loses games that -3.5 wins, so a leg whose line moved
+            needs an explicit acceptance naming the new line even when the price
+            improved.
+        tradeable:
+          type: boolean
+          description: |
+            False when the market is suspended, closed or settled, when the event
+            is no longer accepting wagers, or when the newest quote is older than
+            the freshness window. One false leg makes the whole slip unplaceable.
+        observed_at:
+          type: string
+          format: date-time
+          description: The provider's instant for `current_decimal`, so the client computes staleness itself rather than trusting freshness by implication.
+
+    SlipImpediment:
+      type: object
+      required: [code, message]
+      additionalProperties: false
+      description: |
+        One reason the slip cannot be placed right now.
+
+        Deliberately NOT the `Error` envelope: this is a `200` describing a
+        priced slip, and forcing the two shapes together would make a client
+        branch on "is this an error body or a quote body" for a response that is
+        always a quote. `code` is drawn from the same token vocabulary as
+        `Error.code`, so a client's code-to-message table is one table either
+        way.
+
+        `limit_exceeded` is NOT in this enum. Evaluating a self-imposed limit is
+        a period-scoped sum over the ledger taken under the placement lock, and
+        a second evaluation on a read path would be a second answer to a
+        responsible-gaming control. `POST /wagers` is the only evaluator.
+      properties:
+        code:
+          type: string
+          enum:
+            - self_excluded
+            - account_not_active
+            - insufficient_funds
+            - market_unavailable
+            - price_moved
+        message:
+          type: string
+          maxLength: 200
+          description: A fixed human-readable string from a closed set in Go, exactly as `Error.message` is.
+        selection_id:
+          allOf: [{ $ref: "#/components/schemas/EntityID" }]
+          nullable: true
+          description: Set when the impediment belongs to one leg; null when it belongs to the whole slip.
+
+    SlipQuote:
+      type: object
+      required:
+        [kind, stake_minor, ticket_count, total_stake_minor,
+         potential_payout_minor, potential_profit_minor, rounding, legs,
+         price_moved, placeable, impediments, cash_balance_minor, as_of]
+      additionalProperties: false
+      properties:
+        kind: { $ref: "#/components/schemas/WagerKind" }
+        stake_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          description: The stake on ONE ticket, echoed from the request.
+        ticket_count:
+          type: integer
+          format: int32
+          minimum: 1
+          description: |
+            1 for a straight, parlay or teaser. For a round robin, the number of
+            combinations its sizes expand to -- the sum of C(n, k) over them.
+        total_stake_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          description: '`stake_minor` x `ticket_count`. What the customer actually risks, and what the affordability check is made against.'
+        decimal_odds:
+          allOf: [{ $ref: "#/components/schemas/TicketDecimalOdds" }]
+          nullable: true
+          description: |
+            The ticket price as it stands now. NULL for a round robin, whose
+            combinations are independent tickets at different prices: a single
+            headline number there would be an average nobody is offered.
+        seen_ticket_decimal:
+          allOf: [{ $ref: "#/components/schemas/TicketDecimalOdds" }]
+          nullable: true
+          description: Echoed from the request when it carried one.
+        ticket_movement:
+          allOf: [{ $ref: "#/components/schemas/PriceMovement" }]
+          nullable: true
+          description: '`decimal_odds` against `seen_ticket_decimal`. Null when the request carried no seen ticket price.'
+        potential_payout_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          description: |
+            TOTAL RETURN if every leg wins, STAKE INCLUDED. For a round robin,
+            summed across every combination, since all of them win when all the
+            selections do.
+        potential_profit_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          description: 'NET WINNINGS: `potential_payout_minor` - `total_stake_minor`.'
+        rounding: { $ref: "#/components/schemas/Rounding" }
+        is_same_game:
+          type: boolean
+          description: |
+            True when every leg is on one event. Worth surfacing because a
+            same-game ticket is priced with a correlation adjustment and is
+            therefore NOT the product of its leg prices -- a client that
+            multiplied the legs itself would get a different, larger number and
+            would look right. This deployment refuses to price one at all rather
+            than approximate it.
+        legs:
+          type: array
+          items: { $ref: "#/components/schemas/SlipQuoteLeg" }
+        price_moved:
+          type: boolean
+          description: True when any leg's `movement` is not `unchanged`, any leg's line moved, or the ticket price moved.
+        placeable:
+          type: boolean
+          description: |
+            ADVISORY, and false exactly when `impediments` is non-empty. The
+            balance and the market states behind it are read outside a
+            transaction and can be stale by the time the user presses Place;
+            `POST /wagers` re-evaluates all of it inside the placement
+            transaction and is the only evaluation that decides anything.
+        impediments:
+          type: array
+          maxItems: 32
+          items: { $ref: "#/components/schemas/SlipImpediment" }
+          description: Empty when `placeable` is true. Never null.
+        cash_balance_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          description: |
+            The spendable balance the affordability check was made against,
+            folded from the ledger at `as_of`. Reported so a client renders "you
+            have X" beside "this costs Y" from ONE read rather than from two
+            that can disagree.
+        as_of:
+          type: string
+          format: date-time
+
+    # ---- Placed wagers ------------------------------------------------------
+
+    WagerLeg:
+      type: object
+      required:
+        [id, event_id, market_id, market_type, selection_id, role, status,
+         book_id, book_slug, decimal_odds, price_observed_at]
+      additionalProperties: false
+      description: |
+        One selection on a placed ticket, holding THE PRICE AT PLACEMENT TIME.
+
+        `book_id`, `decimal_odds`, `line` and `price_observed_at` are a copied
+        `domain.Price` VALUE, not a reference into the price series, and the
+        database freezes every one of them after insert. They describe what the
+        customer took; they do not track the market and no request can make them.
+
+        `price_observed_at` is when the QUOTE was seen, not when the bet was
+        placed -- that is the wager's `placed_at`. Their difference is how stale
+        the price the customer took already was, which is the headline staleness
+        SLO's question asked about a settled ticket.
+      properties:
+        id: { $ref: "#/components/schemas/EntityID" }
+        event_id: { $ref: "#/components/schemas/EntityID" }
+        market_id: { $ref: "#/components/schemas/EntityID" }
+        market_type: { $ref: "#/components/schemas/MarketType" }
+        selection_id: { $ref: "#/components/schemas/EntityID" }
+        role: { $ref: "#/components/schemas/SelectionRole" }
+        status: { $ref: "#/components/schemas/LegStatus" }
+        book_id: { $ref: "#/components/schemas/EntityID" }
+        book_slug: { $ref: "#/components/schemas/Slug" }
+        decimal_odds:
+          allOf: [{ $ref: "#/components/schemas/DecimalOdds" }]
+          description: The price AT PLACEMENT. Never re-resolved, never updated.
+        display:
+          type: string
+          nullable: true
+          description: '`decimal_odds` in the requested `odds_format`. Null when the format is `decimal`.'
+        line:
+          type: number
+          format: double
+          nullable: true
+          description: |
+            The line the price was quoted at, from this selection's own
+            perspective. Null on a market with no line; `0.0` is a stored
+            pick'em.
+        teased_line:
+          type: number
+          format: double
+          nullable: true
+          description: |
+            The moved line a teaser leg actually grades at. The leg keeps the
+            REAL price it was booked against beside it rather than forging a
+            price at the moved line -- the book never traded there, and a forged
+            quote would corrupt line history and destroy CLV.
+        grading_line:
+          type: number
+          format: double
+          nullable: true
+          description: 'The line this leg grades at: `teased_line` when present, otherwise `line`.'
+        price_observed_at:
+          type: string
+          format: date-time
+        graded_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Set exactly when `status` is not `pending`. Per leg, because the legs of a parlay grade at different times.
+
+    Wager:
+      type: object
+      required:
+        [id, kind, status, stake_minor, decimal_odds, rounding,
+         potential_payout_minor, potential_profit_minor, legs, placed_at,
+         updated_at]
+      additionalProperties: false
+      description: |
+        One placed ticket.
+
+        `decimal_odds`, `rounding` and `potential_payout_minor` are FROZEN AT
+        PLACEMENT and are never recomputed. A parlay's price is not always the
+        product of its legs -- same-game legs carry a correlation adjustment, a
+        teaser's price is a posted ladder that has nothing to do with the
+        underlying prices at all -- so re-deriving it later would produce a
+        different number than the customer was shown and accepted. "To win $X"
+        is a promise, and a promise recomputed later is not one.
+      properties:
+        id: { $ref: "#/components/schemas/EntityID" }
+        kind: { $ref: "#/components/schemas/WagerKind" }
+        status: { $ref: "#/components/schemas/WagerStatus" }
+        stake_minor: { $ref: "#/components/schemas/MoneyMinor" }
+        decimal_odds:
+          allOf: [{ $ref: "#/components/schemas/TicketDecimalOdds" }]
+          description: The ticket price the customer accepted.
+        display:
+          type: string
+          nullable: true
+          description: '`decimal_odds` in the requested `odds_format`.'
+        rounding: { $ref: "#/components/schemas/Rounding" }
+        potential_payout_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          description: TOTAL RETURN if every leg wins, stake included.
+        potential_profit_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          description: 'NET WINNINGS: payout minus stake.'
+        teaser_points:
+          type: number
+          format: double
+          nullable: true
+          description: Present exactly on a teaser.
+        round_robin_id:
+          allOf: [{ $ref: "#/components/schemas/EntityID" }]
+          nullable: true
+          description: |
+            Present exactly on a round-robin ticket, naming the parent the
+            combination was expanded from. Every sibling ticket carries the same
+            value and the same `stake_minor`.
+        returned_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          nullable: true
+          description: |
+            What settlement actually paid back -- the ONLY authority on what the
+            ticket returned. A partially-voided parlay returns less than
+            `potential_payout_minor`, and a cash-out returns whatever price was
+            taken. NULL exactly while the ticket is still running.
+        net_return_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          nullable: true
+          description: '`returned_minor` - `stake_minor`. NEGATIVE on a loser. Null while running.'
+        legs:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/WagerLeg" }
+        placed_at: { type: string, format: date-time }
+        updated_at:
+          type: string
+          format: date-time
+          description: |
+            The instant of the most recent transition, from the acting service's
+            clock -- not row bookkeeping. A redelivered settlement message
+            re-applies the ORIGINAL instant rather than the wall clock.
+        settled_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            `updated_at` once `status` is terminal, and null before then. It is
+            not a separate stored field: a second copy of the same instant is a
+            second thing to keep in agreement.
+
+    RoundRobinTicketSet:
+      type: object
+      required: [id, selection_count, sizes, stake_per_combination_minor, combination_count]
+      additionalProperties: false
+      description: |
+        The parent of an expanded round robin. Its own selection set is NOT
+        reported here, because it is exactly the union of the tickets' legs and
+        a second copy could disagree with the tickets it supposedly generated --
+        and the copy, not the tickets, is the one nobody would notice was wrong.
+      properties:
+        id: { $ref: "#/components/schemas/EntityID" }
+        selection_count:
+          type: integer
+          format: int32
+          minimum: 2
+          maximum: 10
+          description: 'The `n` in C(n, k).'
+        sizes:
+          type: array
+          items: { type: integer, format: int32, minimum: 2, maximum: 10 }
+          description: Ascending and de-duplicated -- the canonical order the domain stores.
+        stake_per_combination_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          description: The stake on EACH ticket, not the total.
+        combination_count:
+          type: integer
+          format: int32
+          minimum: 1
+          description: 'Sum of C(n, k) over `sizes`. Equal to the length of `Placement.wagers`.'
+
+    Placement:
+      type: object
+      required: [wagers, total_stake_minor, potential_payout_minor, potential_profit_minor, replayed]
+      additionalProperties: false
+      description: |
+        The result of a placement. `wagers` holds one ticket for a straight,
+        parlay or teaser, and every expanded combination for a round robin --
+        which is why this is an array rather than a single wager even in the
+        overwhelmingly common one-ticket case. A shape that changed with the kind
+        would make every client write the branch this array removes.
+      properties:
+        wagers:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/Wager" }
+        round_robin:
+          allOf: [{ $ref: "#/components/schemas/RoundRobinTicketSet" }]
+          nullable: true
+          description: Present exactly when the tickets are of kind `round_robin`.
+        total_stake_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          description: Summed across every ticket. What left the cash balance and now sits in escrow.
+        potential_payout_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          description: TOTAL RETURN across every ticket if every selection wins, stake included.
+        potential_profit_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          description: '`potential_payout_minor` - `total_stake_minor`.'
+        replayed:
+          type: boolean
+          description: |
+            True when this `Idempotency-Key` had already placed and the tickets
+            were read back rather than written. It is the same fact the `200`
+            status carries, restated in the body so that a log line or a stored
+            response records it without the status code beside it. It is NOT an
+            error condition and should render exactly as a first placement.
+
+    WagerPage:
+      type: object
+      required: [data, page]
+      additionalProperties: false
+      properties:
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/Wager" }
+        page: { $ref: "#/components/schemas/PageInfo" }
+
+    # ---- Cash-out -----------------------------------------------------------
+
+    CashOutQuote:
+      type: object
+      required:
+        [wager_id, stake_minor, potential_payout_minor, survival_probability,
+         fair_value_minor, margin_bps, margin_minor, value_minor,
+         net_return_minor, pending_leg_count, quoted_at]
+      additionalProperties: false
+      description: |
+        What the book will pay to close this wager now, and what it is charging
+        to do so.
+
+            fair_value_minor = round(potential_payout_minor x survival_probability)
+            value_minor      = round(fair_value_minor x (1 - margin_bps / 10000))
+            margin_minor     = fair_value_minor - value_minor
+
+        with the rounding taken from the ticket rather than chosen fresh.
+
+        Both halves are reported because the point of pricing off the FAIR value
+        and subtracting a NAMED haircut -- rather than quoting off the offered
+        price, where the same take hides inside the vig -- is that "what did the
+        book charge me to close early" has an answer. Withholding `margin_minor`
+        would give the number back and keep none of the benefit.
+      properties:
+        wager_id: { $ref: "#/components/schemas/EntityID" }
+        stake_minor: { $ref: "#/components/schemas/MoneyMinor" }
+        potential_payout_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          description: What the book owes if the ticket wins, frozen at placement.
+        survival_probability:
+          type: number
+          format: double
+          minimum: 0
+          exclusiveMinimum: true
+          maximum: 1.0
+          description: |
+            The product of the devigged fair probabilities of the legs still
+            pending, times the graded multiplier of the legs already decided.
+            Devigged against the sharp reference book (ADR 0006), never derived
+            from the offered price.
+        fair_value_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          description: What the position is worth to hold, before the haircut. Not what is paid.
+        margin_bps:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 5000
+          description: |
+            The book's take, in basis points. 500 is 5%. A named constant in the
+            service, not a number derived from prices -- which is exactly what
+            makes it auditable, reviewable and alertable.
+        margin_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          description: '`fair_value_minor` - `value_minor`. The take, in cash.'
+        value_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          description: |
+            What the customer receives. Strictly positive -- a non-positive value
+            is not quoted at all, it is a `409`.
+        net_return_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          description: '`value_minor` - `stake_minor`. Negative when closing early crystallises a loss.'
+        pending_leg_count:
+          type: integer
+          format: int32
+          minimum: 0
+          description: How many legs are still ungraded. Zero means every leg is decided and the ticket is waiting on settlement rather than on a game.
+        quoted_at:
+          type: string
+          format: date-time
+          description: |
+            The instant the quote was computed. There is deliberately no expiry
+            beside it: an expiry would imply the book stands behind the number
+            until then, and it does not. Whatever takes the cash-out re-prices
+            while holding the wager row.
+
+    CashOutRequest:
+      type: object
+      required: [accepted_value_minor]
+      additionalProperties: false
+      properties:
+        accepted_value_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          description: |
+            The `value_minor` the customer was shown and agreed to. The service
+            re-prices while holding the wager row and refuses with `409
+            price_moved` if the number has changed. Echoing a freshly fetched
+            quote instead of the displayed one defeats the control entirely.
+
+    PriceMove:
+      type: object
+      required: [scope, movement]
+      additionalProperties: false
+      description: |
+        One number that changed between what the customer was shown and what the
+        service holds now.
+
+        `scope` says which shape the rest of the object takes, so a client
+        switches once rather than sniffing for fields:
+
+          `leg`      `selection_id`, `book_id` and the decimal/line pair
+          `ticket`   the decimal pair, describing the whole ticket's price
+          `cash_out` the `*_value_minor` pair
+
+        Carried on the `409 price_moved` envelope so the client renders the
+        change immediately. A client that had to re-quote to discover WHAT moved
+        would be racing the next move, and would show the user a third number
+        that was never the reason the request was refused.
+      properties:
+        scope:
+          type: string
+          enum: [leg, ticket, cash_out]
+        selection_id:
+          allOf: [{ $ref: "#/components/schemas/EntityID" }]
+          nullable: true
+        book_id:
+          allOf: [{ $ref: "#/components/schemas/EntityID" }]
+          nullable: true
+        seen_decimal:
+          type: number
+          format: double
+          nullable: true
+          description: The number the customer saw, echoed from the request.
+        seen_line:
+          type: number
+          format: double
+          nullable: true
+        current_decimal:
+          type: number
+          format: double
+          nullable: true
+          description: The number the service holds now, and the one to send back as `accepted_decimal` to take it.
+        current_line:
+          type: number
+          format: double
+          nullable: true
+          description: The line now, and the one to send back as `accepted_line`. A line move always needs an explicit acceptance, whatever the price did.
+        seen_value_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          nullable: true
+          description: On a cash-out, the value the customer accepted.
+        current_value_minor:
+          allOf: [{ $ref: "#/components/schemas/MoneyMinor" }]
+          nullable: true
+          description: On a cash-out, the value now, and the one to send back as `accepted_value_minor`.
+        movement: { $ref: "#/components/schemas/PriceMovement" }
+        improved:
+          type: boolean
+          description: |
+            Whether the move is in the customer's favour: a LONGER price at an
+            UNCHANGED line. It is false whenever the line moved at all, even if
+            the price lengthened, because "better" is not defined across a line
+            move -- which is precisely why this is reported separately from
+            `movement` rather than derived from it by the client.
+        accepted:
+          type: boolean
+          description: |
+            True when the leg or ticket DID carry an acceptance and the accepted
+            number is no longer current either -- the line moved twice while the
+            customer was deciding. The two cases need different interfaces: the
+            first shows a new number for the first time, the second says the
+            number just agreed to is already gone.

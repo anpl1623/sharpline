@@ -71,7 +71,8 @@ Useful targets:
 ```sh
 make up          # bring up the full stack
 make down        # stop it, keeping data
-make down-v      # stop it and wipe the named volumes — the reset button
+make down-v      # stop it and wipe all application state — the reset button
+make clean       # the above, plus every build cache (next `make up` needs the network)
 make logs        # tail everything
 make test        # run the test suite (in a container, with real dependencies)
 make build       # build all six Go binaries (in a container)
@@ -141,7 +142,8 @@ flowchart LR
     FLINK["Flink SQL<br/><i>phase 12</i>"]
     SIG[["signals.steam<br/>signals.arb<br/>signals.clv"]]
 
-    RES["results feed"]
+    RESP["results poller<br/><i>in ingest</i>"]
+    RES[("results feed<br/><i>events.status + score</i>")]
     SETTLE["<b>settle</b>"]
     WE[["wager.events<br/><i>retention</i>"]]
     LEDGER["ledger"]
@@ -153,7 +155,7 @@ flowchart LR
     NRM --> PRICER --> PC --> STREAM
     NRM --> TSW
     NRM -.-> FLINK -.-> SIG
-    RES --> SETTLE --> WE --> LEDGER --> STREAM
+    PROV --> RESP --> RES --> SETTLE --> WE --> LEDGER --> STREAM
     STREAM --> BROWSER
 ```
 
@@ -165,7 +167,7 @@ Six binaries, one parameterized Dockerfile, one Go module.
 
 | Binary | Responsibility |
 |---|---|
-| `ingest` | Provider adapters, rate limiting, payload normalization, change detection, publish deltas to the bus |
+| `ingest` | Provider adapters, rate limiting, payload normalization, change detection, publish deltas to the bus. Also hosts the results poller — the second arrow, which asks the provider for the outcome of contests that should be over and writes the terminal status and final score `settle` grades against |
 | `pricer` | Devig, no-vig fair value, EV%, Kelly sizing, arbitrage + middles detection, parlay correlation |
 | `stream` | WebSocket gateway. Subscription routing, snapshot-then-delta protocol, per-client backpressure |
 | `api` | REST + OpenAPI. Auth, catalog, bet slip, wagers, account, history |
@@ -391,6 +393,13 @@ has a real healthcheck — the stateful ones through their own CLI, the distrole
 services through the binary's own `healthcheck` self-probe — so `depends_on` gates on
 readiness rather than on process spawn. `migrate` runs to completion before `api` starts;
 all persistent state is on named volumes so `docker compose down -v` is the reset button.
+
+That reset button resets *application state only*. The volumes holding build inputs — the
+Go and tooling caches, the Terraform provider plugins, the npm cache, `node_modules` — are
+declared `external`, which puts them outside the Compose project where `down -v` cannot
+reach them. So `make down-v && make up` needs no network, while `make clean` is the total
+wipe that does. Nothing about which volume is which is left to the filename it happens to
+be declared in: the classification sits on the volume itself.
 
 **The proxy is the only container that publishes a host port.** Everything else talks over
 an internal bridge network with service-name DNS. This mirrors the Kubernetes Ingress

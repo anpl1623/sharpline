@@ -90,6 +90,8 @@ func TestSessionlessBuildDropsExactlyTheSessionRoutes(t *testing.T) {
 	partial, err := NewAPI(APIOptions{
 		Catalogue: d.catalogue, Prices: d.prices, Ledger: d.ledger,
 		Accounts: d.accounts, Limits: d.limits, Audit: d.audit,
+		Betting: d.betting, Wagers: d.wagers, Pricer: d.pricer,
+		CashOutQuotes: d.cashOuts, CashOuts: d.cashOuts,
 		Logger: d.logger, Now: fixedClock(),
 		RequireAuth: []Middleware{func(next http.Handler) http.Handler { return next }},
 	})
@@ -159,31 +161,151 @@ func TestEveryRouteIsWellFormed(t *testing.T) {
 	}
 }
 
-// TestAccountRoutesRequireAuthentication is the one that would matter if it ever
+// privatePrefixes are the route subtrees that act on the caller's own data and
+// therefore MUST carry the authentication middleware. Everything else is the
+// public catalogue and must NOT.
+//
+// It is a list rather than a single prefix because phase 8 added a second
+// private subtree: /v1/wagers and /v1/slip are the customer's own tickets and
+// the customer's own slip, and they are as private as /v1/account is. Keeping
+// them in one list rather than loosening the test is what stops the assertion
+// decaying into "some routes have middleware".
+var privatePrefixes = []string{"/account", "/wagers", "/slip"}
+
+// TestPrivateRoutesRequireAuthentication is the one that would matter if it ever
 // failed.
 //
-// Every route under /v1/account carries the authentication middleware, and every
-// route outside it does not. An account route that lost its middleware would
-// still return a body — [API.caller] answers 401 on a missing identity — but it
-// would do so AFTER the rate limiter had counted it as anonymous and after the
-// handler had been entered, and the next handler written without that reflex
-// would leak. So the property is asserted on the ROUTE TABLE, where it is
+// Every route under a private subtree carries the authentication middleware, and
+// every route outside them does not. A private route that lost its middleware
+// would still return a body — [API.caller] answers 401 on a missing identity —
+// but it would do so AFTER the rate limiter had counted it as anonymous and
+// after the handler had been entered, and the next handler written without that
+// reflex would leak. So the property is asserted on the ROUTE TABLE, where it is
 // decided.
-func TestAccountRoutesRequireAuthentication(t *testing.T) {
+func TestPrivateRoutesRequireAuthentication(t *testing.T) {
 	t.Parallel()
 
 	api := newTestAPI(t)
 	for _, r := range api.Routes() {
-		account := strings.HasPrefix(r.Path, "/"+APIVersion+"/account")
+		private := false
+		for _, prefix := range privatePrefixes {
+			if strings.HasPrefix(r.Path, "/"+APIVersion+prefix) {
+				private = true
+				break
+			}
+		}
 		switch {
-		case account && len(r.Middleware) == 0:
-			t.Errorf("%s %s is an account route with no authentication middleware", r.Method, r.Path)
-		case !account && len(r.Middleware) > 0:
+		case private && len(r.Middleware) == 0:
+			t.Errorf("%s %s acts on the caller's own data but carries no authentication middleware",
+				r.Method, r.Path)
+		case !private && len(r.Middleware) > 0:
 			// Not a security failure, but it means a public route is paying for
 			// authentication it does not use, and it is far more likely to be a
 			// copy-paste than a decision.
 			t.Errorf("%s %s is public but carries per-route middleware; was that intended?", r.Method, r.Path)
 		}
+	}
+}
+
+// TestBettingRoutesNameNoUser restates, on the route table, the property every
+// handler in this package depends on: NOTHING BELOW /v1 TAKES A USER AS A
+// PARAMETER.
+//
+// [API.caller] is the only source of the caller's identity, so "act on behalf of
+// somebody else" is not expressible rather than merely forbidden — and that is
+// why none of these handlers contains an authorization check. The one identifier
+// that does belong to somebody is {wagerId}, and the read that resolves it takes
+// the caller's id and answers 404 for a ticket that is not theirs.
+//
+// A path wildcard named for a user would silently reopen the question, so it
+// fails here.
+func TestBettingRoutesNameNoUser(t *testing.T) {
+	t.Parallel()
+
+	forbidden := []string{"{userId}", "{user}", "{accountId}", "{customerId}"}
+	api := newTestAPI(t)
+	for _, r := range api.Routes() {
+		for _, wildcard := range forbidden {
+			if strings.Contains(r.Path, wildcard) {
+				t.Errorf("%s %s names a user in its path; identity comes from the token and nowhere else",
+					r.Method, r.Path)
+			}
+		}
+	}
+}
+
+// TestCashOutRoutesFollowTheirPorts asserts the degradation is EXACT.
+//
+// The two cash-out capabilities are independently optional: pricing an early
+// close needs devigged reference prices, taking one needs the settlement write
+// path, and a deployment can plausibly have either without the other. A build
+// missing one must drop exactly that route and nothing else — a build that
+// dropped the wager history along with the cash-out would be a silent outage,
+// and one that kept the take without an executor would panic on a nil port.
+func TestCashOutRoutesFollowTheirPorts(t *testing.T) {
+	t.Parallel()
+
+	const (
+		quotePath = "GET /" + APIVersion + "/wagers/{wagerId}/cashout"
+		takePath  = "POST /" + APIVersion + "/wagers/{wagerId}/cashout"
+	)
+
+	build := func(t *testing.T, quotes CashOutQuotes, takes CashOuts) map[string]bool {
+		t.Helper()
+		d := newDeps()
+		api, err := NewAPI(APIOptions{
+			Catalogue: d.catalogue, Prices: d.prices, Ledger: d.ledger,
+			Accounts: d.accounts, Limits: d.limits, Audit: d.audit,
+			Sessions: d.sessions,
+			Betting:  d.betting, Wagers: d.wagers, Pricer: d.pricer,
+			CashOutQuotes: quotes, CashOuts: takes,
+			Logger: d.logger, Now: fixedClock(),
+			RequireAuth: []Middleware{func(next http.Handler) http.Handler { return next }},
+		})
+		if err != nil {
+			t.Fatalf("NewAPI: %v", err)
+		}
+		got := map[string]bool{}
+		for _, r := range api.Routes() {
+			got[r.Method+" "+r.Path] = true
+		}
+		return got
+	}
+
+	full := newTestAPI(t)
+	fullCount := len(full.Routes())
+	if !full.HasCashOutQuotes() || !full.HasTakeCashOut() {
+		t.Fatal("the full build reports a cash-out port unwired; every later count here would be wrong")
+	}
+
+	cases := []struct {
+		name       string
+		quotes     CashOutQuotes
+		takes      CashOuts
+		wantQuote  bool
+		wantTake   bool
+		wantRoutes int
+	}{
+		{"both wired", &fakeCashOuts{}, &fakeCashOuts{}, true, true, fullCount},
+		{"quote only", &fakeCashOuts{}, nil, true, false, fullCount - 1},
+		{"take only", nil, &fakeCashOuts{}, false, true, fullCount - 1},
+		{"neither", nil, nil, false, false, fullCount - 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := build(t, tc.quotes, tc.takes)
+			if got[quotePath] != tc.wantQuote {
+				t.Errorf("%s mounted = %v, want %v", quotePath, got[quotePath], tc.wantQuote)
+			}
+			if got[takePath] != tc.wantTake {
+				t.Errorf("%s mounted = %v, want %v", takePath, got[takePath], tc.wantTake)
+			}
+			if len(got) != tc.wantRoutes {
+				t.Errorf("route count = %d, want %d; only the cash-out routes may move",
+					len(got), tc.wantRoutes)
+			}
+		})
 	}
 }
 
