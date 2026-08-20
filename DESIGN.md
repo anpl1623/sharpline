@@ -170,8 +170,33 @@ A light theme would be a separate design decision and is currently out of scope
 |---|---|
 | Board row height | 36px |
 | Board price cell | 15px tall, 2px gap, stacked two per market |
-| Board tap target | 44px (padding carries it) |
+| Board tap target | see the note below — 44px is not achievable at a 36px row |
 | Non-board control height | 44–48px |
+
+**The board tap target does not add up, and this is the correction.** A 36px row
+holding two stacked 15px cells with a 2px gap leaves each cell a box roughly 17px
+tall — 44px cannot be "carried by padding" out of 36px of row when two targets
+share it. The 44×44 figure is WCAG 2.2 SC 2.5.5, which is **AAA**; the rest of
+this file targets AA (`ink-muted` is annotated "AA body ✓"). The AA requirement is
+SC 2.5.8 Target Size (Minimum), **24×24 CSS px**.
+
+Where that leaves the board, stated plainly rather than rounded up:
+
+| Surface | Price-cell target | SC 2.5.8 (24×24, AA) |
+|---|---|---|
+| Board, < 768px (56px row) | ~88 × 27px | **met** |
+| Board, ≥ 768px (36px row) | ~88 × 17px | **not met vertically** |
+| Every non-board control | 44–48px | met, and AAA too |
+
+Touch — the modality target size exists for — is the 56px row, and it clears the
+AA minimum. The shortfall is confined to the pointer-driven desktop board, where
+the density is the product. Closing it means a ~52px row (two 24px cells + gap +
+padding), which is a 44% taller board and a different product. **That trade is a
+design decision, not a code fix, and it is Open Decision #6.** Until it is taken,
+the board renders the largest honest target it can — the full market-column width
+by half the row height, with the two stacked links never overlapping — and this
+file does not claim a number it does not hit.
+
 
 ---
 
@@ -184,6 +209,95 @@ A light theme would be a separate design decision and is currently out of scope
 - **Board columns:** Game | Moneyline | Spread | Total, each market column holding two
   stacked price cells
 - **Bet slip:** right rail ≥1000px, bottom sheet below
+
+### The mobile board (< 768px) — resolved 2026-08-19
+
+Open Decision #4 said the mobile board was "specified but not designed" and needed its own
+pass before phase 7 mobile work. This is that pass. It resolves the two pieces phase 7
+owns; the third — the bottom-sheet bet slip — is deferred with a stated reason.
+
+**The problem.** The desktop board is `Game | Moneyline | Spread | Total`, three market
+columns each holding two stacked price cells. At 375px that is six 15px prices plus a
+game name in ~340px of usable width: ~42px per cell. Below the 44px tap target, below
+readable at the `price` step, and the delta rail — 2px of a 42px cell — stops reading as
+a rail and starts reading as a border artefact.
+
+**Resolved: the table survives, the viewport scrolls it.** At < 768px the board keeps
+its `<table>`, keeps all three market columns, and keeps every price cell at its full
+desktop size. The `Game` column becomes `position: sticky; left: 0` and the market
+columns scroll horizontally inside an `overflow-x: auto` wrapper. The row grows from
+36px to 56px so the two competitors stack instead of truncating.
+
+Rejected: **card-per-event**, the category's usual mobile answer — one card per game with
+the markets stacked vertically inside it. It is rejected on three counts, and the first is
+the one that matters:
+
+1. **It destroys the column scan.** A board is a table because the eye compares one
+   market across many games in a single vertical sweep. Stacking markets inside a card
+   turns that sweep into a paging operation. The governing idea of this system is that a
+   moving price is the loudest event in the viewport; a layout where only one game is
+   ever in the viewport has nothing to be loud *against*, and the recency gradient the
+   decay rail exists to produce cannot form at all.
+2. **It breaks the accessibility contract.** "Every price is a table cell with an
+   accessible name (market, selection, price)" is a structural promise. A card grid
+   re-implements that with ARIA and gets it subtly wrong.
+3. **It triples scroll length** for the same information.
+
+The accepted cost is real and is named: **horizontal scrolling is a worse gesture than
+vertical scrolling**, and a market column can be off-screen at rest. It is mitigated by
+the sticky game column (the row is never orphaned from its identity), by the columns
+being ordered by demand — moneyline first.
+
+**Scroll-snapping on the column boundary was specified here and has been dropped.** It does
+not compose with a sticky first column: a snap point aligns against the scrollport's start
+edge, which a `position: sticky` cell does not move, so the board loaded already scrolled
+right with the Moneyline column painted underneath the game cell. `scroll-padding` is the
+documented fix and fails too, because it takes a length while the game column's width is
+content-driven. A partial column at rest is a nicety; a hidden first column is a defect.
+The reasoning is repeated at the CSS in `globals.css` so nobody re-adds it.
+
+| Measure | ≥ 768px | < 768px |
+|---|---|---|
+| Board row height | 36px | 56px (two-line game cell) |
+| Price cell | unchanged | unchanged — this is the point |
+| Game column | static | `sticky left: 0`, 132px, `ground-1` backdrop |
+| Market columns | fit | `overflow-x: auto` (see note on snapping) |
+| Status rail | 24px mono rail, persistent | collapsed to a pip — below |
+
+**Resolved: the collapsed status pip.** The persistent 24px mono status rail is 6% of a
+812px viewport and it is the first thing to cut. At < 768px it collapses to a single 8px
+pip in the header — the ONLY full-radius object in the product, alongside avatars, exactly
+as the radius table already allows.
+
+The pip carries connection state by fill, and **never by fill alone**: it has an
+accessible name that states the same fact in words, so the colour is redundant for a
+screen reader and for a colourblind reader both.
+
+| State | Fill | Accessible name |
+|---|---|---|
+| Streaming | `money` | "Live — streaming" |
+| Resyncing | `info` | "Resyncing" |
+| Reconnecting | `info`, 1.2s pulse | "Reconnecting" |
+| Disconnected | `loss` | "Disconnected" |
+| Idle / no socket | `ink-faint` | "Not connected" |
+
+`money` on the pip is not a violation of "green means money". The pip is not a price and
+carries no quantity; it is the one place in the product where green means *this machine is
+working*, and it is the same judgement that already puts green on the place-bet CTA. It is
+listed here so it is a decision rather than a drift.
+
+Tapping the pip expands the full rail content — connection id, sequence number, channel
+count, staleness, provenance — into a 6px-radius sheet from the top. Same mono register,
+same values, same order as the desktop rail. Nothing is *lost* on mobile, only folded.
+
+**Deferred, with a reason: the bottom-sheet bet slip.** Open Decision #4 also named the
+slip. The bet slip does not exist — CLAUDE.md §11 puts wagering in phase 8 — and designing
+a container for a thing with no contents produces a spec that phase 8 will discard. The
+sheet's mechanics (6px radius, 180ms `short` enter on the `enter` curve, drag-to-dismiss,
+focus trap) are settled by the motion and radius systems already; what is undesigned is
+its *content*, and that is phase 8's to design against a real slip. Open Decision #4 is
+therefore **closed for the board and the status pip, and re-opened narrowly as Open
+Decision #5** for the slip alone.
 
 ### Border radius — hierarchical and small
 
@@ -252,7 +366,9 @@ CLAUDE.md §7 is explicit about this and it is not optional.
 - Colour is never the sole carrier of direction: an arrow glyph and the numeral itself
   both encode it.
 - `ink-faint` (3.1:1) is barred from body text. Decorative and disabled states only.
-- Every price cell is keyboard focusable with a visible focus ring on `rule-hi`.
+- Every price cell is keyboard focusable with a visible focus ring on `ink-muted`
+  (was `rule-hi`, which measures ~2.25:1 and fails WCAG 2.2 SC 1.4.11 — see the
+  Decisions Log entry of 2026-08-19).
 
 ---
 
@@ -276,8 +392,17 @@ These are safe on purpose. Innovating here buys nothing and costs literacy.
    this is the one to cut; Instrument Sans absorbs the display role at 650.
 3. **Board full-bleed vs. capped** — spec says full bleed. Validate against a real
    ultrawide before locking.
-4. **Mobile board** — the bottom-sheet slip and collapsed status pip are specified but
-   not designed. Needs its own pass before phase 7 mobile work.
+4. **Mobile board** — ~~RESOLVED 2026-08-19~~. See "The mobile board (< 768px)" under
+   Layout: sticky game column with horizontally scrolling market columns, and the status
+   rail collapsed to a pip. The slip half of this decision is re-opened as #5.
+5. **Mobile bet slip (bottom sheet)** — the sheet's mechanics are settled by the motion
+   and radius systems; its CONTENT is undesigned and cannot be designed before the slip
+   exists. Phase 8 owns it (CLAUDE.md §11).
+6. **Desktop board row height vs. WCAG 2.2 SC 2.5.8** — the 36px row misses the AA 24×24
+   target minimum vertically (see Spacing). Options: raise the row to ~52px and lose 44%
+   of the density the board exists for; keep 36px and accept a documented AA shortfall on
+   pointer devices only; or ship both behind the compact/comfortable density switch this
+   file already contemplates. Needs a decision. Mobile already meets it.
 
 ---
 
@@ -304,3 +429,6 @@ board with working delta rails — lives at:
 | 2026-08-17 | Engineering layer as a permanent 24px mono status rail, not a debug drawer | Satisfies "shows its work" without a second product. Costs 24px of permanent vertical space. |
 | 2026-08-17 | Prices set in Instrument Sans with `tabular-nums`, not mono | Same alignment, ~15% denser, and keeps the consumer read. |
 | 2026-08-17 | Dark only, no light palette | Charter §7 makes dark primary; a light theme is a separate decision nobody has asked for. |
+| 2026-08-19 | Open Decision #4 resolved for the board and the status pip; the slip half re-opened as #5 | The board and the pip are phase 7 and were blocking it. A container for a bet slip that does not exist yet would be a spec phase 8 discards. See "The mobile board (< 768px)". |
+| 2026-08-19 | **DEVIATION, approved:** focus ring moves from `rule-hi` to `ink-muted` | `rule-hi` measures ~2.25:1 on `ground-0`, ~1.86:1 on `ground-2` and ~1.4:1 against a control's own `rule` border — all below the 3:1 WCAG 2.2 SC 1.4.11 requires of a focus indicator, and near-invisible on a bordered control. This file's own Accessibility section says accessibility here "is not optional", so it contradicted itself and the accessibility half wins. `ink-muted` clears 3:1 on every ground a focused control can sit on (5.68 / 4.69 / 3.36) and is already a sanctioned foreground token, so no sixth hue enters. One token in `globals.css` reverts it. |
+| 2026-08-19 | Board tap target corrected from 44px to the real arithmetic; AA 24×24 named as the target | 44px (SC 2.5.5, AAA) is unreachable from a 36px row shared by two stacked cells, and a spec that states an impossible number is worse than one that states a shortfall. Mobile's 56px row meets AA; the desktop row does not, and that trade is Open Decision #6 rather than a silent redesign. |

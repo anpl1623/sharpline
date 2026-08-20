@@ -230,6 +230,79 @@ external dependencies, table-driven **and** property-based tests.
 Coverage target is 80% overall and effectively 100% here. Wrong odds math is the one bug
 class that destroys this project's credibility.
 
+### Frontend
+
+Next.js 16 App Router, TypeScript strict, Tailwind v4, shadcn/ui, TanStack Query for REST,
+Zustand for client state, and a purpose-built WebSocket client. It runs in a container in
+both dev and prod; nothing here is ever run with a host `npm`.
+
+The design system is [`DESIGN.md`](DESIGN.md) and it is the source of truth for every
+visual decision. Two of its choices look like bugs until you read the argument for them:
+
+- **Price deltas are cyan and amber, never green and red.** Cyan means the implied
+  probability fell (the price lengthened), amber means it rose (shortened — steam).
+  Blue↔orange is the canonical colourblind-safe axis, and it frees green to mean *money*
+  and only money anywhere in the product. Direction is carried redundantly by an arrow
+  glyph and by the numeral, so colour is never load-bearing on its own.
+- **A 2px decaying rail on each price cell's leading edge, not a cell flash.** Hard onset
+  at 0ms, a single-line digit roll at 180ms, then a 2500ms decay. The payoff is a recency
+  gradient across the whole board: a glance shows what moved in the last few seconds. A
+  300ms full-cell flash across hundreds of cells is a strobe, not information.
+
+**Where the data comes from is split deliberately.** REST is the source for the catalogue
+tree — which events exist, which markets hang off them, which selections under those — and
+the WebSocket is the source for movement. Board and event pages are React Server
+Components that fetch over the in-network service name, so the first paint is real prices
+with no spinner and no client waterfall; they hand that page to a client component which
+subscribes to the relevant channels and applies deltas in place by
+`(market_id, selection_id, book_slug)`. There is no polling anywhere: a REST poll running
+beside the socket would render the same change twice and would quietly paper over a dead
+stream, which is the one failure the status rail exists to make visible. See
+[ADR 0009](docs/adr/0009-frontend-data-plane.md).
+
+Odds format conversion happens client-side from the canonical `decimal_odds`, because the
+stream carries only decimal and both feeds must render identically. The TypeScript API
+types are generated from `internal/httpapi/openapi.yaml` — the same file the Go server
+types and `pkg/client` come from — committed, and drift-checked by `make codegen-check`.
+
+| Route | What it is |
+|---|---|
+| `/` | Landing poster, and the "simulation, not a licensed sportsbook" disclaimer |
+| `/board` | The live odds board across every league |
+| `/board/{league}` | The same board scoped to one league — the URL and the WebSocket channel are the same string |
+| `/events/{eventId}` | Event detail: full market tree, multi-book comparison, line-movement chart, and the devigged fair value in the mono engineering register |
+| `/login`, `/register` | Email + password against argon2id and rotating refresh tokens |
+
+**The engineering layer is permanent, not a debug drawer.** A 24px monospace status rail
+sits below the header on every page reporting connection state, connection id, sequence
+number, channels held, frame rate, the age of the newest frame, median odds staleness and
+the provider that produced the newest quote. Below 768px it collapses to a single pip
+whose accessible name states the connection state in words, and tapping it expands the
+full rail. Every mono glyph on screen means the machine is talking.
+
+**Accessibility is part of the contract, not a pass at the end.** Every price is a table
+cell with an accessible name that states market, selection and price ("Total, Over, 54.5,
+minus 108"). Price movement goes to a single `aria-live="polite"` region throttled to one
+batched announcement every five seconds ("14 markets moved") — never one per tick, which
+would be the worst thing this UI could do to a screen reader user. An individual change is
+exposed through `aria-describedby` on focus rather than announced. Under
+`prefers-reduced-motion` the digit roll becomes an instant swap and the rail shortens to a
+400ms linear fade, but the rail still runs, because it carries information.
+
+Frontend work goes through `make`, and every target is a container:
+
+```bash
+make web-ci         # reproducible install from the committed lockfile
+make web-typecheck  # tsc --noEmit, strict
+make web-lint       # eslint
+make web-build      # next build, standalone output
+make build-web      # the production image
+make codegen-ts     # regenerate the TypeScript API types from the OpenAPI spec
+make e2e            # Playwright, one-shot, through the proxy
+```
+
+---
+
 ---
 
 ## The prime directive

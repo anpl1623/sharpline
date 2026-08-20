@@ -206,6 +206,21 @@ services:
       - ../../web:/app
       - web-node-modules:/app/node_modules
       - npm-cache:/npm-cache
+      # The OpenAPI spec, read-only, at a FIXED path inside the container.
+      #
+      # `npm run codegen:api` generates web/src/lib/api/schema.ts from it, so the
+      # TypeScript client is derived from the same contract the Go server types are
+      # (internal/httpapi/openapi.yaml -> `make codegen-openapi`). It is mounted at
+      # /openapi.yaml rather than resolved relatively because /app is the web/
+      # directory and nothing above it is mounted — a relative `../internal/...`
+      # simply does not exist in this container, which is the correct enforcement of
+      # "the spec is an input, not a sibling file the frontend can reach around".
+      - type: bind
+        source: ../../internal/httpapi/openapi.yaml
+        target: /openapi.yaml
+        read_only: true
+        bind:
+          create_host_path: false
     networks:
       - sharpline
     command: ["npm", "install"]
