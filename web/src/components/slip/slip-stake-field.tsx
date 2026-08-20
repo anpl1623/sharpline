@@ -27,7 +27,7 @@
  * this file and must not.
  */
 
-import { useEffect, useId, useState } from 'react';
+import { useId, useState } from 'react';
 
 import { Button, Input, Label } from '@/components/ui';
 import {
@@ -86,12 +86,19 @@ export function SlipStakeField({
   // cleared slip, a restored one. The guard is what stops it from fighting the
   // caret: while typing, the store already holds what the text parses to, so
   // this is a no-op on exactly the renders where a write would be destructive.
+  //
+  // Adjusted DURING RENDER rather than in an effect, which is React's own
+  // prescription for deriving state from a changed prop
+  // (https://react.dev/learn/you-might-not-need-an-effect). An effect would
+  // paint the stale text first and correct it on a second pass, so a preset
+  // would visibly flicker through the old amount; setting state during render
+  // makes React discard this render and retry with the new value before
+  // committing anything to the DOM. The `!==` guard is what bounds the retry.
   const [lastPushed, setLastPushed] = useState(stakeMinor);
-  useEffect(() => {
-    if (stakeMinor === lastPushed) return;
+  if (stakeMinor !== lastPushed) {
     setLastPushed(stakeMinor);
     setText(formatMinorForInput(stakeMinor));
-  }, [stakeMinor, lastPushed]);
+  }
 
   const commit = (next: string): void => {
     const parsed = parseMinor(next);
