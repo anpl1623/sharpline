@@ -196,6 +196,11 @@ jobs:
             cover \
             tidy-check \
             codegen-check \
+            env \
+            web-ci \
+            web-typecheck \
+            web-lint \
+            web-build \
             vuln \
             migrate-dry-run \
             buildx-multiarch \
@@ -399,6 +404,40 @@ jobs:
       - run: make codegen-check
 
   # ---------------------------------------------------------------------------
+  # Frontend gate (CLAUDE.md section 7, phase 7)
+  #
+  # Same rule as every other job: no `setup-node`, no host npm. Each step is a
+  # `make` target that runs `docker compose run --rm npm`, so this fails on a
+  # runner exactly as it would on a laptop with nothing but Docker installed --
+  # which is the whole point of the directive job above.
+  #
+  # `web-ci` FIRST and deliberately: it is `npm ci` against the committed
+  # lockfile, not `npm install`, so CI cannot silently resolve a different
+  # dependency tree than the one in the diff. The steps after it all read the
+  # node_modules volume it populates.
+  #
+  # `web-build` is the real gate. `next build` typechecks every route, resolves
+  # next/font at build time, and is the only step that catches a server/client
+  # boundary violation -- none of which `tsc --noEmit` sees.
+  # ---------------------------------------------------------------------------
+  web:
+    name: frontend lint + typecheck + build
+    needs: [directive]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      # compose interpolates the whole file, not just the service being run, so a
+      # missing .env makes `docker compose run npm` fail on a variable that has
+      # nothing to do with the frontend. This is the same first-run affordance
+      # `make up` gets.
+      - run: make env
+      - run: make web-ci
+      - run: make web-typecheck
+      - run: make web-lint
+      - run: make web-build
+
+  # ---------------------------------------------------------------------------
   # govulncheck
   # ---------------------------------------------------------------------------
   vuln:
@@ -526,7 +565,7 @@ jobs:
   ci:
     name: ci
     if: always()
-    needs: [directive, lint, test, coverage, generated, vuln, migrate-dry-run, build, scan]
+    needs: [directive, lint, test, coverage, generated, web, vuln, migrate-dry-run, build, scan]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

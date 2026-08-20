@@ -1,0 +1,8 @@
+# Playwright writes these back through the bind mount as uid 1001. None of them
+# belong in git.
+node_modules/
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+.last-run.json

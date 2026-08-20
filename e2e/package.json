@@ -1,0 +1,14 @@
+{
+  "name": "sharpline-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Playwright critical-path E2E for the sharpline compose stack. Runs only inside deploy/docker/playwright.Dockerfile — never on a host toolchain.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "test": "playwright test",
+    "report": "playwright show-report playwright-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1"
+  }
+}

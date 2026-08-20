@@ -1,0 +1,36 @@
+{
+  "//": [
+    "Editor/LSP configuration ONLY. Playwright transpiles these .ts files itself and",
+    "does not type-check them, and nothing in the container ever runs `tsc` here.",
+    "",
+    "Deliberately CommonJS-shaped, matching the absence of `\"type\": \"module\"` in",
+    "package.json: Playwright's TypeScript loader is most reliable on the CJS path,",
+    "where extensionless relative imports (`./support/env`) resolve without an ESM",
+    "loader hook. Adding `\"type\": \"module\"` would require explicit extensions and buys",
+    "nothing here.",
+    "",
+    "No `types` array: @types/node is not installed (e2e/ has no node_modules by",
+    "design — the image resolves @playwright/test through a /node_modules symlink to",
+    "the global install), so pinning `types` would break editor resolution rather than",
+    "help it."
+  ],
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "exactOptionalPropertyTypes": true,
+    "noFallthroughCasesInSwitch": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "noEmit": true
+  },
+  "include": ["playwright.config.ts", "tests/**/*.ts", "support/**/*.ts"],
+  "exclude": ["node_modules", "test-results", "playwright-report"]
+}

@@ -1,27 +1,178 @@
 @import "tailwindcss";
 
-/*
- * PHASE 0 BASELINE ONLY — this is not the design system.
+/* ===========================================================================
+ * Sharpline design system — "Instrument Dark".
  *
- * CLAUDE.md §7 mandates that `/design-consultation` runs BEFORE any component
- * is written, and that work happens in phase 7. Everything below is the
- * minimum needed for the container to build and render legible text:
- * a dark-first ground (§7: "dark mode is the primary theme, not an
- * afterthought") and tabular numerals declared once, because every number on
- * this product's surface is a price. The phase 7 agent replaces this file
- * wholesale with the approved type scale, color system, spacing scale and
- * motion language. Do not grow it here.
- */
+ * DESIGN.md is the source of truth; this file is its executable form. Every
+ * value below is quoted from it, and the OKLCH numbers are the AUTHORED
+ * values (the hex in the comments is only the sRGB rendering, for a reader
+ * who wants to picture the colour).
+ *
+ * The governing idea, because every odd-looking constraint here serves it:
+ *   the resting state has near-zero visual energy, so that change carries
+ *   all of it.
+ * A board that is colourful at rest cannot make a moving price loud. There is
+ * no decoration in this file. No gradient, no shadow, no glow, no entrance
+ * animation. The entire motion budget is spent on one element — the delta
+ * rail, at the bottom of this file.
+ *
+ * Tailwind v4 is configured entirely in CSS. There is no tailwind.config.js
+ * and one must not be created.
+ * =========================================================================== */
 
 @theme {
-  --color-ground: oklch(0.16 0.008 260);
-  --color-ink: oklch(0.95 0.005 260);
-  --color-ink-muted: oklch(0.68 0.01 260);
-  --color-rule: oklch(0.28 0.01 260);
+  /* -----------------------------------------------------------------------
+   * Ground & ink — DESIGN.md § Color
+   *
+   * Four grounds, not two, because this product stacks surfaces: the page
+   * carries rows, rows carry price cells, price cells sit next to input
+   * wells. Each step is ~0.04 L, which is the smallest separation that still
+   * reads as a distinct plane on a calibrated panel without any border.
+   * --------------------------------------------------------------------- */
+  --color-ground-0: oklch(0.145 0.006 260);  /* #0B0D12  page                */
+  --color-ground-1: oklch(0.185 0.008 260);  /* #14171E  surface, card, row  */
+  --color-ground-2: oklch(0.225 0.009 260);  /* #1D212A  raised, price cell  */
+  --color-ground-3: oklch(0.265 0.010 260);  /* #262B35  input well          */
+  --color-rule:     oklch(0.32  0.010 260);  /* #333945  hairline            */
+  --color-rule-hi:  oklch(0.40  0.012 260);  /* #454C5A  emphasised border   */
+
+  --color-ink:       oklch(0.96 0.004 260);  /* #F2F4F8  primary   ~17:1     */
+  --color-ink-2:     oklch(0.78 0.008 260);  /* #B4BAC6  secondary ~9:1      */
+  --color-ink-muted: oklch(0.62 0.010 260);  /* #838B9A  muted     ~5.5:1 AA */
+  /* ~3.1:1. DECORATIVE AND DISABLED ONLY. Barred from body text — this is an
+   * accessibility rule in DESIGN.md, not a preference. */
+  --color-ink-faint: oklch(0.48 0.010 260);  /* #5B6270                      */
+
+  /* -----------------------------------------------------------------------
+   * Meaning — five hues in the entire product, and no hue does two jobs.
+   *
+   *   green means money · cyan and amber mean direction · red means wrong.
+   *
+   * NO PRICE IS EVER GREEN OR RED. Direction is cyan/amber, a deliberate
+   * departure from every book in the category: blue<->orange is the canonical
+   * colourblind-safe axis, both hold at low chroma on a near-black ground,
+   * amber=heat maps onto steam, and it frees green to mean money only.
+   * Direction is ALSO carried by an arrow glyph and by the numeral, so colour
+   * is redundant here and never load-bearing alone.
+   * --------------------------------------------------------------------- */
+  --color-delta-out: oklch(0.78 0.13 210);   /* #4FC3E8  implied prob FELL   */
+  --color-delta-in:  oklch(0.80 0.14 70);    /* #F0A93B  implied prob ROSE   */
+  --color-money:     oklch(0.76 0.16 155);   /* #3ECF8E  stake, payout, CTA  */
+  --color-loss:      oklch(0.65 0.19 25);    /* #F0563E  error, settled loss */
+  --color-info:      oklch(0.72 0.10 250);   /* #7B9BE8  resync, suspension  */
+
+  /* The only ink that ever sits on a saturated `money` fill — the primary CTA
+   * and the arbitrage badge. Quoted verbatim from DESIGN.md § Signals, which
+   * states it as a hex; it is not an OKLCH-authored palette entry. */
+  --color-on-money: #06251A;
+
+  /* -----------------------------------------------------------------------
+   * Border radius — hierarchical and small.
+   *
+   * Uniform bubble-radius is the primary AI-slop tell, so the default radius
+   * namespace is CLEARED and replaced with three named steps that mean
+   * something. `rounded-sm`, `rounded-md`, `rounded-lg` and friends DO NOT
+   * EXIST in this codebase. `rounded-full` and `rounded-none` survive because
+   * they are static utilities, not namespace entries — and full radius is
+   * legal on exactly two objects, the connection pip and an avatar.
+   * --------------------------------------------------------------------- */
+  --radius-*: initial;
+  --radius-price: 2px;   /* price cell, input, button — effectively square  */
+  --radius-card:  4px;   /* card, row group                                 */
+  --radius-sheet: 6px;   /* modal, sheet, popover, dropdown                 */
+
+  /* -----------------------------------------------------------------------
+   * Shadows do not exist. Elevation is carried by ground step + hairline,
+   * which is why there are four grounds. Clearing the namespace makes
+   * `shadow-lg` a no-op rather than a silent violation.
+   * --------------------------------------------------------------------- */
+  --shadow-*: initial;
+
+  /* -----------------------------------------------------------------------
+   * Type — two registers, and the register change is the whole point.
+   * The consumer surface is sans; the engineering layer is mono. Every mono
+   * glyph on screen means *the machine is talking*.
+   *
+   * PRICES ARE SANS WITH tabular-nums, NOT MONO. Mono buys column alignment;
+   * tabular-nums buys identical alignment ~15% narrower and keeps the board
+   * reading as a consumer book rather than a terminal.
+   *
+   * `--font-instrument-sans`, `--font-jetbrains-mono` and `--font-clash-grotesk`
+   * are injected on <html> by next/font (see src/lib/fonts.ts); this file owns
+   * the fallback stacks so they are stated once. Instrument Sans is loaded as a
+   * VARIABLE font because the scale asks for 550 and 650, and no static
+   * instance has either weight.
+   * --------------------------------------------------------------------- */
+  /* Each var() carries its own fallback. Without one, a missing next/font
+   * variable makes the whole font-family declaration invalid at computed-value
+   * time rather than falling through the stack — so a build that failed to
+   * fetch a face would render in the browser default instead of the intended
+   * fallback, which is a much harder failure to spot. */
+  --font-sans: var(--font-instrument-sans, ui-sans-serif), ui-sans-serif,
+    system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    sans-serif;
+  --font-mono: var(--font-jetbrains-mono, ui-monospace), ui-monospace,
+    SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --font-display: var(--font-clash-grotesk, ui-sans-serif),
+    var(--font-instrument-sans, ui-sans-serif), ui-sans-serif, system-ui,
+    sans-serif;
+
+  /* -----------------------------------------------------------------------
+   * Layout widths. The board is deliberately absent from this list: it is
+   * FULL BLEED with no max-width, because density is the point.
+   * --------------------------------------------------------------------- */
+  --container-content: 1200px;  /* max-w-content */
+  --container-prose: 68ch;      /* max-w-prose   */
+
+  /* -----------------------------------------------------------------------
+   * Easing. Declared here (not only in :root) so Tailwind generates the
+   * `ease-enter` / `ease-exit` / `ease-decay` utilities.
+   * --------------------------------------------------------------------- */
+  --ease-enter: cubic-bezier(0.16, 1, 0.3, 1);   /* expo-out, snappy        */
+  --ease-exit: ease-in;                          /* verbatim, per DESIGN.md */
+  --ease-decay: cubic-bezier(0.7, 0, 0.84, 0);   /* holds bright, drops fast*/
 }
 
+/* ---------------------------------------------------------------------------
+ * Motion durations and the focus ring live in a plain :root rather than in
+ * @theme. Tailwind has no `--duration-*` theme namespace, so @theme would buy
+ * no utility and only expose them to theme tree-shaking; declared here they
+ * are unconditionally present for any hand-written CSS in the app.
+ * ------------------------------------------------------------------------- */
 :root {
   color-scheme: dark;
+
+  /* DESIGN.md § Motion. `decay` is reserved: NOTHING but the delta rail may
+   * use 2500ms, because the recency gradient it produces across the board is
+   * only readable if no other element decays on the same clock. */
+  --duration-micro: 80ms;    /* hover, focus                                */
+  --duration-short: 180ms;   /* digit roll, sheet, popover                  */
+  --duration-medium: 240ms;  /* drawer                                      */
+  --duration-decay: 2500ms;  /* delta rail ONLY                             */
+  --duration-exit: 120ms;    /* every exit, on --ease-exit                  */
+
+  /* The focus ring is indirected through a variable so the whole product can
+   * be re-pitched from one line.
+   *
+   * APPROVED DEVIATION from DESIGN.md § Accessibility, recorded in its Decisions
+   * Log on 2026-08-19. That section says "a visible focus ring on rule-hi", and
+   * rule-hi is not visible enough to be one: against ground-0 it measures
+   * ~2.25:1, against ground-2 (the price cell's own ground) ~1.86:1, and against
+   * a control's own `rule` border ~1.4:1 — all below the 3:1 that WCAG 2.2
+   * SC 1.4.11 requires of a focus indicator, and the last of those is close to
+   * invisible on a bordered control.
+   *
+   * The same section opens by saying accessibility here "is not optional", so
+   * the file contradicts itself and the accessibility half wins. ink-muted is
+   * the smallest change that resolves it: 5.68:1 on ground-0, 4.69:1 on
+   * ground-2, 3.36:1 against a `rule` border — it clears 3:1 on every ground a
+   * focused control can sit on, and it is already a sanctioned foreground token
+   * (DESIGN.md marks it "AA body ✓"), so it introduces no sixth hue.
+   *
+   * Reverting is one token, here. */
+  --focus-ring-color: var(--color-ink-muted);
+  --focus-ring-width: 2px;
+  --focus-ring-offset: 2px;
 }
 
 @layer base {
@@ -30,10 +181,626 @@
   }
 
   body {
-    background-color: var(--color-ground);
+    background-color: var(--color-ground-0);
     color: var(--color-ink);
-    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
-      "Helvetica Neue", Arial, sans-serif;
-    font-variant-numeric: tabular-nums;
+    font-family: var(--font-sans);
+    /* Every number on this product's surface is a price or a quantity, and a
+     * price that changes width when a 1 becomes an 8 is a layout jitter on a
+     * board that ticks every few seconds. Declared once, globally. */
+    font-variant-numeric: tabular-nums lining-nums;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* A visible focus ring on every interactive thing. `:where()` keeps the
+   * specificity at zero so a component can restyle without !important, and
+   * nothing in this codebase may set `outline: none` without a replacement. */
+  :where(
+    a[href],
+    area[href],
+    button,
+    input,
+    select,
+    textarea,
+    summary,
+    iframe,
+    [tabindex]:not([tabindex="-1"]),
+    [role="button"],
+    [role="tab"],
+    [role="menuitem"],
+    [role="menuitemcheckbox"],
+    [role="menuitemradio"],
+    [role="option"],
+    [role="link"]
+  ):focus-visible {
+    outline: var(--focus-ring-width) solid var(--focus-ring-color);
+    outline-offset: var(--focus-ring-offset);
+  }
+
+  ::selection {
+    background-color: color-mix(in oklab, var(--color-info) 34%, transparent);
+    color: var(--color-ink);
+  }
+
+  /* Dark only. There is no light palette and none may be added — a light
+   * theme is a separate design decision (DESIGN.md Open Decision #1). */
+}
+
+/* ===========================================================================
+ * TYPE SCALE — DESIGN.md § Typography
+ *
+ * Declared in the components layer so any Tailwind utility (`text-ink-2`,
+ * `font-semibold`, ...) composed onto the same element still wins.
+ *
+ * These classes set TYPE ONLY — never colour. Colour is a separate decision
+ * and mixing the two here is how a scale rots.
+ *
+ * Only `.t-display` uses Clash Grotesk. A league or section head that wants
+ * the display face composes `font-display` with `.t-h2`; that keeps Clash
+ * "scoped narrowly" as DESIGN.md requires, and it keeps `.t-h1` at weight 650
+ * — a weight only the VARIABLE Instrument Sans can render, and one the two
+ * static Clash instances (500, 600) would have to fake.
+ * ========================================================================= */
+@layer components {
+  .t-display {
+    font-family: var(--font-display);
+    font-size: clamp(44px, 6vw, 76px);
+    line-height: 0.95;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+  }
+
+  .t-h1 {
+    font-family: var(--font-sans);
+    font-size: 32px;
+    line-height: 1.15;
+    font-weight: 650;
+  }
+
+  .t-h2 {
+    font-family: var(--font-sans);
+    font-size: 24px;
+    line-height: 1.25;
+    font-weight: 600;
+  }
+
+  .t-h3 {
+    font-family: var(--font-sans);
+    font-size: 18px;
+    line-height: 1.3;
+    font-weight: 600;
+  }
+
+  /* Prices. Line-height is exactly 1.00 so the cell height IS the type size:
+   * the board's 15px cell is a 15px numeral and nothing else. */
+  .t-price-lg {
+    font-family: var(--font-sans);
+    font-size: 24px;
+    line-height: 1;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums lining-nums;
+  }
+
+  .t-price {
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1;
+    font-weight: 550;
+    font-variant-numeric: tabular-nums lining-nums;
+  }
+
+  .t-price-sm {
+    font-family: var(--font-sans);
+    font-size: 13px;
+    line-height: 1;
+    font-weight: 550;
+    font-variant-numeric: tabular-nums lining-nums;
+  }
+
+  .t-body {
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1.5;
+    font-weight: 400;
+  }
+
+  .t-ui {
+    font-family: var(--font-sans);
+    font-size: 13px;
+    line-height: 1.35;
+    font-weight: 500;
+  }
+
+  .t-label {
+    font-family: var(--font-sans);
+    font-size: 11px;
+    line-height: 1.2;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  /* The engineering register: status rail, ids, provenance, sequence numbers.
+   * Never a price. */
+  .t-mono {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.4;
+    font-weight: 400;
+    font-variant-numeric: tabular-nums lining-nums;
+  }
+
+  .tabular {
+    font-variant-numeric: tabular-nums lining-nums;
+  }
+
+  /* -----------------------------------------------------------------------
+   * The 80ms hover/focus transition, as one class instead of four utilities.
+   * Colour only — layout is never transitioned anywhere in this product.
+   * --------------------------------------------------------------------- */
+  .ui-transition {
+    transition-property: color, background-color, border-color, outline-color,
+      opacity;
+    transition-duration: var(--duration-micro);
+    transition-timing-function: var(--ease-enter);
+  }
+
+  /* Enter on the way in, exit on the way out. */
+  .ui-transition:not(:hover):not(:focus-visible) {
+    transition-duration: var(--duration-exit);
+    transition-timing-function: var(--ease-exit);
+  }
+}
+
+/* ===========================================================================
+ * THE DELTA RAIL — the signature element. DESIGN.md § Motion.
+ *
+ * The category standard is a full-cell background flash for ~300ms. On a
+ * board with hundreds of cells updating that is a strobe — "noise, not
+ * information", the exact failure CLAUDE.md §7 names. Instead every price
+ * cell carries a 2px vertical rule on its LEADING edge:
+ *
+ *     0ms     rail snaps to full chroma. NO transition in — hard onset, the
+ *             kind of change the eye catches in peripheral vision.
+ *     180ms   the numeral does a single-line vertical roll (see .digit-roll).
+ *     2500ms  the rail decays on cubic-bezier(0.7, 0, 0.84, 0) — holds
+ *             bright, then drops fast.
+ *
+ * The payoff is not the single cell, it is the board: the decay curve turns
+ * the whole viewport into a RECENCY GRADIENT. A glance shows what moved in
+ * the last few seconds without reading a single number.
+ *
+ * CONTRACT FOR THE BOARD COMPONENT:
+ *   - Colour comes from `data-direction="in" | "out"` on the cell. The names
+ *     match the tokens: `in` = implied probability ROSE (amber, shortened,
+ *     steam), `out` = implied probability FELL (cyan, lengthened).
+ *   - Run the decay by restarting the animation IMPERATIVELY on the DOM node.
+ *     Do NOT drive it from React state that ticks — DESIGN.md requires
+ *     per-cell decay timers and forbids re-rendering the row. Either:
+ *         node.classList.remove('rail-decaying');
+ *         void node.offsetWidth;               // force reflow to restart
+ *         node.classList.add('rail-decaying');
+ *     or the Web Animations API against the pseudo-element:
+ *         node.animate(
+ *           [{ opacity: 1 }, { opacity: 0 }],
+ *           { duration: 2500, easing: 'cubic-bezier(0.7,0,0.84,0)',
+ *             fill: 'forwards', pseudoElement: '::before' },
+ *         );
+ *   - Only `opacity` and `transform` are animated. Never a layout property.
+ * ========================================================================= */
+@layer components {
+  .price-cell {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 15px;
+    padding-inline: 8px;
+    border-radius: var(--radius-price);
+    background-color: var(--color-ground-2);
+    /* At rest the rail is transparent AND zero-opacity. Both, so a cell that
+     * has never moved cannot show a rail even if a class is mis-applied. */
+    --rail-color: transparent;
+  }
+
+  .price-cell::before {
+    content: "";
+    position: absolute;
+    inset-block: 0;
+    inset-inline-start: 0;
+    width: 2px;
+    border-start-start-radius: var(--radius-price);
+    border-end-start-radius: var(--radius-price);
+    background-color: var(--rail-color);
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .price-cell[data-direction="in"] {
+    --rail-color: var(--color-delta-in);
+  }
+
+  .price-cell[data-direction="out"] {
+    --rail-color: var(--color-delta-out);
+  }
+
+  /* `both` fill mode is what produces the hard onset: at 0ms the rail is
+   * already at opacity 1 with nothing easing into it. */
+  .price-cell.rail-decaying::before {
+    animation: rail-decay var(--duration-decay) var(--ease-decay) both;
+  }
+
+  /* -----------------------------------------------------------------------
+   * The digit roll. Structure the board should render:
+   *
+   *   <span class="digit-roll">
+   *     <span class="digit-roll-previous" aria-hidden="true">+118</span>
+   *     <span class="digit-roll-current">+124</span>
+   *   </span>
+   *
+   * The outgoing numeral is absolutely positioned so the roll cannot move
+   * layout, and the container clips it. tabular-nums keeps the two numerals
+   * the same width, so the roll reads as a single line moving rather than as
+   * two strings of different length crossfading.
+   * --------------------------------------------------------------------- */
+  .digit-roll {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: inherit;
+    overflow: hidden;
+  }
+
+  .digit-roll-current {
+    animation: digit-roll-in var(--duration-short) var(--ease-enter) both;
+  }
+
+  .digit-roll-previous {
+    position: absolute;
+    inset-inline: 0;
+    text-align: center;
+    animation: digit-roll-out var(--duration-short) var(--ease-enter) both;
+  }
+}
+
+@keyframes rail-decay {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes digit-roll-in {
+  from {
+    transform: translateY(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+@keyframes digit-roll-out {
+  from {
+    transform: translateY(0);
+    opacity: 1;
+  }
+  to {
+    transform: translateY(-100%);
+    opacity: 0;
+  }
+}
+
+/* ===========================================================================
+ * BOARD DENSITY — DESIGN.md § Layout, including "The mobile board (< 768px)".
+ *
+ * The mobile answer is NOT card-per-event. The table survives and the
+ * viewport scrolls it: the game column goes sticky, the market columns scroll
+ * horizontally, and the price cell keeps its exact desktop size. A board is a
+ * table because the eye compares one market down many games in a single
+ * vertical sweep; stacking markets into cards turns that sweep into a paging
+ * operation, and a layout where only one game is ever on screen has nothing
+ * for a moving price to be loud against.
+ * ========================================================================= */
+@layer components {
+  .board-row {
+    height: 36px;
+  }
+
+  .board-scroll {
+    overflow-x: auto;
+  }
+
+  @media (width < 768px) {
+    /* 56px so the two competitors stack onto two lines instead of truncating. */
+    .board-row {
+      height: 56px;
+    }
+
+    /* NO `scroll-snap-type` HERE, and it is a deliberate removal rather than an
+     * omission — DESIGN.md's mobile section originally specified snapping on the
+     * column boundary so a partial column never rests half-visible.
+     *
+     * Snapping and a sticky first column do not compose. A snap point is aligned
+     * against the SCROLLPORT's start edge, and a `position: sticky` cell does not
+     * move that edge, so the browser loads the board already scrolled to the
+     * right with the Moneyline column painted UNDERNEATH the sticky game cell:
+     * the most-wanted column, invisible at rest, on a layout chosen precisely so
+     * moneyline comes first. Measured: `scrollLeft` 106 at load.
+     *
+     * `scroll-padding-inline-start` is the documented fix and it does not work
+     * here either, because it takes a LENGTH and the game column's width is
+     * content-driven — a table cell with `min-width: 132px` holding two team
+     * names measured 182px, so a padding of 132px still left the column 50px
+     * under the sticky cell. Pinning the cell to exactly 132px would fix the
+     * padding and truncate real team names instead.
+     *
+     * So the snap is dropped. It was a nicety; a hidden first column is a defect.
+     * Verified: with snapping off, `scrollLeft` is 0 at load and stays there. */
+    .board-scroll {
+      scroll-behavior: auto;
+    }
+
+    /* Sticky so a row is never orphaned from its identity while the market
+     * columns scroll. The opaque backdrop is required — the cells scroll
+     * underneath it. */
+    .board-game-cell {
+      position: sticky;
+      inset-inline-start: 0;
+      z-index: 1;
+      width: 132px;
+      background-color: var(--color-ground-1);
+    }
+
+    /* `scroll-snap-align` removed with the snap type above; see the note there. */
+  }
+}
+
+/* ===========================================================================
+ * THE CONNECTION PIP — DESIGN.md § "Resolved: the collapsed status pip".
+ *
+ * Below 768px the persistent 24px mono status rail collapses to a single 8px
+ * pip. It is the only full-radius object in the product besides an avatar.
+ *
+ * State is carried by fill and NEVER by fill alone: the component must give
+ * the pip an accessible name stating the same fact in words ("Live —
+ * streaming", "Resyncing", "Reconnecting", "Disconnected", "Not connected"),
+ * so the colour is redundant for a screen reader and a colourblind reader
+ * both.
+ *
+ * `money` on the pip is not a violation of "green means money": the pip is
+ * not a price and carries no quantity. It is the one place green means *this
+ * machine is working*. Recorded in DESIGN.md as a decision, not a drift.
+ * ========================================================================= */
+@layer components {
+  .status-pip {
+    display: inline-block;
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 9999px;
+    background-color: var(--color-ink-faint);
+  }
+
+  .status-pip[data-state="streaming"] {
+    background-color: var(--color-money);
+  }
+
+  .status-pip[data-state="resyncing"] {
+    background-color: var(--color-info);
+  }
+
+  .status-pip[data-state="reconnecting"] {
+    background-color: var(--color-info);
+    animation: pip-pulse 1.2s ease-in-out infinite;
+  }
+
+  .status-pip[data-state="disconnected"] {
+    background-color: var(--color-loss);
+  }
+
+  .status-pip[data-state="idle"] {
+    background-color: var(--color-ink-faint);
+  }
+}
+
+@keyframes pip-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* ===========================================================================
+ * RADIX SURFACE MOTION.
+ *
+ * Registered with @utility rather than as plain classes so they compose with
+ * variants — `data-[state=open]:anim-pop-in`. Enter is 180ms on the enter
+ * curve; exit is 120ms ease-in. Nothing here is an entrance animation for
+ * page content: these fire only when a user opens a thing.
+ * ========================================================================= */
+@utility anim-fade-in {
+  animation: fade-in var(--duration-short) var(--ease-enter) both;
+}
+@utility anim-fade-out {
+  animation: fade-out var(--duration-exit) var(--ease-exit) both;
+}
+@utility anim-pop-in {
+  animation: pop-in var(--duration-short) var(--ease-enter) both;
+}
+@utility anim-pop-out {
+  animation: pop-out var(--duration-exit) var(--ease-exit) both;
+}
+@utility anim-slide-in-top {
+  animation: slide-in-top var(--duration-short) var(--ease-enter) both;
+}
+@utility anim-slide-in-right {
+  animation: slide-in-right var(--duration-short) var(--ease-enter) both;
+}
+@utility anim-slide-in-bottom {
+  animation: slide-in-bottom var(--duration-short) var(--ease-enter) both;
+}
+@utility anim-slide-in-left {
+  animation: slide-in-left var(--duration-short) var(--ease-enter) both;
+}
+@utility anim-slide-out-top {
+  animation: slide-out-top var(--duration-exit) var(--ease-exit) both;
+}
+@utility anim-slide-out-right {
+  animation: slide-out-right var(--duration-exit) var(--ease-exit) both;
+}
+@utility anim-slide-out-bottom {
+  animation: slide-out-bottom var(--duration-exit) var(--ease-exit) both;
+}
+@utility anim-slide-out-left {
+  animation: slide-out-left var(--duration-exit) var(--ease-exit) both;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes fade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@keyframes pop-out {
+  from {
+    opacity: 1;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+}
+@keyframes slide-in-top {
+  from {
+    transform: translateY(-100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+@keyframes slide-out-top {
+  from {
+    transform: translateY(0);
+  }
+  to {
+    transform: translateY(-100%);
+  }
+}
+@keyframes slide-in-bottom {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+@keyframes slide-out-bottom {
+  from {
+    transform: translateY(0);
+  }
+  to {
+    transform: translateY(100%);
+  }
+}
+@keyframes slide-in-right {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+@keyframes slide-out-right {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+@keyframes slide-in-left {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+@keyframes slide-out-left {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-100%);
+  }
+}
+
+/* ===========================================================================
+ * REDUCED MOTION.
+ *
+ * Deliberately NOT the usual `*{animation:none!important}` sledgehammer, and
+ * this block is unlayered so it outranks everything above it.
+ *
+ * THE DELTA RAIL STILL RUNS. It is the only carrier of "this price just
+ * moved" other than the numeral itself, so removing it removes information,
+ * not decoration. DESIGN.md is explicit: shorten it to a 400ms LINEAR fade
+ * and keep it. What does get killed is the digit roll — the numeral swaps
+ * instantly — and the pip's pulse, whose meaning is already in its accessible
+ * name.
+ * ========================================================================= */
+@media (prefers-reduced-motion: reduce) {
+  .price-cell.rail-decaying::before {
+    animation-duration: 400ms;
+    animation-timing-function: linear;
+  }
+
+  .digit-roll-current,
+  .digit-roll-previous {
+    animation-duration: 0ms;
+  }
+
+  .status-pip[data-state="reconnecting"] {
+    animation: none;
+  }
+
+  /* Every Radix surface. All of them carry a data-slot ending in -content or
+   * -overlay (see src/components/ui/*), so one rule covers the set without
+   * touching anything that carries information. */
+  [data-slot$="-content"],
+  [data-slot$="-overlay"] {
+    animation-duration: 1ms !important;
+  }
+
+  .ui-transition,
+  .ui-transition:not(:hover):not(:focus-visible) {
+    transition-duration: 1ms;
   }
 }
