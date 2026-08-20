@@ -517,6 +517,233 @@ variable "topics" {
         "unclean.leader.election.enable" = "false"
       }
     }
+
+    // =====================================================================
+    // THE SIGNALS FAMILY — signals.ev / .arb / .steam / .clv  (phase 9)
+    // =====================================================================
+    // CLAUDE.md §3's event-flow diagram draws the phase-12 Flink jobs emitting
+    // `signals.steam | signals.arb | signals.clv`. `signals.ev` is an ADDITION,
+    // flagged as one here and in internal/platform/kafka/topics.go: the diagram
+    // does not name it, but §6's Analytics bullet leads with the positive-EV
+    // finder and phase 9 needs it as a first-class signal for the same reason the
+    // other three are — a finding that has to reach a subscriber, be recorded and
+    // be replayable.
+    //
+    // These four are declared NOW, in phase 9, even though the Go implementation
+    // is what publishes to them today. That is the whole point of §11 row 9
+    // calling phase 9 "the reference implementation phase 12 validates against":
+    // if the Go detectors publish to the same topics with the same keys and the
+    // same retention that the Flink jobs will, then the phase-12 cutover is a
+    // like-for-like swap that can be diffed, rather than a new pipeline that has
+    // to be trusted.
+    //
+    // ---------------------------------------------------------------------
+    // ALL FOUR ARE cleanup.policy = "delete". THIS IS THE DECISION.
+    // ---------------------------------------------------------------------
+    // The tempting reading is that signals look like odds.normalized — keyed by
+    // market, superseded constantly — and should therefore be compacted. They are
+    // not, and the distinction is the same one that keeps wager.events
+    // retention-based.
+    //
+    // Compaction is correct when the latest record per key SUPERSEDES the earlier
+    // ones, so that reading to the end of the log reconstructs current state. A
+    // market's current line has that property. A FINDING DOES NOT. "The latest
+    // steam move for market X" is not a snapshot of market X; it is one event, and
+    // the one before it is a different event that also happened and that a
+    // consumer computing hit rates needs to see. Compacting these would destroy
+    // the signal history in exactly the way §3 says compacting wager.events would
+    // destroy the audit trail — and it would do it invisibly, because the topic
+    // would still return something plausible at the head.
+    //
+    // The corollary is that these topics are NOT the system of record either.
+    // Migration 00009's four tables are, and they carry no expiry. The retention
+    // windows below are REPLAY windows on top of that record, and each one is
+    // sized by the question "how far back would someone reset a consumer group
+    // to?", not by "how long is this data worth keeping?".
+    //
+    // ---------------------------------------------------------------------
+    // PARTITIONS = 3 FOR ALL FOUR, and why not 6
+    // ---------------------------------------------------------------------
+    // odds.normalized and price.computed are 6, and the co-partitioning argument
+    // in this file's price.computed block would seem to extend here: same key
+    // (market_id), so equal partition counts would put a market on the same
+    // partition index across all of them.
+    //
+    // It does not extend, because SIGNALS ARE JOIN OUTPUTS, NOT JOIN INPUTS. The
+    // phase-12 jobs read odds.normalized and price.computed and WRITE these; a
+    // sink's partition count has no bearing on whether the join upstream of it
+    // shuffles. Nothing in the design joins two signals topics to each other.
+    //
+    // What is left is volume and consumer parallelism, and both point at 3:
+    //
+    //   * Volume is thresholded output, not a firehose. ev is the busiest and is
+    //     a filter over `prices` that keeps a low single-digit percent of quotes
+    //     (migration 00009 sizes it at ~10^4..10^5 rows/day against that table's
+    //     ~2.7x10^6). steam is rarer still, by construction. arb is rarest — the
+    //     phase-4 gate found 68 findings over 1,065 records with the leg-age bound
+    //     binding constantly. clv is human-rate: one record per graded leg.
+    //   * The consumers are `api`'s alerting and persistence path, which is a
+    //     single low-concurrency group. 3 lets it run 1 or 3 instances with a
+    //     perfectly balanced assignment and costs almost nothing.
+    //
+    // And partitions are not free. `total_partitions` goes from 21 to 33 with
+    // this block, and outputs.tf explains why that number is watched: every
+    // partition costs file handles, an index and a time-index on a single-node
+    // deploy target that also runs Postgres, Redis and six Go services. Choosing 6
+    // apiece would have made it 45 for parallelism nothing asks for.
+    //
+    // Partition count on a keyed topic is effectively permanent — raising it
+    // re-maps hash(key) % partitions and splits a key's history across two
+    // partitions with no ordering between the halves — so 3 is chosen as a floor
+    // that will not need revisiting rather than as a number to grow later.
+    //
+    // >>> THE ORDERING GUARANTEE <<<
+    // Per-KEY total order and nothing else, same as every other keyed topic here.
+    // For ev/arb/steam the key is market_id; for clv it is wager_id. Two findings
+    // on DIFFERENT markets have no defined relative order even if one caused the
+    // other. Order by the payload's own event-time field if that matters — which
+    // for steam is the window edge and for ev is the quote's observed_at.
+    // =====================================================================
+
+    // signals.ev — the +EV finder's output. The busiest of the four.
+    "signals.ev" = {
+      partitions     = 3
+      cleanup_policy = "delete"
+
+      config = {
+        // 7 DAYS. The replay question for +EV is "re-run last week's slate
+        // through a corrected detector and diff the findings", which is a
+        // weekend-plus-a-work-week window. Longer buys nothing: the durable
+        // artifact is the ev_signals hypertable, which has no retention policy,
+        // and evaluating a month-old signal against its close is a database
+        // query rather than a bus replay.
+        "retention.ms" = "604800000"
+
+        // 512 MiB per partition. A byte ceiling as well as a time one, for the
+        // reason odds.raw has one: this is the highest-volume signals topic and a
+        // misconfigured threshold — someone setting min EV to 0 — is exactly how
+        // its volume goes up two orders of magnitude without anyone noticing.
+        // Whichever of size or time trips first wins, so the failure mode is
+        // "we lost old findings" rather than "the broker filled the volume the
+        // database is on". 3 x 512 MiB = 1.5 GiB worst case.
+        "retention.bytes" = "536870912"
+
+        // 6 hours. Kafka deletes whole SEGMENTS and never the ACTIVE one, so with
+        // the 7-day segment.ms default a topic asking for 7-day retention would
+        // have one perpetually-active segment and delete nothing, ever. 6h makes
+        // the real retention 7d..7d6h instead of unbounded. Same mechanic
+        // odds.raw's block spells out.
+        "segment.ms" = "21600000"
+
+        // 64 MiB, so a busy slate closes segments on volume too.
+        "segment.bytes" = "67108864"
+
+        // 1 MiB, the Kafka default, declared rather than inherited: a single +EV
+        // finding is a few hundred bytes, and a message here approaching 1 MiB
+        // means the pricer is publishing a whole ComputedMarket where it should
+        // be publishing one finding.
+        "max.message.bytes" = "1048576"
+
+        "compression.type"               = "producer"
+        "unclean.leader.election.enable" = "false"
+      }
+    }
+
+    // signals.arb — arbitrage findings. The lowest-volume of the three
+    // market-keyed topics, and the one whose history is most worth keeping.
+    "signals.arb" = {
+      partitions     = 3
+      cleanup_policy = "delete"
+
+      config = {
+        // 30 DAYS, four times signals.ev's window, and the asymmetry is
+        // deliberate. Arbitrage findings are RARE and each one is a claim that
+        // wants auditing after the fact — "we showed 40 arbs last month; how many
+        // were still live 30 seconds later?" is a question about a month of
+        // findings, and answering it from the bus means being able to replay a
+        // month. The volume makes that free: at the phase-4 gate's rate this is
+        // single-digit MB over the whole window.
+        "retention.ms" = "2592000000"
+
+        // 256 MiB per partition. Half of signals.ev's cap, because the expected
+        // volume is orders of magnitude lower and a breach here means the
+        // staleness bounds have been disabled rather than merely loosened.
+        "retention.bytes" = "268435456"
+
+        // 24 hours. Segment granularity is a whole day against a 30-day window —
+        // real retention 30d..31d, about 3% slop — and it keeps the segment count
+        // at ~30 per partition instead of ~120 with a 6h roll. Same trade
+        // wager.events makes with its 7-day segments over 90 days.
+        "segment.ms" = "86400000"
+
+        "segment.bytes"                  = "67108864"
+        "max.message.bytes"              = "1048576"
+        "compression.type"               = "producer"
+        "unclean.leader.election.enable" = "false"
+      }
+    }
+
+    // signals.steam — steam-move detections. Same sizing as signals.arb and for
+    // the same reasons: rare by construction, and the interesting question about
+    // it is a month-scale one ("did the books that followed actually follow?").
+    "signals.steam" = {
+      partitions     = 3
+      cleanup_policy = "delete"
+
+      config = {
+        "retention.ms"    = "2592000000"
+        "retention.bytes" = "268435456"
+        "segment.ms"      = "86400000"
+
+        "segment.bytes" = "67108864"
+
+        // 1 MiB. Worth a note because steam records are the largest in the
+        // family: each carries a `followers` array with one entry per book that
+        // followed. Twenty books is still well under a kilobyte, so 1 MiB is a
+        // ceiling that only a bug can reach.
+        "max.message.bytes" = "1048576"
+
+        "compression.type"               = "producer"
+        "unclean.leader.election.enable" = "false"
+      }
+    }
+
+    // signals.clv — per-graded-leg closing line value, written by `settle`.
+    //
+    // The odd one out in three ways, all of which follow from it being a fact
+    // about a WAGER rather than about a market: it is keyed by wager_id, it is
+    // written by settle rather than by the pricer, and it is sized like
+    // wager.events rather than like its siblings.
+    "signals.clv" = {
+      partitions     = 3
+      cleanup_policy = "delete"
+
+      config = {
+        // 90 DAYS, matching wager.events exactly, and for the same reason that
+        // block gives: "how far back would someone want to re-run grading to
+        // debug a settlement bug? A SEASON." CLV is computed from the same graded
+        // legs, so a replay that re-grades week 3 in week 14 must be able to
+        // re-measure it too. Splitting the two windows would mean a replay that
+        // could reproduce the settlement but not the CLV attached to it.
+        "retention.ms" = "7776000000"
+
+        // UNLIMITED, explicitly, again matching wager.events. Volume is
+        // human-rate — one record per graded leg — so there is no
+        // disk-exhaustion risk to trade against, and a size-triggered hole in a
+        // user's CLV record is the failure that makes a leaderboard
+        // untrustworthy.
+        "retention.bytes" = "-1"
+
+        // 7 days, matching wager.events: real retention 90..97 days, ~13 segments
+        // per partition over the window.
+        "segment.ms" = "604800000"
+
+        "segment.bytes"                  = "67108864"
+        "max.message.bytes"              = "1048576"
+        "compression.type"               = "producer"
+        "unclean.leader.election.enable" = "false"
+      }
+    }
   }
 
   validation {

@@ -41,7 +41,42 @@ const (
 	// stalled database would convert a slow query into LOST partitions and
 	// duplicated work.
 	DefaultFlushTimeout = 10 * time.Second
+
+	// deadlockAttempts bounds how many times one record's transaction is
+	// re-run after Postgres chooses it as a deadlock victim. See [Writer.write]
+	// for why retrying THIS transaction is safe and why nothing else in this
+	// repository inherits the behaviour.
+	//
+	// Three, not more: the contention it survives is two processes taking the
+	// same catalogue rows in two orders, which clears as soon as the other
+	// transaction commits — a few milliseconds. A deadlock that survives three
+	// attempts is a contention problem an operator needs to see, not one a longer
+	// loop should hide.
+	deadlockAttempts = 3
+
+	// deadlockBackoff is the base pause between those attempts, multiplied by the
+	// attempt number. It is deliberately short: the winning transaction has
+	// already committed by the time the victim's error arrives, so the pause is
+	// there to avoid re-colliding with the NEXT one rather than to wait out the
+	// last.
+	deadlockBackoff = 10 * time.Millisecond
 )
+
+// sleepCtx pauses for d, or returns the context's error if it ends first.
+//
+// A bare time.Sleep here would hold a rebalance open past the consumer's
+// deadline for no benefit; the pause is a courtesy to the other transaction, not
+// a step the record needs.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
 
 // ErrNotRunnable is returned by Run when it is given no consumer.
 var ErrNotRunnable = errors.New("writer: no consumer")
@@ -320,8 +355,7 @@ func (w *Writer) write(ctx context.Context, s snapshot) error {
 	offered := len(s.prices)
 	inserted := 0
 
-	start := w.now()
-	err := w.db.InTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+	body := func(ctx context.Context, tx pgx.Tx) error {
 		if err := w.upsertCatalogue(ctx, tx, s); err != nil {
 			return err
 		}
@@ -331,9 +365,59 @@ func (w *Writer) write(ctx context.Context, s snapshot) error {
 		}
 		inserted = n
 		return nil
-	})
-	committed := w.now()
-	w.metrics.observeFlush(committed.Sub(start), err)
+	}
+
+	// # Why this one transaction is retried on a deadlock, and nothing else is
+	//
+	// internal/platform/postgres deliberately ships NO retry helper: only a
+	// caller knows whether re-running its own function is safe, because the
+	// function may have produced to Kafka or mutated state between the failing
+	// statement and the return. This one has not. `body` is upserts and nothing
+	// else — every statement is ON CONFLICT DO UPDATE on a natural key, `inserted`
+	// is reassigned rather than accumulated, and a 40P01 GUARANTEES the server
+	// rolled the whole transaction back. Re-running it writes exactly the rows the
+	// first attempt would have.
+	//
+	// It became necessary in phase 9, and the mechanism is worth recording because
+	// it is not obvious. This transaction upserts the catalogue spine in FK order,
+	// and ON CONFLICT DO UPDATE takes an EXCLUSIVE row lock on every conflicting
+	// row whether or not the WHERE clause then declines the update. Phase 9's
+	// signals stage inserts into ev_signals, whose foreign keys make Postgres take
+	// FOR KEY SHARE on the same leagues, books, markets and selections rows — in
+	// the order the referential-integrity triggers fire, which is not this
+	// function's FK order. Two processes taking the same rows in two orders is a
+	// deadlock, and before phase 9 nothing else wrote those parents so none was
+	// reachable. Without this loop the observable symptom is a line-history writer
+	// that silently drops a few percent of its price batches.
+	//
+	// Bounded, not indefinite: a deadlock the server keeps choosing this
+	// transaction as the victim of is a contention problem an operator has to see,
+	// so the last failure is returned with its SQLSTATE intact and the record's
+	// offset stays uncommitted.
+	var (
+		start     time.Time
+		committed time.Time
+		err       error
+	)
+	for attempt := 1; ; attempt++ {
+		start = w.now()
+		err = w.db.InTx(ctx, body)
+		committed = w.now()
+		w.metrics.observeFlush(committed.Sub(start), err)
+
+		if err == nil || attempt >= deadlockAttempts || !postgres.IsSerializationFailure(err) {
+			break
+		}
+		w.log.Warn("write deadlocked and is being retried; nothing was written",
+			slog.String("market", string(s.market.ID())),
+			slog.String("sqlstate", postgres.SQLState(err)),
+			slog.Int("attempt", attempt),
+			slog.Int("attempts", deadlockAttempts),
+		)
+		if waitErr := sleepCtx(ctx, deadlockBackoff*time.Duration(attempt)); waitErr != nil {
+			return waitErr
+		}
+	}
 
 	if err != nil {
 		return err

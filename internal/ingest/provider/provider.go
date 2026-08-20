@@ -676,6 +676,308 @@ type Adapter interface {
 type ProviderAdapter = Adapter
 
 // -----------------------------------------------------------------------------
+// Results: the second arrow into the system
+// -----------------------------------------------------------------------------
+
+// Results are a SEPARATE SEAM from odds, and the separation is structural.
+//
+// CLAUDE.md §3 draws two arrows into the pipeline, not one:
+//
+//	provider → ingest → [odds.raw.*] → normalizer → [odds.normalized] → …
+//	results  → settle → [wager.events] → ledger → …
+//
+// `results` is drawn as an input to settle, beside the odds flow rather than
+// carried on it. That is the design this section implements, and the obvious
+// alternative — put the score and the terminal status on the odds payload — is
+// wrong twice over:
+//
+//  1. THE ODDS PATH CANNOT CARRY A RESULT EVEN IN PRINCIPLE. odds.normalized is
+//     compacted and keyed by MARKET, and a finished contest has no priced market
+//     to key on. The books take their prices down when play ends — this package's
+//     own synthetic adapter models exactly that — so an ended contest produces a
+//     payload with no observation instant on it, which the normalizer rejects
+//     whole. An ended event is precisely the shape that yields no record. There
+//     is nothing to hang the result on.
+//
+//  2. THE NORMALIZER'S EXCLUSION OF SCORE AND CLOCK IS CORRECT AND STAYS.
+//     internal/ingest/normalizer/payload.go leaves both out of the published
+//     record on purpose: a record carrying a live score would be republished for
+//     every market on the event on every score change, which is the exact bus
+//     flood CLAUDE.md §5's change detection exists to prevent, and it would do it
+//     at the moment the slate is busiest. Relaxing that to reach settlement would
+//     trade a correct design for a convenient one.
+//
+// The seam is also the shape the real world has. Every candidate provider in
+// CLAUDE.md §13's open decision serves scores from a DIFFERENT ENDPOINT with its
+// own quota cost and its own lookback window — The Odds API's /v4/…/scores takes
+// a `daysFrom` and bills separately from /odds. An adapter that could only ever
+// state a result while it was also quoting a price could not use that endpoint
+// at all, because by the time the score exists the prices are gone.
+
+// ResultWindow is the span of finishing instants one results request covers.
+//
+// # Why a window and not a list of contests
+//
+// A results endpoint is a WINDOW QUERY, not a lookup. The Odds API's route is
+// GET /v4/sports/{sport}/scores?daysFrom=3: it is addressed by sport, bounded by
+// a lookback in days, and it answers with the contests that finished — it is not
+// asked, and cannot be asked, "what happened in event X". An interface that
+// posed one question per contest would have every adapter fanning a window query
+// out into a per-id filter it then had to reverse.
+//
+// # And why it carries no identifier of ours at all
+//
+// This shape replaced one that did, and the replacement fixed a defect that had
+// stopped every settlement in the system. The poller's identifiers come out of
+// the database, so they are DOMAIN identifiers — internal/ingest/normalizer
+// derives `synthetic.e.syn-sba-20260820-2` from the generator's own
+// `syn-sba-20260820-2`. An adapter's identifiers are its own. Handing a domain
+// identifier to an adapter that compares it against a native one produces no
+// error and no match, for any event, ever; what it produces is a settlement feed
+// that returns "unresolved" for every contest for ever while looking healthy.
+//
+// So the direction is flipped: the adapter REPORTS what finished, keyed by its
+// own identifier (see [FinalResult.EventKey]), and the POLLER maps that key
+// forward into the domain space with the same derivation the ingest path used.
+// The forward derivation is total and always correct; the inverse is not
+// available in general, because that derivation hashes any key it cannot embed
+// verbatim. Nothing in this struct can be misread as belonging to the other
+// space, because nothing in it is an identifier.
+//
+// The league is absent for the same reason: a domain.LeagueID here would be
+// exactly the same mistake one field over. An adapter that must name a sport to
+// build its request takes it from its OWN catalogue, which it owns and can spell.
+type ResultWindow struct {
+	// Since is the earliest finishing instant of interest. Required.
+	//
+	// The poller derives it from the oldest contest on its work queue — a
+	// contest cannot finish before it starts, so its scheduled start is a sound
+	// lower bound — which is what keeps a routine request from asking for the
+	// whole history of the sport. An adapter may narrow it further to its own
+	// lookback window and MUST NOT widen it into a request the provider does not
+	// serve.
+	Since time.Time
+
+	// Until is the latest finishing instant of interest. Required, and not
+	// before Since.
+	//
+	// It is the caller's clock reading for the tick. An adapter clamps it to its
+	// own clock rather than trusting it, because a window reaching into the
+	// future would otherwise invite a result for a contest still being played.
+	Until time.Time
+}
+
+// Validate reports whether the window is one an adapter can be asked.
+//
+// It wraps ErrInvalidScope for the reason the odds Scope does: a malformed
+// request is the caller asking for something that is not a well-formed request,
+// and Classify maps that sentinel to DispositionFatal so a poller cannot retry a
+// bad window for ever.
+func (w ResultWindow) Validate() error {
+	if w.Since.IsZero() {
+		return fmt.Errorf("result window: %w: no start instant", ErrInvalidScope)
+	}
+	if w.Until.IsZero() {
+		return fmt.Errorf("result window: %w: no end instant", ErrInvalidScope)
+	}
+	if w.Until.Before(w.Since) {
+		return fmt.Errorf("result window: %w: ends %s before it begins (%s to %s)",
+			ErrInvalidScope, w.Since.Sub(w.Until), w.Since.UTC().Format(time.RFC3339),
+			w.Until.UTC().Format(time.RFC3339))
+	}
+	return nil
+}
+
+// Covers reports whether an instant falls inside the window. The bounds are
+// INCLUSIVE at both ends: a contest that finished at exactly Until is finished,
+// and excluding it would strand it until some later tick happened to reach past
+// it.
+func (w ResultWindow) Covers(t time.Time) bool {
+	return !t.Before(w.Since) && !t.After(w.Until)
+}
+
+// String implements fmt.Stringer.
+func (w ResultWindow) String() string {
+	return fmt.Sprintf("result-window(%s to %s)",
+		w.Since.UTC().Format(time.RFC3339), w.Until.UTC().Format(time.RFC3339))
+}
+
+// FinalResult is one contest's outcome, as the provider states it.
+//
+// The field set is deliberately identical to settlement.Result's, minus the
+// statuses only the database can hold. That is not duplication for its own sake:
+// this value crosses the provider boundary, is written to `events` by the
+// results poller, and is read back out of `events` by settle's ResultsSource, so
+// the two ends of the pipe agreeing on the shape is what makes the round trip
+// lossless. The two Validate methods are spelled the same way for the same
+// reason.
+type FinalResult struct {
+	// EventKey is the contest, named in the PROVIDER'S OWN identifier space:
+	// The Odds API's `id`, the generator's `syn-sba-20260820-2`. Required.
+	//
+	// IT IS NOT A domain.EventID AND THE TYPE SAYS SO. The database holds the
+	// identifier internal/ingest/normalizer's EventIDFor derives from this key —
+	// `synthetic.e.syn-sba-20260820-2` — and the poller performs that same
+	// forward derivation on the way in. Carrying the native key in a
+	// domain.EventID field is precisely how those two spaces came to be compared
+	// against each other, silently, in every results poll this system ever
+	// issued; a plain string that no domain function will accept makes the
+	// mistake fail to compile instead.
+	//
+	// The adapter is not obliged to restrict itself to contests anybody asked
+	// about — under a window query it cannot, since it is answering "what
+	// finished" rather than "what happened to X". A reported contest this
+	// deployment never ingested is an ordinary outcome the poller counts and
+	// drops.
+	EventKey string
+
+	// Status is the contest's terminal status. Only [domain.EventStatusEnded]
+	// and [domain.EventStatusCancelled] may appear.
+	//
+	// `settled` is excluded even though settlement.Result admits it: it means
+	// "every wager has been graded", which is a fact about THIS system's
+	// bookkeeping and not something any provider is in a position to state.
+	// `postponed` is excluded because it is not a result at all — the domain
+	// admits `postponed → scheduled`, so voiding a postponed contest's wagers
+	// would cancel bets on a game that is still going to be played.
+	Status domain.EventStatus
+
+	// Score is the final score. Present exactly when HasScore is true.
+	Score domain.Score
+
+	// HasScore reports whether Score is set. It mirrors domain.Event.Score()'s
+	// own (value, ok) pair rather than using a sentinel, because 0-0 is a real
+	// and common final in several of the sports in scope.
+	HasScore bool
+
+	// FinalisedAt is the PROVIDER'S OWN instant for the outcome — when the
+	// contest finished, not when the adapter was asked about it.
+	//
+	// It becomes events.observed_at, which settle stamps onto every leg it
+	// grades from this result, so a replayed result must re-apply the ORIGINAL
+	// grading time rather than the replay's. It is the same distinction
+	// Snapshot.FetchedAt draws against Price.ObservedAt at the top of this file,
+	// and getting it wrong here has a worse consequence than a wrong metric: it
+	// restamps a customer's settled ticket with the instant of a redelivery.
+	FinalisedAt time.Time
+}
+
+// IsScored reports whether the contest was played to a final score, which is the
+// precondition for grading anything against it.
+func (r FinalResult) IsScored() bool {
+	return r.HasScore && r.Status == domain.EventStatusEnded
+}
+
+// IsCancelled reports whether the contest will never be played, so every leg
+// riding on it voids and every stake comes back.
+func (r FinalResult) IsCancelled() bool { return r.Status == domain.EventStatusCancelled }
+
+// Validate reports whether the result is one that can be written down.
+//
+// It is checked on the way IN, at the boundary, rather than trusted, and the
+// check that matters is "ended with no score". The events table permits such a
+// row — migrations/00002's events_score_all_or_nothing constrains the score
+// PAIR, not its presence — and settlement's own results source skips one with a
+// warning. A provider adapter that emitted them would be manufacturing that
+// warning, and a stake would sit in escrow with nothing to release it.
+//
+// It wraps ErrMalformedPayload because that sentinel already means "decoded into
+// something the domain refuses". Classify maps it to DispositionFatal and
+// requestOutcome counts it as `invalid_response`, which are both the right
+// answers: no amount of retrying makes an adapter's bad result good, and the
+// condition belongs on the invalid-response series rather than the retry one.
+func (r FinalResult) Validate() error {
+	if strings.TrimSpace(r.EventKey) == "" {
+		return fmt.Errorf("final result: %w: empty provider event key", ErrMalformedPayload)
+	}
+	if r.FinalisedAt.IsZero() {
+		return fmt.Errorf("final result for event %s: %w: no finalisation instant",
+			r.EventKey, ErrMalformedPayload)
+	}
+	switch {
+	case r.IsScored(), r.IsCancelled() && !r.HasScore:
+		return nil
+	case r.IsCancelled():
+		return fmt.Errorf("final result for event %s: %w: a cancelled contest carries no score, "+
+			"got %s", r.EventKey, ErrMalformedPayload, r.Score)
+	case r.HasScore:
+		return fmt.Errorf("final result for event %s: %w: status %s carries a score; "+
+			"only an ended contest has a final one", r.EventKey, ErrMalformedPayload, r.Status)
+	default:
+		return fmt.Errorf("final result for event %s: %w: status %s is not an outcome "+
+			"(want ended with a score, or cancelled without one)",
+			r.EventKey, ErrMalformedPayload, r.Status)
+	}
+}
+
+// String implements fmt.Stringer.
+func (r FinalResult) String() string {
+	if r.HasScore {
+		return fmt.Sprintf("final-result(%s %s %s)", r.EventKey, r.Status, r.Score)
+	}
+	return fmt.Sprintf("final-result(%s %s)", r.EventKey, r.Status)
+}
+
+// ResultsProvider reports the outcome of contests that have finished.
+//
+// It is the second arrow's adapter seam, and it is declared here beside Adapter
+// for the reason the package comment gives about Adapter: the consumer is
+// internal/ingest's results poller, the method list is the poller's and nothing
+// an adapter would find convenient to expose, and it lives in this package only
+// so the two adapters and the poller share one vocabulary of ResultWindow and
+// FinalResult instead of every adapter importing the poller.
+//
+// It is a SEPARATE interface from Adapter rather than two more methods on it,
+// and that is load-bearing in both directions. A deployment may legitimately
+// have an odds source with no results source — that is exactly the state
+// theoddsapi ships in, pending CLAUDE.md §13's provider decision and the quota
+// math that goes with it — and a results source is a thing a later phase may
+// want to point at a different vendor from the prices. Folding the methods into
+// Adapter would make both of those unrepresentable and would force every future
+// adapter to implement a scores endpoint before it could quote a price.
+//
+// # Contract
+//
+//   - Results takes a context and MUST honour its deadline, and must apply its
+//     own default so a caller passing context.Background() cannot hang the
+//     poller for ever. Same rule as Adapter, same reason.
+//   - Every returned error must be classifiable by Classify. An adapter that
+//     does not implement a scores endpoint returns ErrNotSupported, which
+//     classifies as fatal, so the poller can disable itself loudly and once
+//     rather than retrying a capability that will never appear.
+//   - It NEVER invents a result. Returning nothing for a contest whose outcome
+//     the provider does not know is the required answer; guessing would grade a
+//     customer's ticket against a number nobody published.
+//   - It reports at most one FinalResult per contest. A second copy of one key
+//     in a single answer is a bug in the adapter, and the poller drops it,
+//     because two statements about one contest cannot both be attributed.
+//   - It answers in ITS OWN identifier space, on [FinalResult.EventKey], and
+//     never in the domain's. Resolving the two is the poller's job and only the
+//     poller's; see [ResultWindow].
+//   - It is safe for concurrent use.
+type ResultsProvider interface {
+	// Name identifies the source of the results. It is the `provider` label on
+	// the poller's series, and cmd/ingest asserts it against the odds adapter's
+	// name at startup so a deployment cannot silently take its prices from one
+	// source and its outcomes from another.
+	Name() Name
+
+	// Results returns every contest the provider knows finished inside the
+	// window, in any order.
+	//
+	// AN EMPTY ANSWER IS NORMAL AND NOT AN ERROR. Most windows close over a
+	// stretch in which nothing the provider covers finished, and the poller
+	// simply asks again on the next tick. An adapter that errored rather than
+	// answering with nothing would turn the steady state into an alert.
+	//
+	// The answer is NOT limited to contests this deployment holds. A window
+	// query cannot be: the provider is answering "what finished", not "what
+	// happened to the rows in your database". The poller intersects the answer
+	// against its own work queue and counts the remainder.
+	Results(ctx context.Context, window ResultWindow) ([]FinalResult, error)
+}
+
+// -----------------------------------------------------------------------------
 // Instrumentation
 // -----------------------------------------------------------------------------
 

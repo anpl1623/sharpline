@@ -118,6 +118,19 @@ export function AccountMenu({ className }: AccountMenuProps) {
           <p className="mt-1 t-ui break-all text-ink">{label}</p>
         </div>
         <DropdownMenuSeparator />
+        {/* `asChild` so the item IS the link: a `<div role="menuitem">` with an
+            onSelect that navigates cannot be opened in a new tab, cannot be
+            copied, and has no href for a screen reader to announce. */}
+        <DropdownMenuItem asChild>
+          <Link href="/bets">Your bets</Link>
+        </DropdownMenuItem>
+        {/* CLV is per-account and reachable nowhere else — it is not a section
+          * of the product, it is a reading of this customer's own tickets, so it
+          * belongs beside them rather than in the section nav. */}
+        <DropdownMenuItem asChild>
+          <Link href="/account/clv">Your closing line value</Link>
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
         <DropdownMenuItem
           onSelect={() => {
             void logout();

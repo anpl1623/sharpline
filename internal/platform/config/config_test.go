@@ -167,6 +167,19 @@ func TestLoadFromValidation(t *testing.T) {
 			env:  with(map[string]string{config.EnvPricerReferenceBooks: ""}),
 		},
 		{
+			// Phase 9 put the signals stage in this binary: a second consumer
+			// group over price.computed that persists +EV, arbitrage and steam
+			// findings. Without a pool it would report itself ready, publish to
+			// the bus, and leave every analytics table empty — a query surface
+			// answering 200 with an empty collection, indistinguishable from a
+			// quiet market. The declaration is what makes that impossible.
+			name:         "pricer requires postgres",
+			spec:         config.Pricer,
+			env:          with(map[string]string{config.EnvPostgresDSN: ""}),
+			wantErr:      config.ErrMissing,
+			wantMentions: []string{config.EnvPostgresDSN},
+		},
+		{
 			name:         "api requires postgres",
 			spec:         config.API,
 			env:          with(map[string]string{config.EnvPostgresDSN: ""}),
@@ -402,6 +415,7 @@ func TestPricerReferenceBooksParseIntoAnOrderedList(t *testing.T) {
 
 	cfg, err := config.LoadFrom(config.Pricer, config.MapLookup(map[string]string{
 		config.EnvKafkaBrokers:         "kafka:9092",
+		config.EnvPostgresDSN:          "postgres://sharpline:secret@postgres:5432/sharpline?sslmode=disable",
 		config.EnvPricerReferenceBooks: " pinnacle , sharpline , ,",
 	}))
 	if err != nil {
@@ -414,6 +428,7 @@ func TestPricerReferenceBooksParseIntoAnOrderedList(t *testing.T) {
 
 	empty, err := config.LoadFrom(config.Pricer, config.MapLookup(map[string]string{
 		config.EnvKafkaBrokers: "kafka:9092",
+		config.EnvPostgresDSN:  "postgres://sharpline:secret@postgres:5432/sharpline?sslmode=disable",
 	}))
 	if err != nil {
 		t.Fatalf("LoadFrom(pricer) with no preference list: %v", err)
@@ -431,9 +446,12 @@ func TestLoadFromDefaults(t *testing.T) {
 	// Only the variables a pricer genuinely requires; everything else absent.
 	// Redis is deliberately NOT here: the pricer opens no Redis client, its whole
 	// state is a fold of a compacted topic, and phase 2's rule is that a declared
-	// dependency must be one the binary actually opens.
+	// dependency must be one the binary actually opens. Postgres IS here, and by
+	// that same rule: phase 9 put the signals stage in this binary, which opens a
+	// pool and writes the analytics tables.
 	env := map[string]string{
 		config.EnvKafkaBrokers: "kafka:9092",
+		config.EnvPostgresDSN:  "postgres://sharpline:secret@postgres:5432/sharpline?sslmode=disable",
 	}
 
 	cfg, err := config.LoadFrom(config.Pricer, config.MapLookup(env))
@@ -619,6 +637,77 @@ func TestIngestLiveIntervalIsOptionalAndValidated(t *testing.T) {
 			}
 			if cfg.IngestLiveInterval != tc.want {
 				t.Errorf("IngestLiveInterval = %s, want %s", cfg.IngestLiveInterval, tc.want)
+			}
+		})
+	}
+}
+
+// TestIngestResultsKnobsAreOptionalAndValidated.
+//
+// The two results-path cadence knobs go through the same parse-and-refuse rule
+// as the live interval, and they are asserted here for a different reason. The
+// live interval's failure mode is a bill; theirs is a customer's stake sitting
+// in escrow with nothing to release it, which is invisible until somebody asks
+// why they have not been paid.
+//
+// The case that matters most is "0s". It parses, and a poller would happily take
+// it as "use the default" — because the field's zero value is exactly what an
+// UNSET variable produces — so the two would silently mean the same thing while
+// an operator believed they had set something. It is refused at the boundary.
+func TestIngestResultsKnobsAreOptionalAndValidated(t *testing.T) {
+	t.Parallel()
+
+	for _, knob := range []struct {
+		env  string
+		read func(*config.Config) time.Duration
+	}{
+		{config.EnvIngestResultsInterval, func(c *config.Config) time.Duration { return c.IngestResultsInterval }},
+		{config.EnvIngestResultsDelay, func(c *config.Config) time.Duration { return c.IngestResultsDelay }},
+	} {
+		t.Run(knob.env, func(t *testing.T) {
+			t.Parallel()
+
+			for _, tc := range []struct {
+				name    string
+				value   string
+				want    time.Duration
+				wantErr bool
+			}{
+				{name: "absent means the poller's own default", value: "", want: 0},
+				{name: "minutes parse", value: "30s", want: 30 * time.Second},
+				{name: "hours parse", value: "6h", want: 6 * time.Hour},
+				{name: "surrounding whitespace is tolerated", value: "  2m  ", want: 2 * time.Minute},
+
+				{name: "zero is refused", value: "0s", wantErr: true},
+				{name: "negative is refused", value: "-5m", wantErr: true},
+				{name: "a unitless number is refused", value: "60", wantErr: true},
+				{name: "nonsense is refused", value: "later", wantErr: true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					t.Parallel()
+
+					env := with(map[string]string{knob.env: tc.value})
+					cfg, err := config.LoadFrom(config.Ingest, config.MapLookup(env))
+
+					if tc.wantErr {
+						if err == nil {
+							t.Fatalf("%s=%q was accepted; it must fail startup", knob.env, tc.value)
+						}
+						if !errors.Is(err, config.ErrInvalid) {
+							t.Errorf("error does not wrap ErrInvalid: %v", err)
+						}
+						if !strings.Contains(err.Error(), knob.env) {
+							t.Errorf("the error does not name the variable, so an operator cannot find it: %v", err)
+						}
+						return
+					}
+					if err != nil {
+						t.Fatalf("%s=%q was rejected: %v", knob.env, tc.value, err)
+					}
+					if got := knob.read(cfg); got != tc.want {
+						t.Errorf("%s = %s, want %s", knob.env, got, tc.want)
+					}
+				})
 			}
 		})
 	}

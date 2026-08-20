@@ -24,10 +24,20 @@ import (
 //
 // # What is deliberately NOT here
 //
-// The bet slip and wager placement. CLAUDE.md §3 lists them among `api`'s
-// responsibilities and phase 8 builds them. There is no stub, no `501`, and no
-// route reserved for them: a route that exists and does nothing is worse than an
-// absent one, because a client discovers it and writes against it.
+// Any decision about money. Phase 8 added the bet slip, placement, wager history
+// and cash-out, and every RULE behind them — self-exclusion, responsible-gaming
+// limits, the balance fold, price-move detection, the double-entry stake
+// movement — lives in internal/betting, inside one transaction, in an order that
+// is load-bearing. This package parses, maps sentinels onto statuses, and
+// renders. It re-checks nothing, because a second answer to any of those
+// questions is a second answer that can disagree with the one the transaction
+// used.
+//
+// The same rule explains the two OPTIONAL betting ports. Where a capability's
+// adapter does not exist yet, its route is NOT MOUNTED rather than mounted over
+// a stub: a route that exists and does nothing is worse than an absent one,
+// because a client discovers it and writes against it. [API.Routes] reports
+// which shape it built and NewAPI logs it.
 type API struct {
 	catalogue Catalogue
 	prices    Prices
@@ -37,6 +47,16 @@ type API struct {
 	limits    Limits
 	sessions  Sessions
 	audit     Audit
+
+	betting       Betting
+	wagers        Wagers
+	pricer        TicketPricer
+	cashOutQuotes CashOutQuotes
+	cashOuts      CashOuts
+
+	signals     Signals
+	clv         CLV
+	leaderboard Leaderboard
 
 	requireAuth []Middleware
 
@@ -73,6 +93,58 @@ type APIOptions struct {
 	// a deployment missing the adapter says so rather than being discovered by
 	// a user who cannot log in.
 	Sessions Sessions
+
+	// Betting, Wagers and Pricer are the phase 8 write and read surface, and
+	// all three are REQUIRED. Unlike Sessions there is no argument for
+	// degrading here: an `api` that serves the catalogue and cannot take a bet
+	// is not a smaller version of this service, it is a different one, and the
+	// failure would be invisible because every read endpoint would stay green.
+	//
+	// Pricer must be THE SAME TicketPricer instance the placement service
+	// holds. Two pricers would make `/slip/quote` a polite fiction: a slip
+	// would quote at one number and place at another, and the difference would
+	// surface to the customer as a price move that never happened.
+	Betting Betting
+	Wagers  Wagers
+	Pricer  TicketPricer
+
+	// CashOutQuotes prices an early close, and is OPTIONAL for one reason: it
+	// needs devigged reference prices (betting.FairPrices), and a deployment
+	// whose pricer is not publishing them cannot quote a cash-out at all. When
+	// it is nil, `GET /wagers/{wagerId}/cashout` is not mounted and everything
+	// else serves normally.
+	//
+	// Wiring it over a service that has no fair-price source would be the worse
+	// shape: every call would answer 500, which is a mounted route that does
+	// nothing — the thing this package refuses to ship.
+	CashOutQuotes CashOutQuotes
+
+	// CashOuts EXECUTES an early close, and is OPTIONAL for a different and
+	// more structural reason: taking a cash-out is a state transition on a
+	// placed ticket, and every other transition belongs to internal/settlement,
+	// deliberately — a component that could both quote and take a cash-out
+	// could do both in one transaction at a price of its own choosing. When it
+	// is nil, `POST /wagers/{wagerId}/cashout` is not mounted and the quote on
+	// the same path still serves.
+	CashOuts CashOuts
+
+	// Signals, CLV and Leaderboard are the phase 9 analytics read surface, and
+	// all three are REQUIRED.
+	//
+	// Unlike Sessions and the two cash-out ports there is no adapter-availability
+	// question to degrade around: they read tables the same migration set that
+	// creates `events` and `prices` also creates, over the same pool, through
+	// the same generated queries. A deployment could not have one of these
+	// without the others and could not have the board without all three.
+	//
+	// Making them required is also what stops the analytics surface going dark
+	// by omission. CLAUDE.md §6 calls analytics "the differentiator"; a wire-up
+	// that forgot one of these ports would serve a complete-looking product
+	// whose most distinctive feature answered 404, and nothing in the logs or
+	// the tests would say why. A startup error is the loud version of that.
+	Signals     Signals
+	CLV         CLV
+	Leaderboard Leaderboard
 
 	// Cache is the optional Redis snapshot in front of Prices. nil disables it
 	// and every read goes to Postgres, which is correct — just slower.
@@ -125,6 +197,24 @@ func NewAPI(opts APIOptions) (*API, error) {
 	if opts.Limits == nil {
 		missing = append(missing, "Limits")
 	}
+	if opts.Betting == nil {
+		missing = append(missing, "Betting")
+	}
+	if opts.Wagers == nil {
+		missing = append(missing, "Wagers")
+	}
+	if opts.Pricer == nil {
+		missing = append(missing, "Pricer")
+	}
+	if opts.Signals == nil {
+		missing = append(missing, "Signals")
+	}
+	if opts.CLV == nil {
+		missing = append(missing, "CLV")
+	}
+	if opts.Leaderboard == nil {
+		missing = append(missing, "Leaderboard")
+	}
 	if len(opts.RequireAuth) == 0 {
 		// Not a nil check with a default: a default here would make every
 		// account route public the moment a caller forgot the field.
@@ -152,6 +242,20 @@ func NewAPI(opts APIOptions) (*API, error) {
 		opts.Logger.Warn("audit sink is nil: state-changing actions will not be recorded",
 			slog.String("requirement", "CLAUDE.md §6 platform: audit log on every state-changing action"))
 	}
+	if opts.CashOutQuotes == nil {
+		opts.Logger.Warn("no cash-out pricer: the cash-out quote route is not mounted",
+			slog.String("unmounted", "GET /v1/wagers/{wagerId}/cashout"),
+			slog.String("needs", "a betting.FairPrices source — devigged reference prices "+
+				"from internal/pricing, per ADR 0006"),
+			slog.String("effect", "placement, history and the wager detail page are unaffected"))
+	}
+	if opts.CashOuts == nil {
+		opts.Logger.Warn("no cash-out executor: the take-cash-out route is not mounted",
+			slog.String("unmounted", "POST /v1/wagers/{wagerId}/cashout"),
+			slog.String("why", "settling a ticket early is a state transition and belongs with "+
+				"the other transitions in internal/settlement"),
+			slog.String("effect", "that path answers the spec's own 404; nothing is fabricated"))
+	}
 	if opts.Sessions == nil {
 		opts.Logger.Warn("no session adapter: the auth and TOTP routes are not mounted",
 			slog.String("unmounted", "POST /v1/auth/{register,login,refresh,logout}, /v1/account/totp*"),
@@ -167,6 +271,16 @@ func NewAPI(opts APIOptions) (*API, error) {
 		limits:    opts.Limits,
 		sessions:  opts.Sessions,
 		audit:     opts.Audit,
+
+		betting:       opts.Betting,
+		wagers:        opts.Wagers,
+		pricer:        opts.Pricer,
+		cashOutQuotes: opts.CashOutQuotes,
+		cashOuts:      opts.CashOuts,
+
+		signals:     opts.Signals,
+		clv:         opts.CLV,
+		leaderboard: opts.Leaderboard,
 
 		requireAuth: slices.Clone(opts.RequireAuth),
 
@@ -210,13 +324,53 @@ func (a *API) Routes() []Route {
 		// History
 		{Method: http.MethodGet, Path: "/v1/selections/{selectionId}/history", Handler: http.HandlerFunc(a.handleHistory)},
 
+		// Signals and the leaderboard. Public and unauthenticated, like the
+		// board: they are derived from public odds, and the leaderboard names
+		// nobody — its rows carry a derived pseudonym rather than an account.
+		{Method: http.MethodGet, Path: "/v1/signals/ev", Handler: http.HandlerFunc(a.handleEVSignals)},
+		{Method: http.MethodGet, Path: "/v1/signals/arbitrage", Handler: http.HandlerFunc(a.handleArbitrageSignals)},
+		{Method: http.MethodGet, Path: "/v1/signals/steam", Handler: http.HandlerFunc(a.handleSteamSignals)},
+		{Method: http.MethodGet, Path: "/v1/leaderboard", Handler: http.HandlerFunc(a.handleLeaderboard)},
+
 		// Account. Every one carries the authentication middleware; there is no
 		// route below that resolves a user id from a path or a body, so a
 		// handler CANNOT act on a user other than the one the token names.
 		{Method: http.MethodGet, Path: "/v1/account", Handler: http.HandlerFunc(a.handleGetAccount), Middleware: authed},
 		{Method: http.MethodGet, Path: "/v1/account/balance", Handler: http.HandlerFunc(a.handleGetBalance), Middleware: authed},
+		{Method: http.MethodPost, Path: "/v1/account/grant", Handler: http.HandlerFunc(a.handleGrant), Middleware: authed},
+		{Method: http.MethodPost, Path: "/v1/account/self-exclusion", Handler: http.HandlerFunc(a.handleSelfExclude), Middleware: authed},
 		{Method: http.MethodGet, Path: "/v1/account/limits", Handler: http.HandlerFunc(a.handleListLimits), Middleware: authed},
 		{Method: http.MethodPost, Path: "/v1/account/limits", Handler: http.HandlerFunc(a.handleSetLimit), Middleware: authed},
+		{Method: http.MethodGet, Path: "/v1/account/clv", Handler: http.HandlerFunc(a.handleAccountCLV), Middleware: authed},
+
+		// Betting. Authenticated for the same reason the account routes are,
+		// and with the same property: no path parameter, query parameter or
+		// body field anywhere below names a user. `/wagers/{wagerId}` names a
+		// WAGER, which is the one identifier here that belongs to somebody —
+		// so the read that resolves it takes the caller's id and answers
+		// [ErrNotFound] for a ticket that is not theirs, indistinguishably
+		// from one that does not exist.
+		{Method: http.MethodPost, Path: "/v1/slip/quote", Handler: http.HandlerFunc(a.handleQuoteSlip), Middleware: authed},
+		{Method: http.MethodGet, Path: "/v1/wagers", Handler: http.HandlerFunc(a.handleListWagers), Middleware: authed},
+		{Method: http.MethodPost, Path: "/v1/wagers", Handler: http.HandlerFunc(a.handlePlaceWager), Middleware: authed},
+		{Method: http.MethodGet, Path: "/v1/wagers/{wagerId}", Handler: http.HandlerFunc(a.handleGetWager), Middleware: authed},
+	}
+
+	// The two cash-out routes are mounted per PORT rather than as a pair,
+	// because the two capabilities are genuinely independent: pricing an early
+	// close needs devigged reference prices, taking one needs the settlement
+	// write path, and a deployment can plausibly have either without the other.
+	if a.cashOutQuotes != nil {
+		routes = append(routes, Route{
+			Method: http.MethodGet, Path: "/v1/wagers/{wagerId}/cashout",
+			Handler: http.HandlerFunc(a.handleCashOutQuote), Middleware: authed,
+		})
+	}
+	if a.cashOuts != nil {
+		routes = append(routes, Route{
+			Method: http.MethodPost, Path: "/v1/wagers/{wagerId}/cashout",
+			Handler: http.HandlerFunc(a.handleTakeCashOut), Middleware: authed,
+		})
 	}
 
 	if a.sessions == nil {
@@ -239,6 +393,15 @@ func (a *API) Routes() []Route {
 		Route{Method: http.MethodDelete, Path: "/v1/account/totp", Handler: http.HandlerFunc(a.handleRemoveTOTP), Middleware: authed},
 	)
 }
+
+// HasCashOutQuotes and HasTakeCashOut report which of the optional betting
+// routes are mounted, so the composition root can log the shape it built rather
+// than leaving "why does cash-out 404" to be answered by reading the route
+// table.
+func (a *API) HasCashOutQuotes() bool { return a.cashOutQuotes != nil }
+
+// HasTakeCashOut reports whether POST /wagers/{wagerId}/cashout is mounted.
+func (a *API) HasTakeCashOut() bool { return a.cashOuts != nil }
 
 // HasSessions reports whether the session-dependent routes are mounted.
 //

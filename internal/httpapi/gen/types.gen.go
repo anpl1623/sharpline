@@ -97,20 +97,51 @@ func (e BookKind) Valid() bool {
 	}
 }
 
+// Defines values for DevigMethod.
+const (
+	DevigMethodAdditive       DevigMethod = "additive"
+	DevigMethodMultiplicative DevigMethod = "multiplicative"
+	DevigMethodPower          DevigMethod = "power"
+	DevigMethodShin           DevigMethod = "shin"
+)
+
+// Valid indicates whether the value is a known member of the DevigMethod enum.
+func (e DevigMethod) Valid() bool {
+	switch e {
+	case DevigMethodAdditive:
+		return true
+	case DevigMethodMultiplicative:
+		return true
+	case DevigMethodPower:
+		return true
+	case DevigMethodShin:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for ErrorCode.
 const (
 	ErrorCodeAccountNotActive   ErrorCode = "account_not_active"
 	ErrorCodeAlreadyExists      ErrorCode = "already_exists"
 	ErrorCodeBadRequest         ErrorCode = "bad_request"
+	ErrorCodeCashOutUnavailable ErrorCode = "cash_out_unavailable"
 	ErrorCodeConflict           ErrorCode = "conflict"
 	ErrorCodeForbidden          ErrorCode = "forbidden"
+	ErrorCodeInsufficientFunds  ErrorCode = "insufficient_funds"
 	ErrorCodeInternal           ErrorCode = "internal"
 	ErrorCodeInvalidCredentials ErrorCode = "invalid_credentials"
 	ErrorCodeInvalidCursor      ErrorCode = "invalid_cursor"
+	ErrorCodeInvalidGrantAmount ErrorCode = "invalid_grant_amount"
 	ErrorCodeInvalidParameter   ErrorCode = "invalid_parameter"
 	ErrorCodeInvalidTotpCode    ErrorCode = "invalid_totp_code"
+	ErrorCodeLimitExceeded      ErrorCode = "limit_exceeded"
+	ErrorCodeMarketUnavailable  ErrorCode = "market_unavailable"
 	ErrorCodeNotFound           ErrorCode = "not_found"
+	ErrorCodePriceMoved         ErrorCode = "price_moved"
 	ErrorCodeRateLimited        ErrorCode = "rate_limited"
+	ErrorCodeSelfExcluded       ErrorCode = "self_excluded"
 	ErrorCodeTotpRequired       ErrorCode = "totp_required"
 	ErrorCodeUnauthenticated    ErrorCode = "unauthenticated"
 	ErrorCodeUnprocessable      ErrorCode = "unprocessable"
@@ -125,9 +156,13 @@ func (e ErrorCode) Valid() bool {
 		return true
 	case ErrorCodeBadRequest:
 		return true
+	case ErrorCodeCashOutUnavailable:
+		return true
 	case ErrorCodeConflict:
 		return true
 	case ErrorCodeForbidden:
+		return true
+	case ErrorCodeInsufficientFunds:
 		return true
 	case ErrorCodeInternal:
 		return true
@@ -135,13 +170,23 @@ func (e ErrorCode) Valid() bool {
 		return true
 	case ErrorCodeInvalidCursor:
 		return true
+	case ErrorCodeInvalidGrantAmount:
+		return true
 	case ErrorCodeInvalidParameter:
 		return true
 	case ErrorCodeInvalidTotpCode:
 		return true
+	case ErrorCodeLimitExceeded:
+		return true
+	case ErrorCodeMarketUnavailable:
+		return true
 	case ErrorCodeNotFound:
 		return true
+	case ErrorCodePriceMoved:
+		return true
 	case ErrorCodeRateLimited:
+		return true
+	case ErrorCodeSelfExcluded:
 		return true
 	case ErrorCodeTotpRequired:
 		return true
@@ -235,6 +280,51 @@ func (e HistoryResolution) Valid() bool {
 	case N6h:
 		return true
 	case Raw:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for LeaderboardBasis.
+const (
+	Clv LeaderboardBasis = "clv"
+	Roi LeaderboardBasis = "roi"
+)
+
+// Valid indicates whether the value is a known member of the LeaderboardBasis enum.
+func (e LeaderboardBasis) Valid() bool {
+	switch e {
+	case Clv:
+		return true
+	case Roi:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for LegStatus.
+const (
+	LegStatusLost    LegStatus = "lost"
+	LegStatusPending LegStatus = "pending"
+	LegStatusPush    LegStatus = "push"
+	LegStatusVoid    LegStatus = "void"
+	LegStatusWon     LegStatus = "won"
+)
+
+// Valid indicates whether the value is a known member of the LegStatus enum.
+func (e LegStatus) Valid() bool {
+	switch e {
+	case LegStatusLost:
+		return true
+	case LegStatusPending:
+		return true
+	case LegStatusPush:
+		return true
+	case LegStatusVoid:
+		return true
+	case LegStatusWon:
 		return true
 	default:
 		return false
@@ -364,6 +454,69 @@ func (e OddsFormat) Valid() bool {
 	}
 }
 
+// Defines values for PriceMoveScope.
+const (
+	CashOut PriceMoveScope = "cash_out"
+	Leg     PriceMoveScope = "leg"
+	Ticket  PriceMoveScope = "ticket"
+)
+
+// Valid indicates whether the value is a known member of the PriceMoveScope enum.
+func (e PriceMoveScope) Valid() bool {
+	switch e {
+	case CashOut:
+		return true
+	case Leg:
+		return true
+	case Ticket:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for PriceMovement.
+const (
+	Lengthened PriceMovement = "lengthened"
+	Shortened  PriceMovement = "shortened"
+	Unchanged  PriceMovement = "unchanged"
+)
+
+// Valid indicates whether the value is a known member of the PriceMovement enum.
+func (e PriceMovement) Valid() bool {
+	switch e {
+	case Lengthened:
+		return true
+	case Shortened:
+		return true
+	case Unchanged:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for Rounding.
+const (
+	HalfAwayFromZero Rounding = "half_away_from_zero"
+	HalfToEven       Rounding = "half_to_even"
+	TowardZero       Rounding = "toward_zero"
+)
+
+// Valid indicates whether the value is a known member of the Rounding enum.
+func (e Rounding) Valid() bool {
+	switch e {
+	case HalfAwayFromZero:
+		return true
+	case HalfToEven:
+		return true
+	case TowardZero:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for SelectionRole.
 const (
 	SelectionRoleAway     SelectionRole = "away"
@@ -394,6 +547,21 @@ func (e SelectionRole) Valid() bool {
 	}
 }
 
+// Defines values for SelfExclusionRequestConfirm.
+const (
+	SelfExclude SelfExclusionRequestConfirm = "self_exclude"
+)
+
+// Valid indicates whether the value is a known member of the SelfExclusionRequestConfirm enum.
+func (e SelfExclusionRequestConfirm) Valid() bool {
+	switch e {
+	case SelfExclude:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for SessionResponseTokenType.
 const (
 	Bearer SessionResponseTokenType = "Bearer"
@@ -403,6 +571,135 @@ const (
 func (e SessionResponseTokenType) Valid() bool {
 	switch e {
 	case Bearer:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for SlipImpedimentCode.
+const (
+	SlipImpedimentCodeAccountNotActive  SlipImpedimentCode = "account_not_active"
+	SlipImpedimentCodeInsufficientFunds SlipImpedimentCode = "insufficient_funds"
+	SlipImpedimentCodeMarketUnavailable SlipImpedimentCode = "market_unavailable"
+	SlipImpedimentCodePriceMoved        SlipImpedimentCode = "price_moved"
+	SlipImpedimentCodeSelfExcluded      SlipImpedimentCode = "self_excluded"
+)
+
+// Valid indicates whether the value is a known member of the SlipImpedimentCode enum.
+func (e SlipImpedimentCode) Valid() bool {
+	switch e {
+	case SlipImpedimentCodeAccountNotActive:
+		return true
+	case SlipImpedimentCodeInsufficientFunds:
+		return true
+	case SlipImpedimentCodeMarketUnavailable:
+		return true
+	case SlipImpedimentCodePriceMoved:
+		return true
+	case SlipImpedimentCodeSelfExcluded:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for SteamBasis.
+const (
+	SteamBasisAdditive       SteamBasis = "additive"
+	SteamBasisMultiplicative SteamBasis = "multiplicative"
+	SteamBasisNone           SteamBasis = "none"
+	SteamBasisPower          SteamBasis = "power"
+	SteamBasisShin           SteamBasis = "shin"
+)
+
+// Valid indicates whether the value is a known member of the SteamBasis enum.
+func (e SteamBasis) Valid() bool {
+	switch e {
+	case SteamBasisAdditive:
+		return true
+	case SteamBasisMultiplicative:
+		return true
+	case SteamBasisNone:
+		return true
+	case SteamBasisPower:
+		return true
+	case SteamBasisShin:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for SteamDirection.
+const (
+	Drift   SteamDirection = "drift"
+	Shorten SteamDirection = "shorten"
+)
+
+// Valid indicates whether the value is a known member of the SteamDirection enum.
+func (e SteamDirection) Valid() bool {
+	switch e {
+	case Drift:
+		return true
+	case Shorten:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for WagerKind.
+const (
+	Parlay     WagerKind = "parlay"
+	RoundRobin WagerKind = "round_robin"
+	Straight   WagerKind = "straight"
+	Teaser     WagerKind = "teaser"
+)
+
+// Valid indicates whether the value is a known member of the WagerKind enum.
+func (e WagerKind) Valid() bool {
+	switch e {
+	case Parlay:
+		return true
+	case RoundRobin:
+		return true
+	case Straight:
+		return true
+	case Teaser:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for WagerStatus.
+const (
+	WagerStatusCashedOut WagerStatus = "cashed_out"
+	WagerStatusLost      WagerStatus = "lost"
+	WagerStatusOpen      WagerStatus = "open"
+	WagerStatusPlaced    WagerStatus = "placed"
+	WagerStatusPush      WagerStatus = "push"
+	WagerStatusVoid      WagerStatus = "void"
+	WagerStatusWon       WagerStatus = "won"
+)
+
+// Valid indicates whether the value is a known member of the WagerStatus enum.
+func (e WagerStatus) Valid() bool {
+	switch e {
+	case WagerStatusCashedOut:
+		return true
+	case WagerStatusLost:
+		return true
+	case WagerStatusOpen:
+		return true
+	case WagerStatusPlaced:
+		return true
+	case WagerStatusPush:
+		return true
+	case WagerStatusVoid:
+		return true
+	case WagerStatusWon:
 		return true
 	default:
 		return false
@@ -475,6 +772,179 @@ type AccountBalanceAccountKind string
 
 // AccountStatus defines model for AccountStatus.
 type AccountStatus string
+
+// AnalyticsWindow The half-open window `[from, to)` an aggregate was computed over, echoed
+// because both bounds have defaults and a number without its window is not
+// interpretable.
+type AnalyticsWindow struct {
+	From time.Time `json:"from"`
+	To   time.Time `json:"to"`
+}
+
+// ArbitrageBounds The bounds THIS READ applied, echoed so a reader can see what was
+// filtered out rather than inferring it from an empty list. They are
+// applied on top of the bounds each finding already records.
+type ArbitrageBounds struct {
+	MaxLegAgeSeconds float64   `json:"max_leg_age_seconds"`
+	MaxSpreadSeconds float64   `json:"max_spread_seconds"`
+	MinDistinctBooks int32     `json:"min_distinct_books"`
+	MinReturnPercent float64   `json:"min_return_percent"`
+	ObservedAfter    time.Time `json:"observed_after"`
+}
+
+// ArbitrageLeg One side of an arbitrage, at one book.
+type ArbitrageLeg struct {
+	// AgeSeconds How old this leg's price was when the finding was written. Exposed
+	// per leg, not just as the maximum, because a two-leg arbitrage where
+	// one side is fresh and the other is 90 seconds old is one book that
+	// has not moved yet, and that is visible here and nowhere else.
+	AgeSeconds float64 `json:"age_seconds"`
+
+	// BookId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	BookId EntityID `json:"book_id"`
+
+	// DecimalOdds Decimal odds -- the total return per unit staked, stake included. THE
+	// CANONICAL representation. American and fractional are derived and lossy.
+	//
+	//
+	// Example: 1.909
+	DecimalOdds DecimalOdds `json:"decimal_odds"`
+
+	// LegIndex Display order, which is the market's own selection order.
+	LegIndex int32 `json:"leg_index"`
+
+	// Line The line in the SELECTION's frame, unlike `ArbitrageSignal.line`.
+	Line       *float64  `json:"line,omitempty"`
+	ObservedAt time.Time `json:"observed_at"`
+
+	// Role Exactly `domain.SelectionRole`.
+	Role SelectionRole `json:"role"`
+
+	// SelectionId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	SelectionId EntityID `json:"selection_id"`
+
+	// StakeFraction This leg's share of the total outlay, the split that makes the
+	// return equal whichever selection wins. A FRACTION, not an amount --
+	// this API does not choose a bankroll.
+	StakeFraction float64 `json:"stake_fraction"`
+}
+
+// ArbitrageSignal defines model for ArbitrageSignal.
+type ArbitrageSignal struct {
+	DetectedAt time.Time `json:"detected_at"`
+
+	// DistinctBooks How many different books the legs came from. `1` is legal and is the
+	// STRONGER finding: a single under-round market has no execution risk
+	// from a second book moving between bets.
+	DistinctBooks int32 `json:"distinct_books"`
+
+	// Id The finding's identifier, a lowercase canonical UUID. Stable across
+	// a recompute of the same finding: the row is keyed by market, instant
+	// and a fingerprint of its legs, none of which is a clock reading of
+	// ours.
+	//
+	// Deliberately NOT `format: uuid`. That format makes oapi-codegen emit
+	// `openapi_types.UUID`, which drags github.com/oapi-codegen/runtime
+	// into a module whose serving path has no third-party dependency at
+	// all -- the same trade `EmailAddress` declines for the same reason.
+	// The pattern above is the validation, and the value is a string on
+	// the wire either way.
+	Id string `json:"id"`
+
+	// ImpliedSum The sum of the legs' implied probabilities. Strictly below 1 by
+	// construction -- that IS the arbitrage. Booking percentage, overround
+	// and vig are all single-operation functions of this number and are
+	// not repeated as separate fields.
+	ImpliedSum float64 `json:"implied_sum"`
+
+	// LeagueId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	LeagueId EntityID       `json:"league_id"`
+	Legs     []ArbitrageLeg `json:"legs"`
+
+	// Line The market's line in the HOME frame -- the market's own line, not a
+	// selection's. This is the one place on this surface where a line is
+	// not in the selection frame, because the signal is about the market
+	// and its legs are about the selections; each leg carries its own line
+	// in its own frame.
+	Line *float64 `json:"line,omitempty"`
+
+	// MarketId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	MarketId EntityID `json:"market_id"`
+
+	// MarketType Exactly `domain.MarketType`.
+	MarketType MarketType `json:"market_type"`
+
+	// MaxLegAgeSeconds The leg-age bound the DETECTOR applied. `oldest_leg_age_seconds` never exceeds it.
+	MaxLegAgeSeconds float64 `json:"max_leg_age_seconds"`
+
+	// MaxObservedSpreadSeconds The spread bound the DETECTOR applied. `observed_spread_seconds` never exceeds it.
+	MaxObservedSpreadSeconds float64 `json:"max_observed_spread_seconds"`
+
+	// ObservedAt The OLDEST leg's instant -- the earliest moment at which every leg
+	// in this finding had been observed, and therefore the moment the
+	// arbitrage can first be said to have existed. Not the newest and not
+	// a detection time.
+	ObservedAt time.Time `json:"observed_at"`
+
+	// ObservedSpreadSeconds The gap between the oldest and newest leg's observation. THE NUMBER
+	// THAT MATTERS MOST on this object: two prices observed 90 seconds
+	// apart were never simultaneously available, whatever their sum says.
+	ObservedSpreadSeconds float64 `json:"observed_spread_seconds"`
+
+	// OldestLegAgeSeconds How old the stalest leg was when the finding was written. May be
+	// negative, for the clock-skew reason `EVSignal.quote_age_seconds`
+	// gives.
+	OldestLegAgeSeconds float64 `json:"oldest_leg_age_seconds"`
+
+	// ReturnFraction `(1 - implied_sum) / implied_sum`: the guaranteed return per unit of total outlay.
+	ReturnFraction float64 `json:"return_fraction"`
+
+	// ReturnPercent `return_fraction` x 100. Derived here so every surface says the same number.
+	ReturnPercent float64 `json:"return_percent"`
+
+	// SelectionCount How many outcomes the market has. Equal to the number of legs.
+	SelectionCount int32 `json:"selection_count"`
+}
+
+// ArbitrageSignalList The live arbitrage set. `page.has_more` is always false and
+// `page.next_cursor` is always null: this list is bounded by its own
+// staleness rules rather than paged, and a cursor would page through a set
+// that no longer exists. The envelope is shared with every other list so a
+// client has one shape to handle.
+type ArbitrageSignalList struct {
+	AsOf time.Time `json:"as_of"`
+
+	// Bounds The bounds THIS READ applied, echoed so a reader can see what was
+	// filtered out rather than inferring it from an empty list. They are
+	// applied on top of the bounds each finding already records.
+	Bounds ArbitrageBounds   `json:"bounds"`
+	Data   []ArbitrageSignal `json:"data"`
+
+	// Page Keyset pagination. There is no total count and there will not be one:
+	// counting an unbounded, continuously-written set costs a full scan on
+	// every page and the number is stale before it is serialised.
+	Page PageInfo `json:"page"`
+}
 
 // BalanceResponse defines model for BalanceResponse.
 type BalanceResponse struct {
@@ -626,6 +1096,274 @@ type BookQuote struct {
 	Quotes    []SelectionQuote `json:"quotes"`
 }
 
+// CLVAggregate The summary over the window. Always present, even for a customer with no
+// history -- honest zeros rather than an absent object.
+type CLVAggregate struct {
+	// BeatCount How many counted rows beat the close. Reported so `mean` and `rate` can be checked against each other.
+	BeatCount int64 `json:"beat_count"`
+
+	// BeatRate `beat_count / counted`. Null when `counted` is zero.
+	BeatRate *float64 `json:"beat_rate,omitempty"`
+
+	// Counted The rows the means are over -- neither voided nor line-moved.
+	Counted           int64 `json:"counted"`
+	LineMovedExcluded int64 `json:"line_moved_excluded"`
+
+	// MeanPercentClv The unweighted mean of `percent_clv`. Null under the same condition.
+	MeanPercentClv *float64 `json:"mean_percent_clv,omitempty"`
+
+	// MeanProbabilityClv The UNWEIGHTED mean over the counted rows. Unweighted because CLV is
+	// a property of the price and not of the stake, and stake-weighting
+	// would let a bettor buy position by sizing up.
+	//
+	// NULL when `counted` is zero, and it must not be rendered as `0.00%`:
+	// "no measurable wagers" and "measured, and it averaged zero" are
+	// different facts.
+	MeanProbabilityClv *float64 `json:"mean_probability_clv,omitempty"`
+
+	// Samples Every row in the window, exclusions included.
+	Samples      int64 `json:"samples"`
+	VoidExcluded int64 `json:"void_excluded"`
+}
+
+// CLVEntry One graded leg scored against the market's close. Both prices are FAIR
+// (devigged) prices under the same `devig_method`; the raw quoted prices
+// are not comparable, because a book widening its margin would read as
+// value lost on a line that never moved.
+type CLVEntry struct {
+	// BeatClose `probability_clv > 1e-12`. A TIE IS NOT A BEAT. The band is
+	// `odds.CLVTieBand`; it exists because two devig implementations can
+	// differ in the last few bits, and it is ten orders of magnitude below
+	// the smallest real price increment, so it can never absorb a genuine
+	// one-tick move.
+	BeatClose bool `json:"beat_close"`
+
+	// ClosedAt The closing observation's instant. Never earlier than `taken_at` --
+	// a close that preceded the take is not a close and no row is written
+	// for it.
+	ClosedAt time.Time `json:"closed_at"`
+
+	// ClosingBookId The book whose closing market was used. Usually the sharp reference
+	// book, and deliberately allowed to differ from `taken_book_id` --
+	// that IS the standard construction. The closing snapshot is always
+	// one book's COMPLETE market, never a best-price mosaic, because
+	// devigging needs the whole outcome set.
+	ClosingBookId EntityID    `json:"closing_book_id"`
+	ClosingFair   Probability `json:"closing_fair"`
+	ClosingLine   *float64    `json:"closing_line,omitempty"`
+
+	// ClosingPrice `1 / closing_fair`.
+	ClosingPrice DecimalOdds `json:"closing_price"`
+
+	// DevigMethod ONE method, applied to both sides. Devigging the two sides
+	// differently would put the difference between two models into a
+	// number claiming to measure a line move.
+	DevigMethod DevigMethod `json:"devig_method"`
+	GradedAt    time.Time   `json:"graded_at"`
+
+	// LeagueId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	LeagueId EntityID `json:"league_id"`
+
+	// LegId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	LegId EntityID `json:"leg_id"`
+
+	// LegStatus Never `pending`: a leg with no result has no closing line value and
+	// no row here.
+	LegStatus LegStatus `json:"leg_status"`
+
+	// LineMoved The line differs between the take and the close. Such a row is SHOWN
+	// -- so a customer can see "you took -3, it closed -3.5" -- and is
+	// excluded from `aggregate` and from every leaderboard, because the
+	// two lines are answers to different questions and converting between
+	// them needs a model of game margins rather than arithmetic.
+	LineMoved bool `json:"line_moved"`
+
+	// Magnitude `abs(percent_clv)`. Size without direction, for sorting a display.
+	Magnitude float64 `json:"magnitude"`
+
+	// MarketId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	MarketId EntityID `json:"market_id"`
+
+	// MarketType Exactly `domain.MarketType`.
+	MarketType MarketType `json:"market_type"`
+
+	// PercentClv `taken_price / closing_price - 1`, times 100. The same comparison as `probability_clv` and always the same sign.
+	PercentClv float64 `json:"percent_clv"`
+
+	// ProbabilityClv `closing_fair - taken_fair`. Positive means the price taken was
+	// longer -- better -- than the close.
+	ProbabilityClv float64 `json:"probability_clv"`
+
+	// SelectionId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	SelectionId EntityID  `json:"selection_id"`
+	TakenAt     time.Time `json:"taken_at"`
+
+	// TakenBookId The book the wager was struck at.
+	TakenBookId EntityID    `json:"taken_book_id"`
+	TakenFair   Probability `json:"taken_fair"`
+	TakenLine   *float64    `json:"taken_line,omitempty"`
+
+	// TakenPrice `1 / taken_fair`. The FAIR price, not the price the customer was charged.
+	TakenPrice DecimalOdds `json:"taken_price"`
+
+	// Voided `leg_status == "void"`. A PUSH IS NOT VOID and is counted at full
+	// weight: it is a settlement outcome, not a data problem, and
+	// excluding it would make CLV depend on the scoreboard -- the exact
+	// dependency CLV exists to remove.
+	Voided bool `json:"voided"`
+
+	// WagerId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	WagerId EntityID `json:"wager_id"`
+}
+
+// CLVLeagueSummary The same summary cut by league -- what a customer is actually good at.
+// Only leagues with at least one countable row appear, so no mean here is
+// nullable. Ordered by `counted` descending, then by league, so the
+// leagues with real evidence come first and the order is stable.
+type CLVLeagueSummary struct {
+	BeatCount int64   `json:"beat_count"`
+	BeatRate  float64 `json:"beat_rate"`
+	Counted   int64   `json:"counted"`
+
+	// LeagueId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	LeagueId           EntityID `json:"league_id"`
+	MeanPercentClv     float64  `json:"mean_percent_clv"`
+	MeanProbabilityClv float64  `json:"mean_probability_clv"`
+}
+
+// CLVResponse defines model for CLVResponse.
+type CLVResponse struct {
+	// Aggregate The summary over the window. Always present, even for a customer with no
+	// history -- honest zeros rather than an absent object.
+	Aggregate CLVAggregate       `json:"aggregate"`
+	AsOf      time.Time          `json:"as_of"`
+	ByLeague  []CLVLeagueSummary `json:"by_league"`
+
+	// Data The graded legs, most recently graded first. INCLUDES line-moved and
+	// voided rows, which `aggregate` excludes -- this is the display path,
+	// and the flags are on every row so a client renders them distinctly.
+	Data []CLVEntry `json:"data"`
+
+	// Page Keyset pagination. There is no total count and there will not be one:
+	// counting an unbounded, continuously-written set costs a full scan on
+	// every page and the number is stale before it is serialised.
+	Page PageInfo `json:"page"`
+
+	// Window The half-open window `[from, to)` an aggregate was computed over, echoed
+	// because both bounds have defaults and a number without its window is not
+	// interpretable.
+	Window AnalyticsWindow `json:"window"`
+}
+
+// CashOutQuote What the book will pay to close this wager now, and what it is charging
+// to do so.
+//
+//	fair_value_minor = round(potential_payout_minor x survival_probability)
+//	value_minor      = round(fair_value_minor x (1 - margin_bps / 10000))
+//	margin_minor     = fair_value_minor - value_minor
+//
+// with the rounding taken from the ticket rather than chosen fresh.
+//
+// Both halves are reported because the point of pricing off the FAIR value
+// and subtracting a NAMED haircut -- rather than quoting off the offered
+// price, where the same take hides inside the vig -- is that "what did the
+// book charge me to close early" has an answer. Withholding `margin_minor`
+// would give the number back and keep none of the benefit.
+type CashOutQuote struct {
+	// FairValueMinor What the position is worth to hold, before the haircut. Not what is paid.
+	FairValueMinor MoneyMinor `json:"fair_value_minor"`
+
+	// MarginBps The book's take, in basis points. 500 is 5%. A named constant in the
+	// service, not a number derived from prices -- which is exactly what
+	// makes it auditable, reviewable and alertable.
+	MarginBps int32 `json:"margin_bps"`
+
+	// MarginMinor `fair_value_minor` - `value_minor`. The take, in cash.
+	MarginMinor MoneyMinor `json:"margin_minor"`
+
+	// NetReturnMinor `value_minor` - `stake_minor`. Negative when closing early crystallises a loss.
+	NetReturnMinor MoneyMinor `json:"net_return_minor"`
+
+	// PendingLegCount How many legs are still ungraded. Zero means every leg is decided and the ticket is waiting on settlement rather than on a game.
+	PendingLegCount int32 `json:"pending_leg_count"`
+
+	// PotentialPayoutMinor What the book owes if the ticket wins, frozen at placement.
+	PotentialPayoutMinor MoneyMinor `json:"potential_payout_minor"`
+
+	// QuotedAt The instant the quote was computed. There is deliberately no expiry
+	// beside it: an expiry would imply the book stands behind the number
+	// until then, and it does not. Whatever takes the cash-out re-prices
+	// while holding the wager row.
+	QuotedAt time.Time `json:"quoted_at"`
+
+	// StakeMinor An amount in MINOR UNITS (cents), as an integer. Never a float, never a
+	// string. The bound is 2^53-1, which is both the largest integer a float64
+	// holds exactly and JavaScript's `Number.MAX_SAFE_INTEGER`, and is the same
+	// bound the database CHECK constraints enforce -- so a JSON number is
+	// lossless for every value that can exist.
+	//
+	//
+	// Example: 250000
+	StakeMinor MoneyMinor `json:"stake_minor"`
+
+	// SurvivalProbability The product of the devigged fair probabilities of the legs still
+	// pending, times the graded multiplier of the legs already decided.
+	// Devigged against the sharp reference book (ADR 0006), never derived
+	// from the offered price.
+	SurvivalProbability float64 `json:"survival_probability"`
+
+	// ValueMinor What the customer receives. Strictly positive -- a non-positive value
+	// is not quoted at all, it is a `409`.
+	ValueMinor MoneyMinor `json:"value_minor"`
+
+	// WagerId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	WagerId EntityID `json:"wager_id"`
+}
+
+// CashOutRequest defines model for CashOutRequest.
+type CashOutRequest struct {
+	// AcceptedValueMinor The `value_minor` the customer was shown and agreed to. The service
+	// re-prices while holding the wager row and refuses with `409
+	// price_moved` if the number has changed. Echoing a freshly fetched
+	// quote instead of the displayed one defeats the control entirely.
+	AcceptedValueMinor MoneyMinor `json:"accepted_value_minor"`
+}
+
 // Competitor defines model for Competitor.
 type Competitor struct {
 	// Id A domain identifier. The charset is exactly `domain.validID`: `:` is
@@ -643,6 +1381,143 @@ type Competitor struct {
 //
 // Example: 1.909
 type DecimalOdds = float64
+
+// DevigMethod Exactly `odds.DevigMethod`. The four margin-removal models disagree
+// meaningfully on longshots, which is why every finding names the one that
+// produced its numbers rather than leaving it to be deployment knowledge.
+type DevigMethod string
+
+// EVSignal One offered price scored as positive expected value against the sharp
+// reference book. Every row in this schema has `expected_value > 0` by
+// construction -- a non-positive finding is not written.
+type EVSignal struct {
+	// BookId The book OFFERING the price.
+	BookId EntityID `json:"book_id"`
+
+	// DetectedAt When this system wrote the finding. Never an ordering key and never
+	// part of an identity: these rows are replayable, and a re-detection
+	// after a fix must land on the same row rather than creating a second
+	// one, so nothing that identifies a finding may be a reading of our
+	// own clock.
+	DetectedAt time.Time `json:"detected_at"`
+
+	// DevigMethod Exactly `odds.DevigMethod`. The four margin-removal models disagree
+	// meaningfully on longshots, which is why every finding names the one that
+	// produced its numbers rather than leaving it to be deployment knowledge.
+	DevigMethod DevigMethod `json:"devig_method"`
+
+	// Edge `fair_probability - offered_implied`: how much more likely the
+	// reference book thinks this is than the offered price implies. A
+	// probability difference, not a rate of return -- `expected_value` is
+	// the rate.
+	Edge        float64 `json:"edge"`
+	EdgePercent float64 `json:"edge_percent"`
+
+	// ExpectedValue Expected return per unit staked, as a fraction. NOT MONEY: there is
+	// no stake attached to this number and the endpoint does not choose
+	// one.
+	ExpectedValue float64 `json:"expected_value"`
+
+	// ExpectedValuePercent `expected_value` x 100. The value the list is ranked on.
+	ExpectedValuePercent float64 `json:"expected_value_percent"`
+
+	// FairDecimal `1 / fair_probability`. The price at which this bet would be exactly break-even.
+	FairDecimal DecimalOdds `json:"fair_decimal"`
+
+	// FairProbability The no-vig probability from the reference book, under `devig_method`.
+	FairProbability Probability `json:"fair_probability"`
+
+	// FractionalKelly `kelly` x `kelly_fraction`. Never greater than `kelly`.
+	FractionalKelly float64 `json:"fractional_kelly"`
+
+	// Kelly The full Kelly stake as a fraction of bankroll. A SIZING SUGGESTION
+	// under an assumed-correct probability, not advice and not a currency
+	// amount; full Kelly is famously too aggressive to bet, which is why
+	// the fractional figure travels beside it.
+	Kelly float64 `json:"kelly"`
+
+	// KellyFraction The multiplier the detector applied, carried so `fractional_kelly`
+	// is reproducible from `kelly` rather than being a number a reader has
+	// to take on trust.
+	KellyFraction float64 `json:"kelly_fraction"`
+
+	// LeagueId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	LeagueId EntityID `json:"league_id"`
+
+	// Line The handicap or total, in the SELECTION's frame -- inverted for an
+	// away spread, so it reads as the number a bettor on this selection
+	// took. Null on moneyline and futures.
+	Line *float64 `json:"line,omitempty"`
+
+	// MarketId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	MarketId EntityID `json:"market_id"`
+
+	// MarketType Exactly `domain.MarketType`.
+	MarketType MarketType `json:"market_type"`
+
+	// MaxQuoteAgeSeconds The staleness bound the detector applied.
+	MaxQuoteAgeSeconds float64 `json:"max_quote_age_seconds"`
+
+	// OfferedDecimal Decimal odds -- the total return per unit staked, stake included. THE
+	// CANONICAL representation. American and fractional are derived and lossy.
+	//
+	//
+	// Example: 1.909
+	OfferedDecimal DecimalOdds `json:"offered_decimal"`
+
+	// OfferedImplied `1 / offered_decimal`, WITH the offering book's margin still in it.
+	// Not a fair probability and must not be labelled as one.
+	OfferedImplied Probability `json:"offered_implied"`
+
+	// QuoteAgeSeconds How old the offered price already was when the finding was written.
+	// MAY BE NEGATIVE -- a provider clock ahead of ours stamps a quote in
+	// our future, and reporting that honestly beats clamping it and hiding
+	// clock skew.
+	QuoteAgeSeconds float64 `json:"quote_age_seconds"`
+
+	// QuoteObservedAt The provider's instant for the offered price.
+	QuoteObservedAt time.Time `json:"quote_observed_at"`
+
+	// ReferenceBookId The sharp book the fair value was devigged from (ADR 0006). May
+	// equal `book_id`, which means that book's own market is under-round.
+	ReferenceBookId EntityID `json:"reference_book_id"`
+
+	// SelectionId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	SelectionId EntityID `json:"selection_id"`
+
+	// ThresholdEvPercent The minimum expected value the detector was configured to emit when
+	// this row was written. `expected_value_percent` is always at least
+	// this. Distinct from the reader's `min_ev_percent`.
+	ThresholdEvPercent float64 `json:"threshold_ev_percent"`
+}
+
+// EVSignalPage defines model for EVSignalPage.
+type EVSignalPage struct {
+	// AsOf When this page was assembled. A client computes each finding's total
+	// staleness against this rather than against its own clock.
+	AsOf time.Time  `json:"as_of"`
+	Data []EVSignal `json:"data"`
+
+	// Page Keyset pagination. There is no total count and there will not be one:
+	// counting an unbounded, continuously-written set costs a full scan on
+	// every page and the number is stale before it is serialised.
+	Page PageInfo `json:"page"`
+}
 
 // EmailAddress An email address.
 //
@@ -690,6 +1565,17 @@ type Error struct {
 	Code          ErrorCode       `json:"code"`
 	InvalidParams *[]InvalidParam `json:"invalid_params,omitempty"`
 	Message       string          `json:"message"`
+
+	// PriceMoves Present only on `409 price_moved`, and the same device as
+	// `invalid_params`: one optional field on the ONE error shape rather
+	// than a second envelope, so a client still writes one decoder.
+	//
+	// It carries the number the customer was shown AND the number the
+	// service holds now, for every leg that moved. Both have to be here.
+	// Reporting only "something moved" would force the client to re-quote
+	// to find out what -- racing the next move, and showing the user a
+	// third number that was never the reason the request was refused.
+	PriceMoves *[]PriceMove `json:"price_moves,omitempty"`
 
 	// RequestId Correlates this response with the server log line and the trace span
 	// that produced it. Quote it in a bug report; it is the only handle on
@@ -765,6 +1651,45 @@ type GameClock struct {
 	ElapsedSeconds *int64 `json:"elapsed_seconds,omitempty"`
 	Period         *int32 `json:"period,omitempty"`
 	Running        bool   `json:"running"`
+}
+
+// GrantRequest A play-money top-up. There is no `transaction_id` field and there will
+// not be one: the identifier is derived from `(user, Idempotency-Key)`,
+// which is what makes a replay collide with its own primary key instead of
+// crediting twice.
+type GrantRequest struct {
+	// AmountMinor Minor units, and strictly positive. Zero is refused rather than
+	// accepted as a no-op: `ledger_entries` refuses a zero amount by CHECK,
+	// so a "successful" zero grant would report a transaction the database
+	// would have rejected.
+	//
+	// Bounded per request at 1000000 minor units. A customer wanting more
+	// submits again under a fresh key, bounded by their own `grant` limit
+	// while doing so.
+	AmountMinor MoneyMinor `json:"amount_minor"`
+}
+
+// GrantResponse The movement, and the balance it produced.
+type GrantResponse struct {
+	// AmountMinor What the transaction named here credited. On a replay this is what
+	// the ORIGINAL request credited, which need not be what this request
+	// asked for.
+	AmountMinor MoneyMinor `json:"amount_minor"`
+
+	// BalanceMinor The user's cash balance after the movement, folded over
+	// `ledger_entries` inside the transaction that wrote it. Derived, never
+	// stored.
+	BalanceMinor MoneyMinor `json:"balance_minor"`
+	OccurredAt   time.Time  `json:"occurred_at"`
+
+	// Replayed True when this key had already issued the grant and nothing was
+	// written. Not an error; the status line says the same thing.
+	Replayed bool `json:"replayed"`
+
+	// TransactionId The derived ledger transaction. Returned so a client whose request
+	// timed out can look the movement up rather than guess whether it
+	// landed.
+	TransactionId EntityID `json:"transaction_id"`
 }
 
 // HistoryPoint One point of a line-movement series. On `resolution: raw` every field but
@@ -854,6 +1779,100 @@ type InvalidParam struct {
 	Reason string `json:"reason"`
 }
 
+// LeaderboardBasis Which measure the board is ranked on. Deliberately NOT an option for
+// raw profit -- see the operation description.
+type LeaderboardBasis string
+
+// LeaderboardEntry defines model for LeaderboardEntry.
+type LeaderboardEntry struct {
+	BeatCount int64 `json:"beat_count"`
+
+	// BeatRate `beat_count / clv_samples`.
+	BeatRate float64 `json:"beat_rate"`
+
+	// ClvSamples Countable CLV legs -- neither voided nor line-moved. A customer with
+	// zero is ABSENT from this board rather than present with a zero.
+	ClvSamples int64 `json:"clv_samples"`
+
+	// MeanPercentClv The unweighted mean of `percent_clv`. What `basis: clv` ranks on.
+	MeanPercentClv float64 `json:"mean_percent_clv"`
+
+	// MeanProbabilityClv Unweighted mean over the countable legs. Unweighted so nobody buys position by sizing up.
+	MeanProbabilityClv float64 `json:"mean_probability_clv"`
+
+	// NetReturnMinor Net return across those wagers -- returns minus stakes, so it is
+	// negative for a losing customer. MONEY, and reported as the evidence
+	// behind `roi` rather than as anything the board is ranked on.
+	NetReturnMinor MoneyMinor `json:"net_return_minor"`
+
+	// Rank Position on THIS page under THIS basis, 1-based and dense. It is a
+	// rendering convenience computed from the returned order, not a stored
+	// fact, and it changes when `basis`, the window or the minimums change.
+	Rank int32 `json:"rank"`
+
+	// Roi `net_return_minor / staked_minor`. NOT MONEY -- a ratio. Being
+	// stake-normalised is exactly what stops a high-stake loser outranking
+	// a low-stake winner at any sample size, which is why this and not
+	// profit is the ranking.
+	Roi float64 `json:"roi"`
+
+	// RoiPercent `roi` x 100. Derived server-side so every surface says the same number.
+	RoiPercent float64 `json:"roi_percent"`
+
+	// SettledWagers Wagers in the window with a settled outcome: `won`, `lost`, `push`
+	// or `cashed_out`. `void` is excluded from this count AND from the
+	// money below -- it had no action.
+	SettledWagers int64 `json:"settled_wagers"`
+
+	// StakedMinor Total staked across those wagers. MONEY.
+	StakedMinor MoneyMinor `json:"staked_minor"`
+
+	// User A stable pseudonym derived one-way from the account identifier. This
+	// system stores no display name -- `users` holds an email address and
+	// nothing else -- so a real identity here would be a published email
+	// address. The same customer is the same handle on every refresh, and
+	// the account is not recoverable from it.
+	User string `json:"user"`
+}
+
+// LeaderboardMinimums The sample-size floors this board was filtered at, echoed beside the rows
+// so a reader can see the ranking is not one lucky bet.
+type LeaderboardMinimums struct {
+	ClvSamples    int64 `json:"clv_samples"`
+	SettledWagers int64 `json:"settled_wagers"`
+}
+
+// LeaderboardPage The ranked board. `page.has_more` is always false and `next_cursor` is
+// always null: a leaderboard is a top-N by construction, and paging to
+// rank 400 is not a thing anyone wants. The envelope is shared so a client
+// has one shape to handle.
+type LeaderboardPage struct {
+	AsOf time.Time `json:"as_of"`
+
+	// Basis Which measure the board is ranked on. Deliberately NOT an option for
+	// raw profit -- see the operation description.
+	Basis LeaderboardBasis `json:"basis"`
+
+	// Data The ranked customers. AN EMPTY ARRAY IS A CORRECT ANSWER and must
+	// render as a designed empty state: it means nobody has yet met the
+	// minimum sample size in this window. Nothing here is ever seeded.
+	Data []LeaderboardEntry `json:"data"`
+
+	// MinimumSamples The sample-size floors this board was filtered at, echoed beside the rows
+	// so a reader can see the ranking is not one lucky bet.
+	MinimumSamples LeaderboardMinimums `json:"minimum_samples"`
+
+	// Page Keyset pagination. There is no total count and there will not be one:
+	// counting an unbounded, continuously-written set costs a full scan on
+	// every page and the number is stale before it is serialised.
+	Page PageInfo `json:"page"`
+
+	// Window The half-open window `[from, to)` an aggregate was computed over, echoed
+	// because both bounds have defaults and a number without its window is not
+	// interpretable.
+	Window AnalyticsWindow `json:"window"`
+}
+
 // League defines model for League.
 type League struct {
 	// Id A domain identifier. The charset is exactly `domain.validID`: `:` is
@@ -886,6 +1905,11 @@ type LeaguePage struct {
 	// every page and the number is stale before it is serialised.
 	Page PageInfo `json:"page"`
 }
+
+// LegStatus Exactly `domain.LegStatus`. Legs grade independently and at different
+// times, because they are on different games -- so a running parlay may
+// legitimately show a mix of `won`, `lost` and `pending`.
+type LegStatus string
 
 // Limit defines model for Limit.
 type Limit struct {
@@ -1073,6 +2097,145 @@ type PageInfo struct {
 	NextCursor *string `json:"next_cursor,omitempty"`
 }
 
+// PlaceWagerRequest The same slip as `SlipQuoteRequest`, with `PlacementLeg` in place of
+// `SlipLeg` so a leg can carry an acceptance.
+//
+// There is no `wager_id` field and there will not be one. The identifier is
+// derived from `(user, Idempotency-Key)` by a stable hash, which is what
+// makes a replay collide with its own primary key instead of producing a
+// second ticket. A client-chosen id would let one client collide with
+// another's.
+//
+// There is no `rounding` field either -- see the note at the top of the
+// betting paths.
+type PlaceWagerRequest struct {
+	// AcceptBetterPrice Opt in to booking a LONGER price at an UNCHANGED line without a
+	// further round trip.
+	//
+	// Every real book takes an improvement without asking. This one does
+	// not unless asked, and the reason is narrow: "accept when the new
+	// price is longer" and "accept when the new price is shorter" are one
+	// comparison operator apart, and the difference between them is
+	// invisible in review and invisible in every test where the line does
+	// not move. So the concession is real, but it is explicit and it is on
+	// the slip, where a reader can see the customer asked for it -- which
+	// is also how books actually model it, as a setting rather than a
+	// silent policy.
+	//
+	// It NEVER covers a shorter price and NEVER covers a line move.
+	AcceptBetterPrice *bool `json:"accept_better_price,omitempty"`
+
+	// AcceptedTicketDecimal The re-quoted ticket price explicitly agreed to, in the same shape as a leg's `accepted_decimal`.
+	AcceptedTicketDecimal *TicketDecimalOdds `json:"accepted_ticket_decimal,omitempty"`
+
+	// Kind Exactly `domain.WagerKind`.
+	//
+	// A `round_robin` is not one bet. "A 3-team round robin by 2s" is three
+	// independent two-leg parlays -- AB, AC, BC -- each of which wins, loses
+	// and settles on its own, so placing one produces N tickets of this kind
+	// sharing a parent, and `Placement.wagers` carries all of them.
+	Kind            WagerKind      `json:"kind"`
+	Legs            []PlacementLeg `json:"legs"`
+	RoundRobinSizes *[]int32       `json:"round_robin_sizes,omitempty"`
+
+	// SeenTicketDecimal The whole-ticket price the customer was shown. REQUIRED in practice
+	// for a parlay and a teaser, where the ticket price is not any leg's
+	// price and the customer is quoted a separate number, and where
+	// omitting it would let the ticket be booked at a price nobody agreed
+	// to. Optional on a straight, where the ticket price must equal the
+	// single leg's anyway; supplying it there costs one comparison and
+	// catches a client computing the number itself. Never sent on a round
+	// robin.
+	SeenTicketDecimal *TicketDecimalOdds `json:"seen_ticket_decimal,omitempty"`
+
+	// StakeMinor An amount in MINOR UNITS (cents), as an integer. Never a float, never a
+	// string. The bound is 2^53-1, which is both the largest integer a float64
+	// holds exactly and JavaScript's `Number.MAX_SAFE_INTEGER`, and is the same
+	// bound the database CHECK constraints enforce -- so a JSON number is
+	// lossless for every value that can exist.
+	//
+	//
+	// Example: 250000
+	StakeMinor   MoneyMinor `json:"stake_minor"`
+	TeaserPoints *float64   `json:"teaser_points,omitempty"`
+}
+
+// Placement The result of a placement. `wagers` holds one ticket for a straight,
+// parlay or teaser, and every expanded combination for a round robin --
+// which is why this is an array rather than a single wager even in the
+// overwhelmingly common one-ticket case. A shape that changed with the kind
+// would make every client write the branch this array removes.
+type Placement struct {
+	// PotentialPayoutMinor TOTAL RETURN across every ticket if every selection wins, stake included.
+	PotentialPayoutMinor MoneyMinor `json:"potential_payout_minor"`
+
+	// PotentialProfitMinor `potential_payout_minor` - `total_stake_minor`.
+	PotentialProfitMinor MoneyMinor `json:"potential_profit_minor"`
+
+	// Replayed True when this `Idempotency-Key` had already placed and the tickets
+	// were read back rather than written. It is the same fact the `200`
+	// status carries, restated in the body so that a log line or a stored
+	// response records it without the status code beside it. It is NOT an
+	// error condition and should render exactly as a first placement.
+	Replayed bool `json:"replayed"`
+
+	// RoundRobin Present exactly when the tickets are of kind `round_robin`.
+	RoundRobin *RoundRobinTicketSet `json:"round_robin,omitempty"`
+
+	// TotalStakeMinor Summed across every ticket. What left the cash balance and now sits in escrow.
+	TotalStakeMinor MoneyMinor `json:"total_stake_minor"`
+	Wagers          []Wager    `json:"wagers"`
+}
+
+// PlacementLeg `SlipLeg` plus the accept-the-move fields, which mean nothing on a quote
+// and are therefore not on `SlipLeg`.
+type PlacementLeg struct {
+	// AcceptedDecimal The re-quoted price the customer has explicitly agreed to, set when
+	// resubmitting after a `409 price_moved`.
+	//
+	// It is a SEPARATE field from `seen_decimal` rather than an overwrite
+	// of it, and that is the design: overwriting would make "the customer
+	// accepted a move" indistinguishable from "the customer never saw
+	// one", so a client that simply echoed back whatever the server last
+	// said would silently opt every user into every future move.
+	//
+	// It must match the CURRENT quote, not the one that prompted it. An
+	// acceptance of a price that has itself since moved is refused again,
+	// with the newer numbers.
+	AcceptedDecimal *DecimalOdds `json:"accepted_decimal,omitempty"`
+
+	// AcceptedLine The re-quoted line agreed to, alongside `accepted_decimal`. Naming
+	// the line as well as the price is what makes an acceptance meaningful
+	// across a line move: "yes, book me at 1.95" is not consent to a
+	// different handicap, and a book that read it as consent would be
+	// moving the customer's bet.
+	AcceptedLine *float64 `json:"accepted_line,omitempty"`
+
+	// BookId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	BookId EntityID `json:"book_id"`
+
+	// SeenDecimal Decimal odds -- the total return per unit staked, stake included. THE
+	// CANONICAL representation. American and fractional are derived and lossy.
+	//
+	//
+	// Example: 1.909
+	SeenDecimal DecimalOdds `json:"seen_decimal"`
+	SeenLine    *float64    `json:"seen_line,omitempty"`
+
+	// SelectionId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	SelectionId EntityID `json:"selection_id"`
+}
+
 // Price defines model for Price.
 type Price struct {
 	// BookId A domain identifier. The charset is exactly `domain.validID`: `:` is
@@ -1115,6 +2278,70 @@ type Price struct {
 	ObservedAt time.Time `json:"observed_at"`
 }
 
+// PriceMove One number that changed between what the customer was shown and what the
+// service holds now.
+//
+// `scope` says which shape the rest of the object takes, so a client
+// switches once rather than sniffing for fields:
+//
+//	`leg`      `selection_id`, `book_id` and the decimal/line pair
+//	`ticket`   the decimal pair, describing the whole ticket's price
+//	`cash_out` the `*_value_minor` pair
+//
+// Carried on the `409 price_moved` envelope so the client renders the
+// change immediately. A client that had to re-quote to discover WHAT moved
+// would be racing the next move, and would show the user a third number
+// that was never the reason the request was refused.
+type PriceMove struct {
+	// Accepted True when the leg or ticket DID carry an acceptance and the accepted
+	// number is no longer current either -- the line moved twice while the
+	// customer was deciding. The two cases need different interfaces: the
+	// first shows a new number for the first time, the second says the
+	// number just agreed to is already gone.
+	Accepted *bool     `json:"accepted,omitempty"`
+	BookId   *EntityID `json:"book_id,omitempty"`
+
+	// CurrentDecimal The number the service holds now, and the one to send back as `accepted_decimal` to take it.
+	CurrentDecimal *float64 `json:"current_decimal,omitempty"`
+
+	// CurrentLine The line now, and the one to send back as `accepted_line`. A line move always needs an explicit acceptance, whatever the price did.
+	CurrentLine *float64 `json:"current_line,omitempty"`
+
+	// CurrentValueMinor On a cash-out, the value now, and the one to send back as `accepted_value_minor`.
+	CurrentValueMinor *MoneyMinor `json:"current_value_minor,omitempty"`
+
+	// Improved Whether the move is in the customer's favour: a LONGER price at an
+	// UNCHANGED line. It is false whenever the line moved at all, even if
+	// the price lengthened, because "better" is not defined across a line
+	// move -- which is precisely why this is reported separately from
+	// `movement` rather than derived from it by the client.
+	Improved *bool `json:"improved,omitempty"`
+
+	// Movement Named from the customer's side rather than as `up`/`down`, because "the
+	// odds went up" is ambiguous in exactly the direction that matters.
+	// `lengthened` pays MORE per unit staked than the customer saw;
+	// `shortened` pays less.
+	Movement PriceMovement  `json:"movement"`
+	Scope    PriceMoveScope `json:"scope"`
+
+	// SeenDecimal The number the customer saw, echoed from the request.
+	SeenDecimal *float64 `json:"seen_decimal,omitempty"`
+	SeenLine    *float64 `json:"seen_line,omitempty"`
+
+	// SeenValueMinor On a cash-out, the value the customer accepted.
+	SeenValueMinor *MoneyMinor `json:"seen_value_minor,omitempty"`
+	SelectionId    *EntityID   `json:"selection_id,omitempty"`
+}
+
+// PriceMoveScope defines model for PriceMove.Scope.
+type PriceMoveScope string
+
+// PriceMovement Named from the customer's side rather than as `up`/`down`, because "the
+// odds went up" is ambiguous in exactly the direction that matters.
+// `lengthened` pays MORE per unit staked than the customer saw;
+// `shortened` pays less.
+type PriceMovement string
+
 // Probability defines model for Probability.
 type Probability = float64
 
@@ -1137,6 +2364,43 @@ type RegisterRequest struct {
 	// never echoed.
 	Password string `json:"password"`
 }
+
+// RoundRobinTicketSet The parent of an expanded round robin. Its own selection set is NOT
+// reported here, because it is exactly the union of the tickets' legs and
+// a second copy could disagree with the tickets it supposedly generated --
+// and the copy, not the tickets, is the one nobody would notice was wrong.
+type RoundRobinTicketSet struct {
+	// CombinationCount Sum of C(n, k) over `sizes`. Equal to the length of `Placement.wagers`.
+	CombinationCount int32 `json:"combination_count"`
+
+	// Id A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	Id EntityID `json:"id"`
+
+	// SelectionCount The `n` in C(n, k).
+	SelectionCount int32 `json:"selection_count"`
+
+	// Sizes Ascending and de-duplicated -- the canonical order the domain stores.
+	Sizes []int32 `json:"sizes"`
+
+	// StakePerCombinationMinor The stake on EACH ticket, not the total.
+	StakePerCombinationMinor MoneyMinor `json:"stake_per_combination_minor"`
+}
+
+// Rounding Exactly `domain.Rounding`: the rule `stake x price` was collapsed under.
+//
+// It is REPORTED and never accepted. A caller who could choose the
+// rounding mode could choose the one that rounds their way, so this is
+// house policy applied server-side. It travels on every quote and every
+// wager because a later recomputation -- a partially-voided parlay
+// repriced at settlement -- must use the rule the ticket was written
+// under, and because it is what makes `potential_payout_minor`
+// reproducible from `stake_minor` and `decimal_odds`.
+type Rounding string
 
 // Score defines model for Score.
 type Score struct {
@@ -1247,6 +2511,25 @@ type SelectionQuote struct {
 // SelectionRole Exactly `domain.SelectionRole`.
 type SelectionRole string
 
+// SelfExclusionRequest A customer asking the system to stop them. There is no `status` field
+// and no `until` field: this endpoint means exactly one thing, and a
+// duration would be a cooling-off period wearing self-exclusion's name.
+type SelfExclusionRequest struct {
+	// Confirm Must be the literal string `self_exclude`. It exists so that this
+	// action cannot be taken by an empty body, a stray click on a
+	// mis-wired button, or a request assembled by a client that did not
+	// read what the endpoint does. A boolean would be weaker: `true` is
+	// what a checkbox sends by accident.
+	Confirm SelfExclusionRequestConfirm `json:"confirm"`
+}
+
+// SelfExclusionRequestConfirm Must be the literal string `self_exclude`. It exists so that this
+// action cannot be taken by an empty body, a stray click on a
+// mis-wired button, or a request assembled by a client that did not
+// read what the endpoint does. A boolean would be weaker: `true` is
+// what a checkbox sends by accident.
+type SelfExclusionRequestConfirm string
+
 // SessionResponse Returned by register, login and refresh. Both tokens are returned in the
 // BODY and never set as cookies: this API is consumed cross-origin through
 // a proxy by a Next.js client and by `pkg/client`, and a cookie-bearing
@@ -1300,6 +2583,280 @@ type SetLimitRequest struct {
 	Period LimitPeriod `json:"period"`
 }
 
+// SlipImpediment One reason the slip cannot be placed right now.
+//
+// Deliberately NOT the `Error` envelope: this is a `200` describing a
+// priced slip, and forcing the two shapes together would make a client
+// branch on "is this an error body or a quote body" for a response that is
+// always a quote. `code` is drawn from the same token vocabulary as
+// `Error.code`, so a client's code-to-message table is one table either
+// way.
+//
+// `limit_exceeded` is NOT in this enum. Evaluating a self-imposed limit is
+// a period-scoped sum over the ledger taken under the placement lock, and
+// a second evaluation on a read path would be a second answer to a
+// responsible-gaming control. `POST /wagers` is the only evaluator.
+type SlipImpediment struct {
+	Code SlipImpedimentCode `json:"code"`
+
+	// Message A fixed human-readable string from a closed set in Go, exactly as `Error.message` is.
+	Message string `json:"message"`
+
+	// SelectionId Set when the impediment belongs to one leg; null when it belongs to the whole slip.
+	SelectionId *EntityID `json:"selection_id,omitempty"`
+}
+
+// SlipImpedimentCode defines model for SlipImpediment.Code.
+type SlipImpedimentCode string
+
+// SlipLeg One selection on a slip, at one book, together with the quote the
+// customer had on screen.
+//
+// `seen_decimal` and `seen_line` are NOT the price that gets booked. They
+// are the left-hand side of a comparison and nothing else.
+type SlipLeg struct {
+	// BookId Which book's line the customer took. Required, not defaulted:
+	// "best price" is a rendering decision the client already made when it
+	// put a number on screen, and re-deriving it server-side could book a
+	// different book's line than the one that was clicked.
+	BookId EntityID `json:"book_id"`
+
+	// SeenDecimal The decimal price that was on screen. Decimal only -- American and fractional are display formats, converted at the edge and discarded.
+	SeenDecimal DecimalOdds `json:"seen_decimal"`
+
+	// SeenLine The line that was on screen, FROM THIS SELECTION'S OWN PERSPECTIVE
+	// -- already inverted for an away spread, exactly as the board
+	// rendered it. `null` on a moneyline or a futures market; a present
+	// `0.0` is a traded pick'em, which is a different fact from "no line".
+	//
+	// It is compared as strictly as the price is. A line move is a
+	// different bet, so it is never waved through.
+	SeenLine *float64 `json:"seen_line,omitempty"`
+
+	// SelectionId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	SelectionId EntityID `json:"selection_id"`
+}
+
+// SlipQuote defines model for SlipQuote.
+type SlipQuote struct {
+	AsOf time.Time `json:"as_of"`
+
+	// CashBalanceMinor The spendable balance the affordability check was made against,
+	// folded from the ledger at `as_of`. Reported so a client renders "you
+	// have X" beside "this costs Y" from ONE read rather than from two
+	// that can disagree.
+	CashBalanceMinor MoneyMinor `json:"cash_balance_minor"`
+
+	// DecimalOdds The ticket price as it stands now. NULL for a round robin, whose
+	// combinations are independent tickets at different prices: a single
+	// headline number there would be an average nobody is offered.
+	DecimalOdds *TicketDecimalOdds `json:"decimal_odds,omitempty"`
+
+	// Impediments Empty when `placeable` is true. Never null.
+	Impediments []SlipImpediment `json:"impediments"`
+
+	// IsSameGame True when every leg is on one event. Worth surfacing because a
+	// same-game ticket is priced with a correlation adjustment and is
+	// therefore NOT the product of its leg prices -- a client that
+	// multiplied the legs itself would get a different, larger number and
+	// would look right. This deployment refuses to price one at all rather
+	// than approximate it.
+	IsSameGame *bool `json:"is_same_game,omitempty"`
+
+	// Kind Exactly `domain.WagerKind`.
+	//
+	// A `round_robin` is not one bet. "A 3-team round robin by 2s" is three
+	// independent two-leg parlays -- AB, AC, BC -- each of which wins, loses
+	// and settles on its own, so placing one produces N tickets of this kind
+	// sharing a parent, and `Placement.wagers` carries all of them.
+	Kind WagerKind      `json:"kind"`
+	Legs []SlipQuoteLeg `json:"legs"`
+
+	// Placeable ADVISORY, and false exactly when `impediments` is non-empty. The
+	// balance and the market states behind it are read outside a
+	// transaction and can be stale by the time the user presses Place;
+	// `POST /wagers` re-evaluates all of it inside the placement
+	// transaction and is the only evaluation that decides anything.
+	Placeable bool `json:"placeable"`
+
+	// PotentialPayoutMinor TOTAL RETURN if every leg wins, STAKE INCLUDED. For a round robin,
+	// summed across every combination, since all of them win when all the
+	// selections do.
+	PotentialPayoutMinor MoneyMinor `json:"potential_payout_minor"`
+
+	// PotentialProfitMinor NET WINNINGS: `potential_payout_minor` - `total_stake_minor`.
+	PotentialProfitMinor MoneyMinor `json:"potential_profit_minor"`
+
+	// PriceMoved True when any leg's `movement` is not `unchanged`, any leg's line moved, or the ticket price moved.
+	PriceMoved bool `json:"price_moved"`
+
+	// Rounding Exactly `domain.Rounding`: the rule `stake x price` was collapsed under.
+	//
+	// It is REPORTED and never accepted. A caller who could choose the
+	// rounding mode could choose the one that rounds their way, so this is
+	// house policy applied server-side. It travels on every quote and every
+	// wager because a later recomputation -- a partially-voided parlay
+	// repriced at settlement -- must use the rule the ticket was written
+	// under, and because it is what makes `potential_payout_minor`
+	// reproducible from `stake_minor` and `decimal_odds`.
+	Rounding Rounding `json:"rounding"`
+
+	// SeenTicketDecimal Echoed from the request when it carried one.
+	SeenTicketDecimal *TicketDecimalOdds `json:"seen_ticket_decimal,omitempty"`
+
+	// StakeMinor The stake on ONE ticket, echoed from the request.
+	StakeMinor MoneyMinor `json:"stake_minor"`
+
+	// TicketCount 1 for a straight, parlay or teaser. For a round robin, the number of
+	// combinations its sizes expand to -- the sum of C(n, k) over them.
+	TicketCount int32 `json:"ticket_count"`
+
+	// TicketMovement `decimal_odds` against `seen_ticket_decimal`. Null when the request carried no seen ticket price.
+	TicketMovement *PriceMovement `json:"ticket_movement,omitempty"`
+
+	// TotalStakeMinor `stake_minor` x `ticket_count`. What the customer actually risks, and what the affordability check is made against.
+	TotalStakeMinor MoneyMinor `json:"total_stake_minor"`
+}
+
+// SlipQuoteLeg One leg of a priced slip: what the customer saw, what the market says
+// now, and whether it can still be taken.
+type SlipQuoteLeg struct {
+	// BookId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	BookId EntityID `json:"book_id"`
+
+	// BookSlug Example: nfl
+	BookSlug Slug `json:"book_slug"`
+
+	// CurrentDecimal The newest quote from this book on this selection.
+	CurrentDecimal DecimalOdds `json:"current_decimal"`
+
+	// CurrentDisplay `current_decimal` rendered in the requested `odds_format`. Null when
+	// the format is `decimal`, which is canonical and always present.
+	CurrentDisplay *string `json:"current_display,omitempty"`
+
+	// CurrentLine The line the current quote is made at, from this selection's own
+	// perspective. Null on a market that carries none; `0.0` is a real
+	// traded pick'em.
+	CurrentLine *float64 `json:"current_line,omitempty"`
+
+	// EventId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	EventId EntityID `json:"event_id"`
+
+	// EventStatus Exactly `domain.EventStatus`, same spelling, same members. The API does
+	// not get to invent a status the domain cannot represent, and the domain
+	// does not get to add one without changing this list.
+	EventStatus *EventStatus `json:"event_status,omitempty"`
+
+	// LineMoved Reported separately from `movement` because it is a different
+	// question. `movement` compares two prices; this compares two BETS. A
+	// spread of -4 loses games that -3.5 wins, so a leg whose line moved
+	// needs an explicit acceptance naming the new line even when the price
+	// improved.
+	LineMoved *bool `json:"line_moved,omitempty"`
+
+	// MarketId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	MarketId EntityID `json:"market_id"`
+
+	// MarketStatus Exactly `domain.MarketStatus`.
+	MarketStatus MarketStatus `json:"market_status"`
+
+	// MarketType Exactly `domain.MarketType`.
+	MarketType MarketType `json:"market_type"`
+
+	// Movement Named from the customer's side rather than as `up`/`down`, because "the
+	// odds went up" is ambiguous in exactly the direction that matters.
+	// `lengthened` pays MORE per unit staked than the customer saw;
+	// `shortened` pays less.
+	Movement PriceMovement `json:"movement"`
+
+	// ObservedAt The provider's instant for `current_decimal`, so the client computes staleness itself rather than trusting freshness by implication.
+	ObservedAt time.Time `json:"observed_at"`
+
+	// Role Exactly `domain.SelectionRole`.
+	Role SelectionRole `json:"role"`
+
+	// SeenDecimal Echoed from the request -- the number the customer saw.
+	SeenDecimal DecimalOdds `json:"seen_decimal"`
+
+	// SeenLine Echoed from the request.
+	SeenLine *float64 `json:"seen_line,omitempty"`
+
+	// SelectionId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	SelectionId EntityID `json:"selection_id"`
+
+	// Tradeable False when the market is suspended, closed or settled, when the event
+	// is no longer accepting wagers, or when the newest quote is older than
+	// the freshness window. One false leg makes the whole slip unplaceable.
+	Tradeable bool `json:"tradeable"`
+}
+
+// SlipQuoteRequest defines model for SlipQuoteRequest.
+type SlipQuoteRequest struct {
+	// Kind Exactly `domain.WagerKind`.
+	//
+	// A `round_robin` is not one bet. "A 3-team round robin by 2s" is three
+	// independent two-leg parlays -- AB, AC, BC -- each of which wins, loses
+	// and settles on its own, so placing one produces N tickets of this kind
+	// sharing a parent, and `Placement.wagers` carries all of them.
+	Kind WagerKind `json:"kind"`
+
+	// Legs `maxItems` is `domain.MaxWagerLegs`, which is also
+	// `odds.MaxParlayLegs` -- a longer ticket could not be priced either.
+	// A straight takes exactly one leg; a parlay, teaser or round robin
+	// takes at least two. A round robin additionally caps at
+	// `domain.MaxRoundRobinLegs` (10), because its ticket count is a
+	// binomial coefficient: at 20 selections it would be a million
+	// tickets, which is not a large bet, it is a denial of service against
+	// the settlement path.
+	Legs []SlipLeg `json:"legs"`
+
+	// RoundRobinSizes Present exactly on a round robin. `[2]` is "by 2s", `[2, 3]` is "by
+	// 2s and 3s". Each size is at least 2 and at most the leg count.
+	// Sorted and de-duplicated server-side, so `[3, 2, 3]` and `[2, 3]`
+	// describe the same round robin.
+	RoundRobinSizes *[]int32 `json:"round_robin_sizes,omitempty"`
+
+	// SeenTicketDecimal The whole-ticket price the customer was last shown, if any. Supplied
+	// only so the response can report ticket-level movement; a first quote
+	// omits it. Never meaningful on a round robin, whose combinations are
+	// separate tickets at separate prices.
+	SeenTicketDecimal *TicketDecimalOdds `json:"seen_ticket_decimal,omitempty"`
+
+	// StakeMinor Strictly positive. For a round robin this is the stake on EACH
+	// generated ticket, not the total -- see `total_stake_minor` in the
+	// response.
+	StakeMinor MoneyMinor `json:"stake_minor"`
+
+	// TeaserPoints Present exactly on a teaser and refused on every other kind. The
+	// points EVERY leg's line moves by, in the leg's own favour.
+	TeaserPoints *float64 `json:"teaser_points,omitempty"`
+}
+
 // Slug Example: nfl
 type Slug = string
 
@@ -1328,6 +2885,157 @@ type SportPage struct {
 	Page PageInfo `json:"page"`
 }
 
+// SteamBasis The margin treatment a steam detection was measured under. `none` --
+// raw implied probability, no devigging -- is legal and is the expected
+// value: a book's margin is very nearly constant across a window of
+// seconds, so devigging mostly subtracts the same constant from both ends
+// of a difference. The four other members are `odds.DevigMethod`.
+type SteamBasis string
+
+// SteamDirection Which way the selection's implied probability moved. `shorten` is a RISE
+// in probability (the price got shorter, amber in the reference client);
+// `drift` is a fall. It always agrees in sign with `delta_probability` and
+// with `velocity_probability_per_minute`, and it is carried as a word so
+// that direction is never conveyed by colour alone.
+type SteamDirection string
+
+// SteamFollower A book that followed the lead book inside the window. The follow LAG is
+// the finding: ordinary drift is uncorrelated across books, and a
+// correlated jump that the sharp book takes first and others repeat is
+// what distinguishes steam from noise.
+type SteamFollower struct {
+	// BookId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	BookId EntityID `json:"book_id"`
+
+	// DeltaProbability This book's own move, in implied probability points, same sign as the lead's.
+	DeltaProbability float64 `json:"delta_probability"`
+
+	// LagSeconds How long after `lead_moved_at` this book moved. Followers are ordered by this, ascending.
+	LagSeconds float64   `json:"lag_seconds"`
+	MovedAt    time.Time `json:"moved_at"`
+}
+
+// SteamSignal defines model for SteamSignal.
+type SteamSignal struct {
+	// CrossBookCorrelation How much the participating books moved together. THE FIELD THAT
+	// SEPARATES STEAM FROM DRIFT: ordinary movement is uncorrelated across
+	// books, so a large move with a low correlation is noise and is not
+	// steam however large it is.
+	CrossBookCorrelation float64 `json:"cross_book_correlation"`
+
+	// DeltaProbability The lead book's change in implied probability across the window, in
+	// PROBABILITY POINTS. Positive is a shortening price. Never zero.
+	DeltaProbability float64   `json:"delta_probability"`
+	DetectedAt       time.Time `json:"detected_at"`
+
+	// DevigMethod The margin treatment a steam detection was measured under. `none` --
+	// raw implied probability, no devigging -- is legal and is the expected
+	// value: a book's margin is very nearly constant across a window of
+	// seconds, so devigging mostly subtracts the same constant from both ends
+	// of a difference. The four other members are `odds.DevigMethod`.
+	DevigMethod SteamBasis `json:"devig_method"`
+
+	// Direction Which way the selection's implied probability moved. `shorten` is a RISE
+	// in probability (the price got shorter, amber in the reference client);
+	// `drift` is a fall. It always agrees in sign with `delta_probability` and
+	// with `velocity_probability_per_minute`, and it is carried as a word so
+	// that direction is never conveyed by colour alone.
+	Direction SteamDirection `json:"direction"`
+
+	// FollowerCount Equal to `followers.length`.
+	FollowerCount int32           `json:"follower_count"`
+	Followers     []SteamFollower `json:"followers"`
+
+	// HopSeconds The hop between consecutive windows. Never greater than
+	// `window_seconds` -- windows HOP rather than tumble, so a move
+	// straddling a boundary is still seen whole by some window.
+	HopSeconds float64 `json:"hop_seconds"`
+
+	// LeadBookId The book that moved first.
+	LeadBookId EntityID `json:"lead_book_id"`
+
+	// LeadMovedAt Inside `[window_start, window_end)`.
+	LeadMovedAt time.Time `json:"lead_moved_at"`
+
+	// LeagueId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	LeagueId EntityID `json:"league_id"`
+
+	// MagnitudeProbabilityPoints `abs(delta_probability)`. The filterable size of the move.
+	MagnitudeProbabilityPoints float64 `json:"magnitude_probability_points"`
+
+	// MarketId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	MarketId EntityID `json:"market_id"`
+
+	// MarketType Exactly `domain.MarketType`.
+	MarketType MarketType `json:"market_type"`
+
+	// MaxFollowerLagSeconds How long after the lead a book could still move and count as a
+	// follower. The synthetic provider's book view lag runs to about 90
+	// seconds, which is the scale this bound is set against.
+	MaxFollowerLagSeconds float64 `json:"max_follower_lag_seconds"`
+
+	// MinFollowers How many followers the detector required.
+	MinFollowers int32 `json:"min_followers"`
+
+	// ParticipatingBooks `follower_count + 1` -- the followers plus the lead.
+	ParticipatingBooks int32 `json:"participating_books"`
+
+	// SelectionId Steam is DIRECTIONAL and is keyed by selection as well as market.
+	// Keying by market alone would collapse the shortening side and the
+	// drifting side of the same move into one finding and lose half of
+	// them.
+	SelectionId EntityID `json:"selection_id"`
+
+	// ThresholdCorrelation The cross-book correlation floor the detector applied.
+	ThresholdCorrelation float64 `json:"threshold_correlation"`
+
+	// ThresholdMagnitude The magnitude floor the detector applied, in probability points.
+	ThresholdMagnitude float64 `json:"threshold_magnitude"`
+
+	// ThresholdVelocity The velocity floor the detector applied, in probability points per minute.
+	ThresholdVelocity float64 `json:"threshold_velocity"`
+
+	// VelocityProbabilityPerMinute Probability points per minute, signed to agree with
+	// `delta_probability`. Measured on implied PROBABILITY and never on
+	// decimal odds: decimal is non-linear in probability, so a fixed
+	// decimal threshold means a different thing at 1.50 than at 10.00.
+	VelocityProbabilityPerMinute float64 `json:"velocity_probability_per_minute"`
+
+	// WindowEnd The window is HALF-OPEN, `[window_start, window_end)`. This is the
+	// value the list is ordered and cursored on.
+	WindowEnd time.Time `json:"window_end"`
+
+	// WindowSeconds The window's width.
+	WindowSeconds float64   `json:"window_seconds"`
+	WindowStart   time.Time `json:"window_start"`
+}
+
+// SteamSignalPage defines model for SteamSignalPage.
+type SteamSignalPage struct {
+	AsOf time.Time     `json:"as_of"`
+	Data []SteamSignal `json:"data"`
+
+	// Page Keyset pagination. There is no total count and there will not be one:
+	// counting an unbounded, continuously-written set costs a full scan on
+	// every page and the number is stale before it is serialised.
+	Page PageInfo `json:"page"`
+}
+
 // TOTPCodeRequest defines model for TOTPCodeRequest.
 type TOTPCodeRequest struct {
 	// Code Compared in constant time against the expected code for the current and adjacent time steps.
@@ -1349,6 +3057,234 @@ type TOTPEnrolment struct {
 	ProvisioningUri string `json:"provisioning_uri"`
 }
 
+// TicketDecimalOdds The price of a whole TICKET -- total return per unit staked with every
+// leg winning.
+//
+// The upper bound is `domain.MaxWagerDecimal` (1e9) and NOT `DecimalOdds`'
+// 1e5. The difference is deliberate rather than sloppy: 1e5 bounds a single
+// quoted market price, while a 20-leg parlay of even-money legs is 2^20 =
+// 1.05e6 in decimal odds -- a perfectly ordinary ticket that the
+// market-price bound would wrongly reject.
+//
+// Example: 6.42
+type TicketDecimalOdds = float64
+
+// Wager One placed ticket.
+//
+// `decimal_odds`, `rounding` and `potential_payout_minor` are FROZEN AT
+// PLACEMENT and are never recomputed. A parlay's price is not always the
+// product of its legs -- same-game legs carry a correlation adjustment, a
+// teaser's price is a posted ladder that has nothing to do with the
+// underlying prices at all -- so re-deriving it later would produce a
+// different number than the customer was shown and accepted. "To win $X"
+// is a promise, and a promise recomputed later is not one.
+type Wager struct {
+	// DecimalOdds The ticket price the customer accepted.
+	DecimalOdds TicketDecimalOdds `json:"decimal_odds"`
+
+	// Display `decimal_odds` in the requested `odds_format`.
+	Display *string `json:"display,omitempty"`
+
+	// Id A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	Id EntityID `json:"id"`
+
+	// Kind Exactly `domain.WagerKind`.
+	//
+	// A `round_robin` is not one bet. "A 3-team round robin by 2s" is three
+	// independent two-leg parlays -- AB, AC, BC -- each of which wins, loses
+	// and settles on its own, so placing one produces N tickets of this kind
+	// sharing a parent, and `Placement.wagers` carries all of them.
+	Kind WagerKind  `json:"kind"`
+	Legs []WagerLeg `json:"legs"`
+
+	// NetReturnMinor `returned_minor` - `stake_minor`. NEGATIVE on a loser. Null while running.
+	NetReturnMinor *MoneyMinor `json:"net_return_minor,omitempty"`
+	PlacedAt       time.Time   `json:"placed_at"`
+
+	// PotentialPayoutMinor TOTAL RETURN if every leg wins, stake included.
+	PotentialPayoutMinor MoneyMinor `json:"potential_payout_minor"`
+
+	// PotentialProfitMinor NET WINNINGS: payout minus stake.
+	PotentialProfitMinor MoneyMinor `json:"potential_profit_minor"`
+
+	// ReturnedMinor What settlement actually paid back -- the ONLY authority on what the
+	// ticket returned. A partially-voided parlay returns less than
+	// `potential_payout_minor`, and a cash-out returns whatever price was
+	// taken. NULL exactly while the ticket is still running.
+	ReturnedMinor *MoneyMinor `json:"returned_minor,omitempty"`
+
+	// RoundRobinId Present exactly on a round-robin ticket, naming the parent the
+	// combination was expanded from. Every sibling ticket carries the same
+	// value and the same `stake_minor`.
+	RoundRobinId *EntityID `json:"round_robin_id,omitempty"`
+
+	// Rounding Exactly `domain.Rounding`: the rule `stake x price` was collapsed under.
+	//
+	// It is REPORTED and never accepted. A caller who could choose the
+	// rounding mode could choose the one that rounds their way, so this is
+	// house policy applied server-side. It travels on every quote and every
+	// wager because a later recomputation -- a partially-voided parlay
+	// repriced at settlement -- must use the rule the ticket was written
+	// under, and because it is what makes `potential_payout_minor`
+	// reproducible from `stake_minor` and `decimal_odds`.
+	Rounding Rounding `json:"rounding"`
+
+	// SettledAt `updated_at` once `status` is terminal, and null before then. It is
+	// not a separate stored field: a second copy of the same instant is a
+	// second thing to keep in agreement.
+	SettledAt *time.Time `json:"settled_at,omitempty"`
+
+	// StakeMinor An amount in MINOR UNITS (cents), as an integer. Never a float, never a
+	// string. The bound is 2^53-1, which is both the largest integer a float64
+	// holds exactly and JavaScript's `Number.MAX_SAFE_INTEGER`, and is the same
+	// bound the database CHECK constraints enforce -- so a JSON number is
+	// lossless for every value that can exist.
+	//
+	//
+	// Example: 250000
+	StakeMinor MoneyMinor `json:"stake_minor"`
+
+	// Status Exactly `domain.WagerStatus`. `placed` and `open` are running and hold
+	// escrow; the other five are terminal, and a terminal wager never
+	// transitions again.
+	//
+	// `void` and `push` both return the stake and are not the same fact:
+	// `void` is the book cancelling the bet, `push` is the bet being graded as
+	// a tie.
+	Status WagerStatus `json:"status"`
+
+	// TeaserPoints Present exactly on a teaser.
+	TeaserPoints *float64 `json:"teaser_points,omitempty"`
+
+	// UpdatedAt The instant of the most recent transition, from the acting service's
+	// clock -- not row bookkeeping. A redelivered settlement message
+	// re-applies the ORIGINAL instant rather than the wall clock.
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// WagerKind Exactly `domain.WagerKind`.
+//
+// A `round_robin` is not one bet. "A 3-team round robin by 2s" is three
+// independent two-leg parlays -- AB, AC, BC -- each of which wins, loses
+// and settles on its own, so placing one produces N tickets of this kind
+// sharing a parent, and `Placement.wagers` carries all of them.
+type WagerKind string
+
+// WagerLeg One selection on a placed ticket, holding THE PRICE AT PLACEMENT TIME.
+//
+// `book_id`, `decimal_odds`, `line` and `price_observed_at` are a copied
+// `domain.Price` VALUE, not a reference into the price series, and the
+// database freezes every one of them after insert. They describe what the
+// customer took; they do not track the market and no request can make them.
+//
+// `price_observed_at` is when the QUOTE was seen, not when the bet was
+// placed -- that is the wager's `placed_at`. Their difference is how stale
+// the price the customer took already was, which is the headline staleness
+// SLO's question asked about a settled ticket.
+type WagerLeg struct {
+	// BookId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	BookId EntityID `json:"book_id"`
+
+	// BookSlug Example: nfl
+	BookSlug Slug `json:"book_slug"`
+
+	// DecimalOdds The price AT PLACEMENT. Never re-resolved, never updated.
+	DecimalOdds DecimalOdds `json:"decimal_odds"`
+
+	// Display `decimal_odds` in the requested `odds_format`. Null when the format is `decimal`.
+	Display *string `json:"display,omitempty"`
+
+	// EventId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	EventId EntityID `json:"event_id"`
+
+	// GradedAt Set exactly when `status` is not `pending`. Per leg, because the legs of a parlay grade at different times.
+	GradedAt *time.Time `json:"graded_at,omitempty"`
+
+	// GradingLine The line this leg grades at: `teased_line` when present, otherwise `line`.
+	GradingLine *float64 `json:"grading_line,omitempty"`
+
+	// Id A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	Id EntityID `json:"id"`
+
+	// Line The line the price was quoted at, from this selection's own
+	// perspective. Null on a market with no line; `0.0` is a stored
+	// pick'em.
+	Line *float64 `json:"line,omitempty"`
+
+	// MarketId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	MarketId EntityID `json:"market_id"`
+
+	// MarketType Exactly `domain.MarketType`.
+	MarketType      MarketType `json:"market_type"`
+	PriceObservedAt time.Time  `json:"price_observed_at"`
+
+	// Role Exactly `domain.SelectionRole`.
+	Role SelectionRole `json:"role"`
+
+	// SelectionId A domain identifier. The charset is exactly `domain.validID`: `:` is
+	// excluded because WebSocket channels are `event:{id}` and a colon inside
+	// an identifier would make splitting a channel name ambiguous.
+	//
+	//
+	// Example: evt_nfl_2026_w1_kc_buf
+	SelectionId EntityID `json:"selection_id"`
+
+	// Status Exactly `domain.LegStatus`. Legs grade independently and at different
+	// times, because they are on different games -- so a running parlay may
+	// legitimately show a mix of `won`, `lost` and `pending`.
+	Status LegStatus `json:"status"`
+
+	// TeasedLine The moved line a teaser leg actually grades at. The leg keeps the
+	// REAL price it was booked against beside it rather than forging a
+	// price at the moved line -- the book never traded there, and a forged
+	// quote would corrupt line history and destroy CLV.
+	TeasedLine *float64 `json:"teased_line,omitempty"`
+}
+
+// WagerPage defines model for WagerPage.
+type WagerPage struct {
+	Data []Wager `json:"data"`
+
+	// Page Keyset pagination. There is no total count and there will not be one:
+	// counting an unbounded, continuously-written set costs a full scan on
+	// every page and the number is stale before it is serialised.
+	Page PageInfo `json:"page"`
+}
+
+// WagerStatus Exactly `domain.WagerStatus`. `placed` and `open` are running and hold
+// escrow; the other five are terminal, and a terminal wager never
+// transitions again.
+//
+// `void` and `push` both return the stake and are not the same fact:
+// `void` is the book cancelling the bet, `push` is the bet being graded as
+// a tie.
+type WagerStatus string
+
 // BookFilter defines model for BookFilter.
 type BookFilter = []Slug
 
@@ -1362,6 +3298,12 @@ type Cursor = string
 // Example: evt_nfl_2026_w1_kc_buf
 type EventID = EntityID
 
+// IdempotencyKey defines model for IdempotencyKey.
+type IdempotencyKey = string
+
+// LeagueFilter Example: nfl
+type LeagueFilter = Slug
+
 // LeagueSlug Example: nfl
 type LeagueSlug = Slug
 
@@ -1371,6 +3313,9 @@ type LeagueSlug = Slug
 //
 // Example: evt_nfl_2026_w1_kc_buf
 type MarketID = EntityID
+
+// MarketTypeFilter defines model for MarketTypeFilter.
+type MarketTypeFilter = []MarketType
 
 // OddsFormatQuery defines model for OddsFormatQuery.
 type OddsFormatQuery = OddsFormat
@@ -1390,6 +3335,16 @@ type SportSlug = Slug
 
 // StartingBefore defines model for StartingBefore.
 type StartingBefore = time.Time
+
+// WagerID A domain identifier. The charset is exactly `domain.validID`: `:` is
+// excluded because WebSocket channels are `event:{id}` and a colon inside
+// an identifier would make splitting a channel name ambiguous.
+//
+// Example: evt_nfl_2026_w1_kc_buf
+type WagerID = EntityID
+
+// WagerStatusFilter defines model for WagerStatusFilter.
+type WagerStatusFilter = []WagerStatus
 
 // BadRequest THE ONE ERROR SHAPE. Every non-2xx response in this API has exactly this
 // body, so a client writes one decoder and one branch.
@@ -1487,6 +3442,55 @@ type Unauthorized = Error
 // are equally fixed.
 type UnprocessableEntity = Error
 
+// GetAccountCLVParams defines parameters for GetAccountCLV.
+type GetAccountCLVParams struct {
+	// GradedFrom Lower bound on `graded_at`, RFC 3339, half-open with `graded_to`.
+	// Defaults to 90 days before the request is served.
+	//
+	// There is no ceiling on how far back this may reach, unlike the
+	// signal feeds. `wager_leg_clv` is a plain table read through an index
+	// led by the customer's own id, so a wide window is one index range
+	// rather than a scan of every chunk in a hypertable.
+	GradedFrom *time.Time `form:"graded_from,omitempty" json:"graded_from,omitempty"`
+
+	// GradedTo Upper bound on `graded_at`, exclusive. Defaults to the instant the
+	// request is served. It bounds `aggregate` and `by_league`; the paged
+	// `data` rows are bounded below only, because a cursor already names
+	// where the page ends.
+	GradedTo *time.Time `form:"graded_to,omitempty" json:"graded_to,omitempty"`
+
+	// Limit Maximum rows in this page.
+	Limit *PageLimit `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Cursor Opaque continuation token from a previous response's `page.next_cursor`.
+	// Do not construct or parse one. A cursor is bound to the ordering and the
+	// filters it was minted under and is rejected `400` if presented with
+	// different ones.
+	Cursor *Cursor `form:"cursor,omitempty" json:"cursor,omitempty"`
+}
+
+// GrantPlayMoneyParams defines parameters for GrantPlayMoney.
+type GrantPlayMoneyParams struct {
+	// IdempotencyKey A client-chosen key that makes a retry safe. REQUIRED on every operation
+	// that moves money, and refused rather than defaulted: without a key the
+	// resource identifier cannot be derived, so a retried submit -- which the
+	// network produces eventually whether the client meant it or not -- books a
+	// second bet. An endpoint that accepted a request with no key would have an
+	// at-least-once money path.
+	//
+	// The identifier is derived deterministically from `(user, this key)`, so a
+	// replayed submit collides with the primary key it already wrote and the
+	// service answers with the EXISTING resource instead of creating a second
+	// one. That is a property of a unique index rather than of a lookup that
+	// could race, which is why a retry is safe even when the first attempt's
+	// response never reached the client.
+	//
+	// The key identifies the SUBMIT, not the body: reusing one with a different
+	// slip returns the ORIGINAL resource unchanged. Use a fresh key per
+	// intended action and reuse it across retries of that action.
+	IdempotencyKey IdempotencyKey `json:"Idempotency-Key"`
+}
+
 // GetBoardParams defines parameters for GetBoard.
 type GetBoardParams struct {
 	// StartingBefore Upper bound on `scheduled_start` (RFC 3339). Defaults to 24 hours from
@@ -1526,6 +3530,31 @@ type GetEventParams struct {
 	// that quietly returns nothing is the worst possible outcome for a price
 	// comparison.
 	Book *BookFilter `form:"book,omitempty" json:"book,omitempty"`
+}
+
+// GetLeaderboardParams defines parameters for GetLeaderboard.
+type GetLeaderboardParams struct {
+	// Basis Which measure to rank on. Both are on every row either way.
+	Basis *LeaderboardBasis `form:"basis,omitempty" json:"basis,omitempty"`
+
+	// MinSettledWagers Minimum settled wagers -- `won`, `lost`, `push` or `cashed_out` --
+	// inside the window for a customer to be ranked at all.
+	MinSettledWagers *int64 `form:"min_settled_wagers,omitempty" json:"min_settled_wagers,omitempty"`
+
+	// MinClvSamples Minimum COUNTABLE CLV legs -- neither voided nor line-moved -- inside
+	// the window for a customer to be ranked at all.
+	MinClvSamples *int64 `form:"min_clv_samples,omitempty" json:"min_clv_samples,omitempty"`
+
+	// From Lower bound on settlement and grading time, RFC 3339. Defaults to 90
+	// days before the request is served. The window is half-open,
+	// `[from, to)`.
+	From *time.Time `form:"from,omitempty" json:"from,omitempty"`
+
+	// To Upper bound, exclusive. Defaults to the instant the request is served.
+	To *time.Time `form:"to,omitempty" json:"to,omitempty"`
+
+	// Limit Maximum rows in this page.
+	Limit *PageLimit `form:"limit,omitempty" json:"limit,omitempty"`
 }
 
 // GetLeagueBoardParams defines parameters for GetLeagueBoard.
@@ -1613,8 +3642,229 @@ type GetSelectionHistoryParams struct {
 	OddsFormat *OddsFormatQuery `form:"odds_format,omitempty" json:"odds_format,omitempty"`
 }
 
+// ListArbitrageSignalsParams defines parameters for ListArbitrageSignals.
+type ListArbitrageSignalsParams struct {
+	// League Restrict findings to one league, by slug. Omitted means every league.
+	// An unknown slug is a `400` naming the parameter, not a silent empty
+	// result -- a typo that quietly returns nothing is indistinguishable from
+	// "there is nothing to report", which is the one answer an analytics
+	// surface must never fake.
+	//
+	// It is a query parameter here rather than a path segment (as it is on the
+	// board) because it composes with the other filters on the same operation
+	// instead of naming a different resource.
+	League *LeagueFilter `form:"league,omitempty" json:"league,omitempty"`
+
+	// MarketType Restrict findings to these market types. Repeatable, and the values
+	// union. Omitted means every type.
+	MarketType *MarketTypeFilter `form:"market_type,omitempty" json:"market_type,omitempty"`
+
+	// MinReturnPercent Only findings whose guaranteed return is at least this, in percent of total outlay.
+	MinReturnPercent *float64 `form:"min_return_percent,omitempty" json:"min_return_percent,omitempty"`
+
+	// MaxLegAgeSeconds Refuse a finding whose stalest leg was already older than this when
+	// the finding was written. Defaults to 120, which is
+	// `pricing.DefaultArbitrageConfig().MaxLegAge` -- the reader's default
+	// is the detector's own bound, so the default view is not silently
+	// narrower than what was detected.
+	MaxLegAgeSeconds *float64 `form:"max_leg_age_seconds,omitempty" json:"max_leg_age_seconds,omitempty"`
+
+	// MaxSpreadSeconds Refuse a finding assembled from legs observed more than this far
+	// apart. Defaults to 30, which is
+	// `pricing.DefaultArbitrageConfig().MaxLegSpread`.
+	MaxSpreadSeconds *float64 `form:"max_spread_seconds,omitempty" json:"max_spread_seconds,omitempty"`
+
+	// MinDistinctBooks Minimum number of distinct books across the legs. `1` (the default)
+	// admits the single-book under-round finding, which is the stronger
+	// one; `2` insists on genuine cross-book arbitrage.
+	MinDistinctBooks *int32 `form:"min_distinct_books,omitempty" json:"min_distinct_books,omitempty"`
+
+	// ObservedAfter Lower bound on `observed_at`, which is the OLDEST leg's instant, RFC
+	// 3339. Defaults to 15 minutes before the request is served and may
+	// not be earlier than 30 days before it -- the retention of the
+	// `signals.arb` topic.
+	ObservedAfter *time.Time `form:"observed_after,omitempty" json:"observed_after,omitempty"`
+
+	// Limit Maximum rows in this page.
+	Limit *PageLimit `form:"limit,omitempty" json:"limit,omitempty"`
+}
+
+// ListEVSignalsParams defines parameters for ListEVSignals.
+type ListEVSignalsParams struct {
+	// League Restrict findings to one league, by slug. Omitted means every league.
+	// An unknown slug is a `400` naming the parameter, not a silent empty
+	// result -- a typo that quietly returns nothing is indistinguishable from
+	// "there is nothing to report", which is the one answer an analytics
+	// surface must never fake.
+	//
+	// It is a query parameter here rather than a path segment (as it is on the
+	// board) because it composes with the other filters on the same operation
+	// instead of naming a different resource.
+	League *LeagueFilter `form:"league,omitempty" json:"league,omitempty"`
+
+	// Book Restrict prices to these books, by slug. Repeatable. Omitted means every
+	// book. An unknown slug is a `400`, not a silent empty result -- a typo
+	// that quietly returns nothing is the worst possible outcome for a price
+	// comparison.
+	Book *BookFilter `form:"book,omitempty" json:"book,omitempty"`
+
+	// MarketType Restrict findings to these market types. Repeatable, and the values
+	// union. Omitted means every type.
+	MarketType *MarketTypeFilter `form:"market_type,omitempty" json:"market_type,omitempty"`
+
+	// MinEvPercent Only findings at or above this expected value, in percent. Applied
+	// ON TOP of `threshold_ev_percent`, which is what the detector was
+	// configured to emit; asking for less than the detector emitted
+	// returns what it emitted and nothing more.
+	MinEvPercent *float64 `form:"min_ev_percent,omitempty" json:"min_ev_percent,omitempty"`
+
+	// ObservedAfter Lower bound on `quote_observed_at`, RFC 3339. Defaults to 6 hours
+	// before the request is served, and may not be earlier than 7 days
+	// before it.
+	//
+	// REQUIRED IN SUBSTANCE even though it has a default: `ev_signals` is
+	// a Timescale hypertable with no retention policy, so a read with no
+	// lower bound consults an index on every chunk that has ever existed.
+	// The 7 day ceiling is not arbitrary either -- it is the retention of
+	// the `signals.ev` Kafka topic, so the REST window and the replayable
+	// bus window are the same window.
+	ObservedAfter *time.Time `form:"observed_after,omitempty" json:"observed_after,omitempty"`
+
+	// Limit Maximum rows in this page.
+	Limit *PageLimit `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Cursor Opaque continuation token from a previous response's `page.next_cursor`.
+	// Do not construct or parse one. A cursor is bound to the ordering and the
+	// filters it was minted under and is rejected `400` if presented with
+	// different ones.
+	Cursor *Cursor `form:"cursor,omitempty" json:"cursor,omitempty"`
+}
+
+// ListSteamSignalsParams defines parameters for ListSteamSignals.
+type ListSteamSignalsParams struct {
+	// MarketType Restrict findings to these market types. Repeatable, and the values
+	// union. Omitted means every type.
+	MarketType *MarketTypeFilter `form:"market_type,omitempty" json:"market_type,omitempty"`
+
+	// MinMagnitude Only moves of at least this size, in IMPLIED PROBABILITY POINTS
+	// (0.02 is two points). Applied on top of `threshold_magnitude`.
+	MinMagnitude *float64 `form:"min_magnitude,omitempty" json:"min_magnitude,omitempty"`
+
+	// MinParticipatingBooks Minimum number of books that took part -- the lead book plus its
+	// followers. Two is the floor a correlated move can be defined at.
+	MinParticipatingBooks *int32 `form:"min_participating_books,omitempty" json:"min_participating_books,omitempty"`
+
+	// WindowEndAfter Lower bound on `window_end`, RFC 3339. Defaults to 2 hours before
+	// the request is served and may not be earlier than 30 days before it
+	// -- the retention of the `signals.steam` topic. `steam_signals` is a
+	// hypertable with no retention policy, so an unbounded read consults
+	// every chunk ever created.
+	WindowEndAfter *time.Time `form:"window_end_after,omitempty" json:"window_end_after,omitempty"`
+
+	// Limit Maximum rows in this page.
+	Limit *PageLimit `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Cursor Opaque continuation token from a previous response's `page.next_cursor`.
+	// Do not construct or parse one. A cursor is bound to the ordering and the
+	// filters it was minted under and is rejected `400` if presented with
+	// different ones.
+	Cursor *Cursor `form:"cursor,omitempty" json:"cursor,omitempty"`
+}
+
+// QuoteSlipParams defines parameters for QuoteSlip.
+type QuoteSlipParams struct {
+	// OddsFormat Adds a rendered `display` string to every price. `decimal_odds` is always
+	// present regardless, because it is the canonical value and the other two
+	// formats are lossy.
+	OddsFormat *OddsFormatQuery `form:"odds_format,omitempty" json:"odds_format,omitempty"`
+}
+
+// ListWagersParams defines parameters for ListWagers.
+type ListWagersParams struct {
+	// Status Restrict the page to these statuses. Repeatable, and the filter is a
+	// union -- `?status=placed&status=open` is "everything still running".
+	// Omitted means every status.
+	//
+	// The filter is applied to the page the server scanned, so a filtered page
+	// may be shorter than `limit` while `has_more` is still true. Follow
+	// `next_cursor` until `has_more` is false.
+	Status *WagerStatusFilter `form:"status,omitempty" json:"status,omitempty"`
+
+	// Limit Maximum rows in this page.
+	Limit *PageLimit `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Cursor Opaque continuation token from a previous response's `page.next_cursor`.
+	// Do not construct or parse one. A cursor is bound to the ordering and the
+	// filters it was minted under and is rejected `400` if presented with
+	// different ones.
+	Cursor *Cursor `form:"cursor,omitempty" json:"cursor,omitempty"`
+
+	// OddsFormat Adds a rendered `display` string to every price. `decimal_odds` is always
+	// present regardless, because it is the canonical value and the other two
+	// formats are lossy.
+	OddsFormat *OddsFormatQuery `form:"odds_format,omitempty" json:"odds_format,omitempty"`
+}
+
+// PlaceWagerParams defines parameters for PlaceWager.
+type PlaceWagerParams struct {
+	// IdempotencyKey A client-chosen key that makes a retry safe. REQUIRED on every operation
+	// that moves money, and refused rather than defaulted: without a key the
+	// resource identifier cannot be derived, so a retried submit -- which the
+	// network produces eventually whether the client meant it or not -- books a
+	// second bet. An endpoint that accepted a request with no key would have an
+	// at-least-once money path.
+	//
+	// The identifier is derived deterministically from `(user, this key)`, so a
+	// replayed submit collides with the primary key it already wrote and the
+	// service answers with the EXISTING resource instead of creating a second
+	// one. That is a property of a unique index rather than of a lookup that
+	// could race, which is why a retry is safe even when the first attempt's
+	// response never reached the client.
+	//
+	// The key identifies the SUBMIT, not the body: reusing one with a different
+	// slip returns the ORIGINAL resource unchanged. Use a fresh key per
+	// intended action and reuse it across retries of that action.
+	IdempotencyKey IdempotencyKey `json:"Idempotency-Key"`
+}
+
+// GetWagerParams defines parameters for GetWager.
+type GetWagerParams struct {
+	// OddsFormat Adds a rendered `display` string to every price. `decimal_odds` is always
+	// present regardless, because it is the canonical value and the other two
+	// formats are lossy.
+	OddsFormat *OddsFormatQuery `form:"odds_format,omitempty" json:"odds_format,omitempty"`
+}
+
+// TakeCashOutParams defines parameters for TakeCashOut.
+type TakeCashOutParams struct {
+	// IdempotencyKey A client-chosen key that makes a retry safe. REQUIRED on every operation
+	// that moves money, and refused rather than defaulted: without a key the
+	// resource identifier cannot be derived, so a retried submit -- which the
+	// network produces eventually whether the client meant it or not -- books a
+	// second bet. An endpoint that accepted a request with no key would have an
+	// at-least-once money path.
+	//
+	// The identifier is derived deterministically from `(user, this key)`, so a
+	// replayed submit collides with the primary key it already wrote and the
+	// service answers with the EXISTING resource instead of creating a second
+	// one. That is a property of a unique index rather than of a lookup that
+	// could race, which is why a retry is safe even when the first attempt's
+	// response never reached the client.
+	//
+	// The key identifies the SUBMIT, not the body: reusing one with a different
+	// slip returns the ORIGINAL resource unchanged. Use a fresh key per
+	// intended action and reuse it across retries of that action.
+	IdempotencyKey IdempotencyKey `json:"Idempotency-Key"`
+}
+
+// GrantPlayMoneyJSONRequestBody defines body for GrantPlayMoney for application/json ContentType.
+type GrantPlayMoneyJSONRequestBody = GrantRequest
+
 // SetLimitJSONRequestBody defines body for SetLimit for application/json ContentType.
 type SetLimitJSONRequestBody = SetLimitRequest
+
+// SelfExcludeJSONRequestBody defines body for SelfExclude for application/json ContentType.
+type SelfExcludeJSONRequestBody = SelfExclusionRequest
 
 // RemoveTOTPJSONRequestBody defines body for RemoveTOTP for application/json ContentType.
 type RemoveTOTPJSONRequestBody = TOTPCodeRequest
@@ -1633,3 +3883,12 @@ type RefreshSessionJSONRequestBody = RefreshRequest
 
 // RegisterJSONRequestBody defines body for Register for application/json ContentType.
 type RegisterJSONRequestBody = RegisterRequest
+
+// QuoteSlipJSONRequestBody defines body for QuoteSlip for application/json ContentType.
+type QuoteSlipJSONRequestBody = SlipQuoteRequest
+
+// PlaceWagerJSONRequestBody defines body for PlaceWager for application/json ContentType.
+type PlaceWagerJSONRequestBody = PlaceWagerRequest
+
+// TakeCashOutJSONRequestBody defines body for TakeCashOut for application/json ContentType.
+type TakeCashOutJSONRequestBody = CashOutRequest

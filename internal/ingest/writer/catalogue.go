@@ -42,6 +42,34 @@
 //	               A league's name changing is a correction, and last-writer-wins
 //	               is the right resolution for a correction.
 //
+//	UNTOUCHEDNESS  Those same four statements additionally carry a
+//	               `WHERE NOT EXISTS (... IS NOT DISTINCT FROM ...)` anti-join in
+//	               front of the ON CONFLICT, and it is a LOCKING guard rather than
+//	               a writing one. The distinctness guard above stops the write; it
+//	               does NOT stop the lock, because ON CONFLICT DO UPDATE takes an
+//	               exclusive row lock on the conflicting row BEFORE it evaluates
+//	               that WHERE and holds it to COMMIT. A row filtered out here never
+//	               reaches ON CONFLICT and is therefore never locked at all.
+//
+//	               This became load-bearing in phase 9. The signals stage inserts
+//	               ev_signals, whose foreign keys make Postgres take FOR KEY SHARE
+//	               on the very rows this function was locking exclusively — the
+//	               league, the two books, the selection — in referential-integrity
+//	               trigger order, which is not this function's FK order. Two
+//	               orders, two processes, and the cycle is a deadlock; before phase
+//	               9 nothing else wrote these parents, so none was reachable. The
+//	               observable symptom on a running stack was a line-history writer
+//	               silently dropping a few percent of its price batches while every
+//	               container reported healthy. FOR KEY SHARE is compatible with
+//	               itself, so once the steady state stops taking the exclusive
+//	               lock the cycle has no edge to close on.
+//
+//	               `events` and `markets` deliberately do NOT carry it: their
+//	               observed_at moves on every poll, so nothing would ever be
+//	               filtered and the anti-join would be a probe that always misses.
+//	               The rows they lock are the record's own event and market, which
+//	               no second transaction is competing for in a different order.
+//
 // # RETURNING (xmax = 0), and why the row count is not enough
 //
 // Each statement returns one boolean per row it touched: true if the row was
@@ -92,7 +120,11 @@ const (
 
 const upsertSport = `
 INSERT INTO sports (id, slug, name)
-VALUES ($1, $2, $3)
+SELECT $1, $2, $3
+ WHERE NOT EXISTS (
+       SELECT 1 FROM sports s
+        WHERE s.id = $1
+          AND (s.slug, s.name) IS NOT DISTINCT FROM ($2, $3))
 ON CONFLICT (id) DO UPDATE
    SET slug = excluded.slug,
        name = excluded.name
@@ -101,7 +133,11 @@ RETURNING (xmax = 0)`
 
 const upsertLeague = `
 INSERT INTO leagues (id, sport_id, slug, name)
-VALUES ($1, $2, $3, $4)
+SELECT $1, $2, $3, $4
+ WHERE NOT EXISTS (
+       SELECT 1 FROM leagues l
+        WHERE l.id = $1
+          AND (l.sport_id, l.slug, l.name) IS NOT DISTINCT FROM ($2, $3, $4))
 ON CONFLICT (id) DO UPDATE
    SET sport_id = excluded.sport_id,
        slug     = excluded.slug,
@@ -176,11 +212,21 @@ RETURNING (xmax = 0)`
 //
 // ON CONFLICT DO UPDATE and not DO NOTHING: a book's display name or its
 // reference flag legitimately changes, and a selection's name does (a provider
-// correcting a player's spelling). The distinctness guard makes the unchanged
-// case free.
+// correcting a player's spelling). The anti-join makes the unchanged case free —
+// free of the WRITE by the distinctness guard, and free of the LOCK by the
+// NOT EXISTS in front of it. See this file's header on why the second is not the
+// same claim as the first.
 const upsertBooks = `
 INSERT INTO books (id, slug, name, kind, is_reference)
-SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::boolean[])
+SELECT t.id, t.slug, t.name, t.kind, t.is_reference
+  FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::boolean[])
+       AS t(id, slug, name, kind, is_reference)
+ WHERE NOT EXISTS (
+       SELECT 1 FROM books b
+        WHERE b.id = t.id
+          AND (b.slug, b.name, b.kind, b.is_reference)
+              IS NOT DISTINCT FROM
+              (t.slug, t.name, t.kind, t.is_reference))
 ON CONFLICT (id) DO UPDATE
    SET slug         = excluded.slug,
        name         = excluded.name,
@@ -193,7 +239,15 @@ RETURNING (xmax = 0)`
 
 const upsertSelections = `
 INSERT INTO selections (id, market_id, market_type, role, name)
-SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[])
+SELECT t.id, t.market_id, t.market_type, t.role, t.name
+  FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[])
+       AS t(id, market_id, market_type, role, name)
+ WHERE NOT EXISTS (
+       SELECT 1 FROM selections s
+        WHERE s.id = t.id
+          AND (s.market_id, s.market_type, s.role, s.name)
+              IS NOT DISTINCT FROM
+              (t.market_id, t.market_type, t.role, t.name))
 ON CONFLICT (id) DO UPDATE
    SET market_id   = excluded.market_id,
        market_type = excluded.market_type,

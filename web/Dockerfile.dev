@@ -81,7 +81,25 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
 COPY --chown=node:node next.config.ts tsconfig.json postcss.config.mjs eslint.config.mjs ./
 COPY --chown=node:node src ./src
 
-RUN mkdir -p /app/.next /app/public && chown -R node:node /app
+# public/ is COPIED for the same reason src/ is, and its absence was a real
+# outage rather than a tidiness issue. `next/font/local` resolves
+# web/src/lib/fonts.ts's `../../public/fonts/ClashGrotesk-*.woff2` on the
+# SERVER, at compile time — so a missing public/ is not a broken image request
+# that degrades to a fallback face, it is a module that fails to resolve, and
+# every route that reaches the root layout answers 500. The container stays
+# unhealthy forever and the only evidence is a resolver error in `docker logs`.
+#
+# `mkdir -p /app/public` used to stand here alone. It created the directory and
+# left it EMPTY, which is worse than not creating it: Next was satisfied that
+# the path existed and failed one level deeper, at the font file.
+#
+# Bind-mounting it in compose.dev.yaml is NOT a substitute, for the reason the
+# comment above gives for src/ — the mount is the hot-reload path, and the COPY
+# is what lets this image run standalone with no mount at all (CI, `docker run`
+# on the image alone). Both are kept, exactly as they are for src/.
+COPY --chown=node:node public ./public
+
+RUN mkdir -p /app/.next && chown -R node:node /app
 
 USER node
 EXPOSE 3000
