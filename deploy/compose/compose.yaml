@@ -242,6 +242,13 @@ services:
     image: apache/kafka:latest@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
     restart: unless-stopped
     environment:
+      # The JVM defaults its max heap to 1/4 of HOST memory, which on the 958 MiB
+      # deploy VM is ~240 MiB claimed before the broker does any work, on top of
+      # metaspace and direct buffers. Capped explicitly, and Xms == Xmx so the
+      # heap is committed up front rather than grown under load on a box where
+      # growth means swapping. This broker holds a handful of low-volume topics;
+      # 192 MiB is generous for that and was verified against `docker stats`.
+      KAFKA_HEAP_OPTS: "-Xmx192m -Xms192m"
       KAFKA_NODE_ID: "1"
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093

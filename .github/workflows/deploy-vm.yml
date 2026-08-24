@@ -230,8 +230,12 @@ jobs:
             echo "==> Stopping the previous stack (named volumes preserved)..."
             sudo docker compose --env-file .env --env-file .env.deploy -f deploy/compose/compose.yaml down --remove-orphans || true
             
+            # --wait, because the topic convergence below talks to the broker and
+            # `up -d` returns as soon as containers are STARTED. Without it
+            # terraform dialled Kafka roughly three seconds in and got
+            # "connection refused", which then left its state half-written.
             echo "==> Starting persistent data plane (Postgres, Redis, Kafka)..."
-            sudo docker compose --env-file .env --env-file .env.deploy -f deploy/compose/compose.yaml up -d postgres redis kafka
+            sudo docker compose --env-file .env --env-file .env.deploy -f deploy/compose/compose.yaml up -d --wait --wait-timeout 180 postgres redis kafka
             
             # -T and </dev/null are both load-bearing, and their absence is why
             # every rollout before this one silently stopped HERE.
@@ -242,6 +246,82 @@ jobs:
             # ran, bash reached EOF, and the step exited 0. The deploy reported
             # success with only postgres, redis and kafka running and nothing
             # listening on :80.
+            # CONVERGE THE KAFKA TOPICS, between the data plane and the services.
+            #
+            # CLAUDE.md §9: topics are "created by Terraform, not by hand", and
+            # Kafka runs with auto-topic-creation OFF. `make up` runs `make topics`
+            # at exactly this point and its comment predicts what happens if you
+            # skip it: "a producer that starts before topics has converged fails
+            # every publish with UNKNOWN_TOPIC_OR_PARTITION while reporting itself
+            # healthy -- a stack that looks up and moves no data."
+            #
+            # This rollout skipped it, so the VM's broker had only
+            # __consumer_offsets. Every producer failed silently, and `stream`
+            # never became healthy because its hub cannot start without
+            # price.computed -- which left `proxy` stuck in Created behind its
+            # depends_on and the public site returning a Cloudflare 521.
+            #
+            # The official terraform image is used rather than the compose `tools`
+            # service, because `tools` is not published to a registry and building
+            # it on a 958 MiB shared-core VM is exactly the cost this rollout
+            # stopped paying when it switched to pulling. The DECLARATIONS are
+            # unchanged -- same .tf files, same module, and .terraform.lock.hcl
+            # pins the provider -- so this is the same convergence by a smaller
+            # runner, not a second source of truth.
+            echo "==> Converging Kafka topics (terraform)..."
+            tf() {
+              sudo docker run --rm --network sharpline \
+                -v "$PWD/deploy/terraform:/tf" -w /tf/envs/local \
+                hashicorp/terraform:1.15.8 "$@" < /dev/null
+            }
+            tf init -input=false -upgrade=false >/dev/null 2>&1 || tf init -input=false
+
+            # RECONCILE STATE WITH THE BROKER BEFORE APPLYING.
+            #
+            # kafka-data is a named volume and the rollout runs `down` WITHOUT -v,
+            # so topics outlive a deploy. Terraform's state is a file on this VM
+            # and does not always: a half-finished apply, a rebuilt VM or a manual
+            # recovery run can leave state empty while the broker still holds every
+            # topic. Terraform then plans to CREATE them and the broker answers
+            # "Topic with this name already exists" for ever -- which is exactly
+            # how this failed, three attempts in a row.
+            #
+            # Importing is the non-destructive reconciliation: it adopts what is
+            # already there instead of deleting it, so a compacted topic keeps its
+            # log rather than losing the snapshot that CLAUDE.md §3 relies on.
+            echo "==> Reconciling terraform state with the broker..."
+            in_state=$(tf state list 2>/dev/null || true)
+            for topic in $(sudo docker run --rm --network sharpline \
+                             apache/kafka:latest /opt/kafka/bin/kafka-topics.sh \
+                             --bootstrap-server kafka:9092 --list 2>/dev/null \
+                           | grep -E '^(odds\.|price\.|wager\.)' || true); do
+              addr="module.kafka_topics.kafka_topic.this[\"${topic}\"]"
+              if printf '%s\n' "$in_state" | grep -qF "$addr"; then
+                continue
+              fi
+              echo "    importing pre-existing topic ${topic}"
+              tf import -input=false "$addr" "$topic" >/dev/null 2>&1 \
+                || echo "    (import of ${topic} failed; apply will report it)"
+            done
+            # Retried: the broker can be slow to answer immediately after start on
+            # a shared-core instance, and a topic call that times out leaves the
+            # rest unconverged. terraform apply is idempotent, so a retry costs
+            # nothing and the third failure is a real one.
+            converged=0
+            for attempt in 1 2 3; do
+              if tf apply -input=false -auto-approve 2>&1 | tail -20; then
+                converged=1; break
+              fi
+              echo "    topic convergence attempt ${attempt} failed; retrying"
+              sleep 10
+            done
+            if [ "$converged" -ne 1 ]; then
+              echo "::error::Kafka topics did not converge. Every producer would fail"
+              echo "::error::with UNKNOWN_TOPIC_OR_PARTITION while reporting healthy,"
+              echo "::error::and stream's hub would never start. Refusing to continue."
+              exit 1
+            fi
+            
             echo "==> Running database schema migrations..."
             sudo docker compose --env-file .env --env-file .env.deploy -f deploy/compose/compose.yaml run --rm -T migrate < /dev/null
             
