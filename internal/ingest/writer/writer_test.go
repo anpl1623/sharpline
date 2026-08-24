@@ -607,6 +607,70 @@ func TestOutOfOrderCatalogueObservationIsDiscarded(t *testing.T) {
 	}
 }
 
+// TestALateQuoteCannotUnEndAFinishedEvent.
+//
+// The odds path and the results path write the same row from different clocks.
+// A quote observed after the final whistle is genuinely newer, so the
+// monotonicity guard lets it through — and this path has no result to state:
+// the normalizer can only emit `scheduled` or `live` and eventArgs sends NULL
+// scores on every record. Without the finality guard the late quote reverts the
+// contest to `live` and NULLs the score, leaving a settled-in-principle wager
+// with its stake in escrow and nothing left to grade it.
+func TestALateQuoteCannotUnEndAFinishedEvent(t *testing.T) {
+	db := openPool(t)
+	w, _ := newWriter(t, db)
+	m := newMarket(t)
+
+	// The event exists and is live, written by the odds path as normal.
+	m.eventStatus = domain.EventStatusLive
+	if err := handle(t, w, delivery(t, m.marketID, m.payload(), 1)); err != nil {
+		t.Fatalf("first observation: %v", err)
+	}
+
+	// The results poller records the outcome. This is the shape of
+	// UpsertEventResult in internal/platform/postgres/queries/results.sql —
+	// four columns, not sixteen — issued here directly so the test depends on
+	// the guard under examination and not on the poller's own wiring.
+	finalAt := m.eventObsAt().Add(2 * time.Hour)
+	if err := exec(t, db, `UPDATE events
+	                          SET status = $2, score_home = $3, score_away = $4, observed_at = $5
+	                        WHERE id = $1`,
+		string(m.eventID), domain.EventStatusEnded.String(), 101, 98, finalAt); err != nil {
+		t.Fatalf("record the result: %v", err)
+	}
+
+	// A quote observed AFTER the whistle. Monotonicity does not stop it: its
+	// instant is later than the result's.
+	m.marketObsAt = finalAt.Add(30 * time.Second)
+	m.quoteObsAt = m.marketObsAt
+	if err := handle(t, w, delivery(t, m.marketID, m.payload(), 2)); err != nil {
+		t.Fatalf("late observation: %v", err)
+	}
+
+	if got := scalar[string](t, db,
+		`SELECT status FROM events WHERE id = $1`, string(m.eventID)); got != domain.EventStatusEnded.String() {
+		t.Errorf("events.status = %q after a late quote, want %q — the odds path un-ended a finished "+
+			"contest, and every stake on it is now stranded in escrow", got, domain.EventStatusEnded)
+	}
+	if got := scalar[int32](t, db,
+		`SELECT score_home FROM events WHERE id = $1`, string(m.eventID)); got != 101 {
+		t.Errorf("events.score_home = %d after a late quote, want 101 — the odds path carries no score "+
+			"and overwrote the recorded one with NULL", got)
+	}
+	if got := scalar[int32](t, db,
+		`SELECT score_away FROM events WHERE id = $1`, string(m.eventID)); got != 98 {
+		t.Errorf("events.score_away = %d after a late quote, want 98", got)
+	}
+
+	// The QUOTES still land. Finality freezes the event row, not the line
+	// history: a price observed after the whistle is a real observation, and
+	// refusing it would lose the closing line CLV is measured against.
+	if got := len(pricesFor(t, db, m)); got != 8 {
+		t.Errorf("prices has %d rows, want 8 — the finality guard is on the event row only and must "+
+			"not discard a late record's quotes", got)
+	}
+}
+
 // -----------------------------------------------------------------------------
 // Tombstones
 // -----------------------------------------------------------------------------

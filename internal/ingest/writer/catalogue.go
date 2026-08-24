@@ -12,7 +12,7 @@
 // "Deliberately unseeded: ingest creates the synthetic row". The catalogue is a
 // projection of the stream, and these statements are the projection.
 //
-// # Two guards, and they answer different questions
+// # Four guards, and they answer different questions
 //
 //	DISTINCTNESS   Every statement's ON CONFLICT DO UPDATE carries
 //	               `WHERE (stored columns) IS DISTINCT FROM (excluded columns)`.
@@ -41,6 +41,41 @@
 //	               observation column and need none: nothing about them moves.
 //	               A league's name changing is a correction, and last-writer-wins
 //	               is the right resolution for a correction.
+//
+//	FINALITY       `events` additionally carries
+//	               `WHERE events.status NOT IN ('ended', 'settled', 'cancelled')`,
+//	               and monotonicity does not subsume it. The two guards order
+//	               different clocks: monotonicity compares this record against
+//	               the last record from the SAME path, while a result arrives on
+//	               a different path entirely — the results poller, whose write is
+//	               internal/platform/postgres/queries/results.sql. A quote
+//	               observed after the final whistle is genuinely newer, so
+//	               `excluded.observed_at >= events.observed_at` holds and lets it
+//	               through.
+//
+//	               What it would then write is the damage. This path has no
+//	               result to state — RawEvent carries no status or score field and
+//	               the normalizer can only emit `scheduled` or `live`, so
+//	               eventArgs sends NULL for score_home and score_away on every
+//	               record. Without this guard a late quote reverts a finished
+//	               contest to `live` and NULLs the score settlement grades from,
+//	               and it does so silently: the row is a legal event, every
+//	               container stays healthy, and the only symptom is a wager whose
+//	               stake sits in escrow with nothing left to settle it.
+//
+//	               Both guards are needed because either alone leaves a hole:
+//	               drop monotonicity and a replay rolls a live event back to
+//	               scheduled; drop finality and a live quote un-ends a finished
+//	               one. `markets` deliberately does NOT carry finality — a market
+//	               closes on its own status, which the provider does report, and
+//	               freezing markets when their event finalises would be a
+//	               different change with a different owner (nothing yet tombstones
+//	               an ended event's markets off odds.normalized).
+//
+//	               The status vocabulary is the results write's own, deliberately:
+//	               `postponed` is absent from both because a postponed event
+//	               returns to `scheduled` once a new time is known, so it is not
+//	               final and the odds path still has true things to say about it.
 //
 //	UNTOUCHEDNESS  Those same four statements additionally carry a
 //	               `WHERE NOT EXISTS (... IS NOT DISTINCT FROM ...)` anti-join in
@@ -174,6 +209,7 @@ ON CONFLICT (id) DO UPDATE
        score_away           = excluded.score_away,
        observed_at          = excluded.observed_at
  WHERE excluded.observed_at >= events.observed_at
+   AND events.status NOT IN ('ended', 'settled', 'cancelled')
    AND (events.league_id, events.kind, events.name,
         events.home_competitor_id, events.home_competitor_name,
         events.away_competitor_id, events.away_competitor_name,
