@@ -273,6 +273,18 @@ export DOCKER_SOCKET
 
 RYUK_DISABLED ?= false
 
+# The reaper image testcontainers-go spawns, pinned to what THIS version asks
+# for: internal/config/config.go's `ReaperDefaultImage`, currently
+# "testcontainers/ryuk:0.14.0" in v0.44.0. `make ryuk-warm` verifies that rather
+# than trusting this line, so a testcontainers bump that moves the tag fails
+# loudly instead of silently un-fixing the pull below.
+#
+# It is a TAG and not a digest, which is the one deliberate exception to
+# CLAUDE.md section 12's pinning rule: the tag is chosen by the library, not by
+# us, and pulling some other digest would leave the tag testcontainers actually
+# requests still unresolved and still pulled inside the 20s budget.
+RYUK_IMAGE ?= testcontainers/ryuk:0.14.0
+
 # GO_TEST_P caps how many package test BINARIES run at once. It is not a tuning
 # knob, it is a correctness one.
 #
@@ -467,6 +479,64 @@ doctor: ## Verify the one and only host dependency (the container runtime) is al
 # Failing here, with the path printed, is the whole point: the alternative is Docker
 # creating a directory at the missing bind source and testcontainers-go failing
 # several minutes later with an error that names neither the socket nor this file.
+.PHONY: ryuk-warm
+ryuk-warm: ## Pre-pull the testcontainers reaper so its spawn budget is not spent pulling
+# WHY THIS TARGET EXISTS
+#
+# testcontainers-go spawns one Ryuk reaper per test process and waits for it to
+# report ready. That wait is bounded by a backoff whose MaxElapsedTime is a
+# HARDCODED 20 SECONDS (reaper.go, `func (r *reaperSpawner) backoff()`), with no
+# environment variable and no option to raise it.
+#
+# On a warm machine the reaper starts in well under a second and the budget is
+# invisible. On a cold CI runner the image is not present, so the pull happens
+# INSIDE those 20 seconds, and the whole package dies with
+#
+#   reaper: from container "<id>": wait for reaper <id>: context deadline exceeded
+#
+# followed by every test in the package reporting "the shared database is
+# unavailable". It reads like a database fault and is a registry round trip.
+#
+# Pulling first moves the download out of the budget. This is NOT the same
+# failure the GO_TEST_P comment above describes -- that one is a thundering herd
+# racing on a reaper in "created", fixed by serialising the binaries; this one is
+# a single reaper that is simply not downloaded yet, and serialising does nothing
+# for it.
+#
+# Disabling the reaper would also "fix" it and is rejected for the reason
+# recorded above: Ryuk is the only thing that cleans up after a killed run, and
+# this project has already filled the Docker VM's disk once.
+	@if docker image inspect '$(RYUK_IMAGE)' >/dev/null 2>&1; then \
+	   printf 'OK  reaper image present: %s\n' '$(RYUK_IMAGE)'; \
+	 else \
+	   printf '==> pulling the testcontainers reaper (%s)\n' '$(RYUK_IMAGE)'; \
+	   docker pull -q '$(RYUK_IMAGE)' >/dev/null || { \
+	     printf 'FAIL  could not pull %s.\n' '$(RYUK_IMAGE)'; \
+	     printf '      Tests would still run, but each package pays the pull inside\n'; \
+	     printf '      the reaper spawn budget and may time out. Check registry access.\n'; \
+	     exit 1; \
+	   }; \
+	 fi
+
+.PHONY: verify-ryuk-image
+verify-ryuk-image: ## Fail if RYUK_IMAGE has drifted from what testcontainers-go asks for
+	@want=$$(docker run --rm -v $(GOMOD_VOLUME):/go/pkg $(GO_IMAGE) \
+	   sh -c "grep -rhoE '\"testcontainers/ryuk:[0-9.]+\"' \
+	     /go/pkg/mod/github.com/testcontainers/testcontainers-go@*/internal/config/config.go \
+	     2>/dev/null | tr -d '\"' | head -1"); \
+	 if [ -z "$$want" ]; then \
+	   printf 'SKIP  testcontainers-go is not in the module cache; run `make test` first.\n'; \
+	   exit 0; \
+	 fi; \
+	 if [ "$$want" != '$(RYUK_IMAGE)' ]; then \
+	   printf 'FAIL  RYUK_IMAGE is %s but testcontainers-go asks for %s.\n' '$(RYUK_IMAGE)' "$$want"; \
+	   printf '      The pre-pull is now warming an image nothing uses, so the 20s\n'; \
+	   printf '      reaper budget is back to including a registry pull on a cold runner.\n'; \
+	   printf '      Update RYUK_IMAGE in the Makefile to %s.\n' "$$want"; \
+	   exit 1; \
+	 fi; \
+	 printf 'OK  reaper image matches testcontainers-go: %s\n' "$$want"
+
 .PHONY: docker-socket
 docker-socket: ## Resolve and validate the Docker socket the test containers mount
 	@sock='$(DOCKER_SOCKET)'; \
@@ -973,7 +1043,7 @@ migrate-dry-run: build-tools ## Apply + roll back every migration on a THROWAWAY
 # $(PKG) stays a separate variable and stays LAST, so a package pattern in ARGS
 # would be a second pattern rather than a replacement -- pass PKG for that.
 .PHONY: test
-test: cache-init docker-socket ## Run the Go suite in a container (ARGS='-v -run X', PKG=./internal/...)
+test: cache-init docker-socket ryuk-warm ## Run the Go suite in a container (ARGS='-v -run X', PKG=./internal/...)
 	docker run --rm \
 	  $(DOCKER_GO_FLAGS) \
 	  $(DOCKER_TESTCONTAINERS_FLAGS) \
@@ -988,7 +1058,7 @@ test: cache-init docker-socket ## Run the Go suite in a container (ARGS='-v -run
 # the script makes the shell do the splitting, so any quoting the caller writes
 # survives intact. `go-test` is $0 and exists only to occupy that slot.
 .PHONY: test-race
-test-race: cache-init docker-socket ## Run the suite under the race detector (ARGS/PKG as above; needs CGO + a C toolchain)
+test-race: cache-init docker-socket ryuk-warm ## Run the suite under the race detector (ARGS/PKG as above; needs CGO + a C toolchain)
 	docker run --rm \
 	  $(DOCKER_GO_FLAGS) \
 	  $(DOCKER_TESTCONTAINERS_FLAGS) \
@@ -1108,7 +1178,7 @@ COVER_MAX_ODDS_UNCOVERED ?= 16
 COVER_ODDS_PKG           ?= github.com/anpl1623/sharpline/internal/domain/odds
 
 .PHONY: cover
-cover: cache-init docker-socket ## Coverage: per-package rollup + HTML, cross-package attribution via -coverpkg, gated
+cover: cache-init docker-socket ryuk-warm ## Coverage: per-package rollup + HTML, cross-package attribution via -coverpkg, gated
 	@# The profile is written to the container's own filesystem and copied out as a
 	@# single sequential write. Writing it DIRECTLY to /src corrupts it on Docker
 	@# Desktop for macOS: `go test` streams the merged profile through the virtiofs
@@ -1251,7 +1321,7 @@ scan-all: ## Trivy scan every built service image
 	done
 
 .PHONY: check
-check: verify-no-host-toolchain fmt-check vet lint tidy-check codegen-check test ## The full local gate CI mirrors
+check: verify-no-host-toolchain verify-ryuk-image fmt-check vet lint tidy-check codegen-check test ## The full local gate CI mirrors
 
 # =============================================================================
 ##@ Dependencies
