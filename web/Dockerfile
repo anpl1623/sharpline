@@ -99,6 +99,26 @@ COPY --from=build --chown=node:node /app/public ./public
 COPY --from=build --chown=node:node /app/.next/standalone ./
 COPY --from=build --chown=node:node /app/.next/static ./.next/static
 
+# Patch the base image's OpenSSL.
+#
+# Trivy fails the scan on CVE-2026-14456 (HIGH, OpenSSL DoS): node:24-alpine
+# ships libcrypto3/libssl3 3.5.7-r0 and the fix is 3.5.8-r0. Bumping NODE_IMAGE
+# does NOT help -- the current node:24-alpine digest still carries 3.5.7-r0 --
+# but 3.5.8-r0 IS in the Alpine v3.24 main repository the image points at, so
+# the upgrade is available without changing branch or base.
+#
+# THE COST, STATED RATHER THAN HIDDEN. CLAUDE.md §12 pins base images by digest
+# so a build is reproducible, and `apk upgrade` reaches out to a repository
+# whose contents move, which weakens that for these two packages. It is the
+# lesser evil: the alternative is shipping a known-vulnerable OpenSSL in the one
+# image that terminates browser traffic, or suppressing the finding in a
+# .trivyignore where the next reader has to re-derive whether it still applies.
+# Two named packages, not a blanket `apk upgrade`, so the rest of the image
+# stays exactly what the digest says it is.
+#
+# When the upstream image picks up 3.5.8-r0, bump NODE_IMAGE and delete this.
+RUN apk upgrade --no-cache libcrypto3 libssl3
+
 # Strip the package manager from the RUNTIME image.
 #
 # A Next standalone server is started with `node server.js` (see CMD) and never
