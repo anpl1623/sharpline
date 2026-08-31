@@ -125,6 +125,20 @@ RUN rm -rf /usr/local/lib/node_modules/npm \
            /usr/local/bin/yarn \
            /usr/local/bin/yarnpkg
 
+# Patch the OpenSSL libraries the base image ships.
+#
+# node:24-alpine currently resolves to alpine 3.24.1 carrying openssl 3.5.7-r0,
+# which Trivy flags as CVE-2026-14456 (HIGH) against libcrypto3 and libssl3 --
+# unbounded memory growth in the QUIC server path. Alpine has already published
+# the fix as 3.5.8-r0 in the v3.24 main repository; the node image simply has
+# not been rebuilt against it yet, so repinning NODE_IMAGE to the newest digest
+# does not clear the finding.
+#
+# Upgrading just these two packages takes the fix without pulling an unrelated
+# package set into the image. Drop this once node:24-alpine ships 3.5.8-r0 --
+# `apk policy libssl3` inside the base image says whether that has happened.
+RUN apk upgrade --no-cache libcrypto3 libssl3
+
 USER node
 EXPOSE 3000
 
