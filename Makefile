@@ -299,11 +299,19 @@ RYUK_IMAGE ?= testcontainers/ryuk:0.14.0
 # It surfaced on a DIFFERENT package on each run, which is what a thundering herd
 # looks like rather than a defect in any one test.
 #
-# Two other fixes were considered and rejected. TESTCONTAINERS_RYUK_DISABLED=true
-# removes the race by removing the reaper, but the reaper is the only thing that
-# cleans up after a panicking or killed test run, and this project has already had
-# the Docker VM reach 100% disk once. Retrying is not available: the failure is
-# inside testcontainers' own reaper bootstrap, not in code we call.
+# Two other fixes were considered and rejected FOR A DEVELOPER MACHINE.
+# TESTCONTAINERS_RYUK_DISABLED=true removes the race by removing the reaper, but
+# the reaper is the only thing that cleans up after a panicking or killed test
+# run, and this project has already had the Docker VM reach 100% disk once.
+# Retrying is not available: the failure is inside testcontainers' own reaper
+# bootstrap, not in code we call.
+#
+# CI SCOPES THAT DECISION RATHER THAN OVERTURNING IT. The disk argument is about
+# a machine that survives the run; a GitHub-hosted runner is destroyed when the
+# job ends, so a leaked container there costs nothing and the reaper protects
+# nothing. ci.yml therefore sets RYUK_DISABLED=true on the two jobs that spawn
+# containers, and only there -- see the comment on those jobs. A local `make
+# test` keeps the reaper, which is where the disk actually fills.
 #
 # Serialising the binaries keeps Ryuk and makes the race impossible. t.Parallel()
 # inside a package is unaffected, so the cost is only the loss of cross-package
@@ -506,7 +514,9 @@ ryuk-warm: ## Pre-pull the testcontainers reaper so its spawn budget is not spen
 # Disabling the reaper would also "fix" it and is rejected for the reason
 # recorded above: Ryuk is the only thing that cleans up after a killed run, and
 # this project has already filled the Docker VM's disk once.
-	@if docker image inspect '$(RYUK_IMAGE)' >/dev/null 2>&1; then \
+	@if [ '$(RYUK_DISABLED)' = 'true' ]; then \
+	   printf 'OK  reaper disabled for this run; nothing to pull\n'; \
+	 elif docker image inspect '$(RYUK_IMAGE)' >/dev/null 2>&1; then \
 	   printf 'OK  reaper image present: %s\n' '$(RYUK_IMAGE)'; \
 	 else \
 	   printf '==> pulling the testcontainers reaper (%s)\n' '$(RYUK_IMAGE)'; \
