@@ -1,13 +1,31 @@
 # Sharpline
 
-A real-time sports odds platform — FanDuel-parity feature *surface*, built to run entirely
-on self-hosted compute. Odds are ingested from a licensed data provider, normalized,
+A real-time sports odds platform with a FanDuel-parity feature *surface*, built to run
+entirely on self-hosted compute. Odds are ingested from a licensed data provider, normalized,
 priced, and streamed live to a browser over WebSocket, with the ingestion, pricing,
 storage, and fanout all computed on hardware the author controls.
 
+![The live odds board, streaming over WebSocket](docs/images/board.png)
+
+The board above is the running stack, not a mockup. The status line along the bottom is
+the WebSocket gateway reporting on itself: `link Live`, the connection id, the sequence
+number, how many markets the client is subscribed to, the message rate, and the age of
+the last frame. `src synthetic` means the prices came from the built-in market maker
+rather than the paid provider.
+
+![The signals feed: positive expected value, with fair price, edge and Kelly stake](docs/images/signals.png)
+
+Signals are written by the pricer as it computes, not calculated when the page loads, so
+each row keeps the thresholds it was detected under. Every figure is a rate rather than
+an amount, and the fair price each one is measured against is the sharp reference book
+devigged by the method named on the row.
+
+Both screenshots are taken from the current development build. The bet slip panel and
+the signals feed are phase 8 and phase 9 work that lands after `v0.1.0`.
+
 ---
 
-## ⚠️ This is a simulation, not a sportsbook
+## This is a simulation, not a sportsbook
 
 **Sharpline is a production-shaped, self-hosted sportsbook *simulation*. It is not a
 licensed sportsbook and does not attempt to be one.**
@@ -19,7 +37,7 @@ licensed sportsbook and does not attempt to be one.**
 | **Geolocation gating** | **No.** No state-by-state eligibility checks. |
 | **Payment processing** | **No.** No card rails, no ACH, no PCI scope. |
 | **Custody of funds** | **No.** Nothing of value is ever held on a user's behalf. |
-| **Gaming licence** | **No.** None held, none applied for, none required — because no wagering of value takes place. |
+| **Gaming licence** | **No.** None held, none applied for, none required, because no wagering of value takes place. |
 
 What *is* real is the engineering: real odds from a licensed data provider, a real
 double-entry ledger where every stake, payout, void, and adjustment is two rows summing
@@ -43,28 +61,28 @@ ritual.
 
 You do **not** need Go, Node, `psql`, `goose`, `golangci-lint`, Terraform, or Python on
 your machine. If any command in this repository only works because your host happens to
-have one of those installed, that command is **broken** — please open an issue.
+have one of those installed, that command is **broken**. Please open an issue.
 
 Once the stack is healthy, everything is reachable through the reverse proxy on `:80` /
 `:443`. Nothing else publishes a host port.
 
-Open **<https://localhost>** — https, not http. Caddy answers `:80` with a `308` to the
+Open **<https://localhost>**. Note https, not http. Caddy answers `:80` with a `308` to the
 https URL, and issues the certificate from its own internal CA, so the browser shows a
 warning on first visit until you trust the root at
 `/data/caddy/pki/authorities/local/root.crt` inside the `proxy` container. That is expected
 on a laptop and is not a misconfiguration: no ACME round-trip means the stack comes up
 offline and cannot burn a Let's Encrypt rate limit.
 
-<https://sharpline.localhost> — the default `SHARPLINE_PROXY_HOST` — works too, with no
+<https://sharpline.localhost>, the default `SHARPLINE_PROXY_HOST`, works too, with no
 `/etc/hosts` entry needed, because `.localhost` resolves to loopback. Use the hostname
 rather than `https://127.0.0.1`: the bare IP is listed as a site address but the internal
 CA issues no certificate for it, so it fails the TLS handshake.
 
 | Path | Goes to |
 |---|---|
-| `/` | `web` — the Next.js app |
-| `/api/*` | `api` — REST + OpenAPI |
-| `/ws` | `stream` — WebSocket gateway (upgrade, no session affinity) |
+| `/` | `web`, the Next.js app |
+| `/api/*` | `api`, REST + OpenAPI |
+| `/ws` | `stream`, the WebSocket gateway (upgrade, no session affinity) |
 
 Useful targets:
 
@@ -91,7 +109,7 @@ cp .env.example .env
 ```
 
 `ODDS_API_KEY` is the interesting one. **Leave it empty and `ingest` starts the synthetic
-provider** — a live stochastic market-maker that generates realistic line movement, steam
+provider**, a live stochastic market-maker that generates realistic line movement, steam
 moves, and book disagreement from a seeded RNG. Set it and `ingest` starts the real
 adapter against [The Odds API](https://the-odds-api.com/). Both sit behind the identical
 `ProviderAdapter` interface, so nothing downstream can tell the difference.
@@ -103,11 +121,11 @@ once that host is actually reachable on `:80`/`:443`, because Caddy will then at
 certificate issuance.
 
 Every other variable in `.env.example` is commented with what reads it and whether compose
-overrides it — several are documentation of the config surface rather than live knobs,
+overrides it. Several are documentation of the config surface rather than live knobs,
 because compose sets them explicitly per service.
 
 There is no third mode. In particular there is **no fixture data**: every number you see
-in the UI travelled the full path — `provider → ingest → Kafka → normalizer → pricer →
+in the UI travelled the full path: `provider → ingest → Kafka → normalizer → pricer →
 Postgres/Redis → api/stream → browser`. An empty board with a correct empty state is a
 correct board. A populated board fed by a hardcoded array would be a defect.
 
@@ -117,7 +135,7 @@ correct board. A populated board fed by a hardcoded array would be a defect.
 
 A **modular monolith with service-ready seams**: one Go module, six `cmd/` entrypoints.
 Every service can run in-process for local development and as its own container in
-Kubernetes without code changes — the difference is which binary starts and whether the
+Kubernetes without code changes. The difference is which binary starts and whether the
 event bus is in-memory or Kafka. Premature microservices on a solo project produce
 distributed-monolith pain with none of the organizational benefit; the seams are what
 make it scalable, and splitting the binaries is a deployment decision made later, cheaply.
@@ -170,7 +188,7 @@ Six binaries, one parameterized Dockerfile, one Go module.
 | `stream` | WebSocket gateway. Subscription routing, snapshot-then-delta protocol, per-client backpressure |
 | `api` | REST + OpenAPI. Auth, catalog, bet slip, wagers, account, history |
 | `settle` | Consumes the results feed, grades open wagers, writes ledger entries, emits settlement events |
-| `migrate` | Schema migrations (goose). Runs as a compose service locally and a Kubernetes Job in-cluster — never a binary anyone runs by hand |
+| `migrate` | Schema migrations (goose). Runs as a compose service locally and a Kubernetes Job in-cluster, never a binary anyone runs by hand |
 
 Every Go service exposes, on its own internal port and its own port only:
 
@@ -178,9 +196,9 @@ Every Go service exposes, on its own internal port and its own port only:
 |---|---|
 | `GET /healthz` | liveness |
 | `GET /readyz` | readiness |
-| `GET /metrics` | Prometheus scrape — **not** exposed publicly through the proxy |
+| `GET /metrics` | Prometheus scrape, **not** exposed publicly through the proxy |
 
-`api` additionally mirrors `/healthz` and `/readyz` — and only those two — beneath its
+`api` additionally mirrors `/healthz` and `/readyz`, and only those two, beneath its
 public `/api` prefix, so the stack's health is observable from outside the container
 network without publishing a second host port:
 
@@ -193,8 +211,8 @@ curl -k https://localhost/api/readyz    # {"status":"ready","service":"api"}
 root, but that matcher does not cover `/api/metrics`; mirroring it would punch a hole
 straight through the deny rule.
 
-Because the runtime image is `gcr.io/distroless/static:nonroot` — no shell, no `wget`, no
-`curl` — the container healthcheck cannot be a shell command. The service binary probes
+Because the runtime image is `gcr.io/distroless/static:nonroot`, with no shell, no `wget`
+and no `curl`, the container healthcheck cannot be a shell command. The service binary probes
 itself instead: `sharpline healthcheck` resolves its own listen address, `GET`s `/readyz`
 over loopback, and exits 0 or 1. That is what lets compose gate the proxy on
 `condition: service_healthy` rather than on "the process was spawned".
@@ -205,10 +223,10 @@ over loopback, and exits 0 or 1. That is what lets compose gate the proxy on
 |---|---|
 | **Postgres 17 + TimescaleDB** | Relational core plus hypertables for the odds time-series. Line history (CLV, steam detection, book disagreement) is the interesting dataset and it is inherently time-series. One engine, two access patterns, no second database to operate. |
 | **Redis 7** | Current-line snapshot cache, WebSocket presence and subscription state, distributed rate limiting, idempotency keys. **Never the source of truth.** |
-| **Apache Kafka (KRaft)** | The event backbone. KRaft removes ZooKeeper, so this is one container rather than a cluster of them. Client is `franz-go` — pure Go, so `CGO_ENABLED=0` and the distroless image survive. See [ADR 0004](docs/adr/0004-kafka-over-nats.md). |
+| **Apache Kafka (KRaft)** | The event backbone. KRaft removes ZooKeeper, so this is one container rather than a cluster of them. Client is `franz-go`, which is pure Go, so `CGO_ENABLED=0` and the distroless image survive. See [ADR 0004](docs/adr/0004-kafka-over-nats.md). |
 
 Topics: `odds.raw.{provider}` (retention), `odds.normalized` (compacted, keyed by market),
-`price.computed` (compacted), `wager.events` (retention — the settlement audit trail).
+`price.computed` (compacted), `wager.events` (retention, the settlement audit trail).
 Topic configuration is declared in Terraform, not created by hand, precisely because a
 `--config cleanup.policy=compact` flag typed once at a CLI is the kind of thing that
 silently differs between laptop and cluster.
@@ -218,9 +236,9 @@ silently differs between laptop and cluster.
 `internal/domain/odds` is the intellectual core: pure functions over value types, zero
 external dependencies, table-driven **and** property-based tests.
 
-- Format conversion — American ↔ decimal ↔ fractional ↔ implied probability
+- Format conversion between American, decimal, fractional, and implied probability
 - Overround / vig calculation
-- Devigging — multiplicative, additive, power, and Shin. All four, because they disagree
+- Devigging: multiplicative, additive, power, and Shin. All four, because they disagree
   meaningfully on longshots
 - No-vig fair odds and fair probability
 - Expected value %, edge, Kelly and fractional-Kelly stake sizing
@@ -240,7 +258,7 @@ The design system is [`DESIGN.md`](DESIGN.md) and it is the source of truth for 
 visual decision. Two of its choices look like bugs until you read the argument for them:
 
 - **Price deltas are cyan and amber, never green and red.** Cyan means the implied
-  probability fell (the price lengthened), amber means it rose (shortened — steam).
+  probability fell (the price lengthened), amber means it rose (shortened, a steam move).
   Blue↔orange is the canonical colourblind-safe axis, and it frees green to mean *money*
   and only money anywhere in the product. Direction is carried redundantly by an arrow
   glyph and by the numeral, so colour is never load-bearing on its own.
@@ -250,7 +268,8 @@ visual decision. Two of its choices look like bugs until you read the argument f
   300ms full-cell flash across hundreds of cells is a strobe, not information.
 
 **Where the data comes from is split deliberately.** REST is the source for the catalogue
-tree — which events exist, which markets hang off them, which selections under those — and
+tree, meaning which events exist, which markets hang off them and which selections sit
+under those, and
 the WebSocket is the source for movement. Board and event pages are React Server
 Components that fetch over the in-network service name, so the first paint is real prices
 with no spinner and no client waterfall; they hand that page to a client component which
@@ -262,14 +281,14 @@ stream, which is the one failure the status rail exists to make visible. See
 
 Odds format conversion happens client-side from the canonical `decimal_odds`, because the
 stream carries only decimal and both feeds must render identically. The TypeScript API
-types are generated from `internal/httpapi/openapi.yaml` — the same file the Go server
-types and `pkg/client` come from — committed, and drift-checked by `make codegen-check`.
+types are generated from `internal/httpapi/openapi.yaml`, the same file the Go server
+types and `pkg/client` come from. It is committed, and drift-checked by `make codegen-check`.
 
 | Route | What it is |
 |---|---|
 | `/` | Landing poster, and the "simulation, not a licensed sportsbook" disclaimer |
 | `/board` | The live odds board across every league |
-| `/board/{league}` | The same board scoped to one league — the URL and the WebSocket channel are the same string |
+| `/board/{league}` | The same board scoped to one league. The URL and the WebSocket channel are the same string |
 | `/events/{eventId}` | Event detail: full market tree, multi-book comparison, line-movement chart, and the devigged fair value in the mono engineering register |
 | `/login`, `/register` | Email + password against argon2id and rotating refresh tokens |
 
@@ -283,7 +302,7 @@ full rail. Every mono glyph on screen means the machine is talking.
 **Accessibility is part of the contract, not a pass at the end.** Every price is a table
 cell with an accessible name that states market, selection and price ("Total, Over, 54.5,
 minus 108"). Price movement goes to a single `aria-live="polite"` region throttled to one
-batched announcement every five seconds ("14 markets moved") — never one per tick, which
+batched announcement every five seconds ("14 markets moved"), never one per tick, which
 would be the worst thing this UI could do to a screen reader user. An individual change is
 exposed through `aria-describedby` on focus rather than announced. Under
 `prefers-reduced-motion` the digit roll becomes an instant swap and the rail shortens to a
@@ -303,8 +322,6 @@ make e2e            # Playwright, one-shot, through the proxy
 
 ---
 
----
-
 ## The prime directive
 
 **Every process in this system runs in a container.** Backend services, the Next.js
@@ -321,11 +338,11 @@ Consequences that are honored rather than worked around:
 - `make build` invokes a builder image. It does not shell out to a host `go build`.
 - `make test` runs the Go test image with the Docker socket mounted, so `testcontainers-go`
   spawns real Postgres, Redis, and Kafka as sibling containers. No mocked databases and no
-  mocked broker — the interesting bugs live in consumer-group rebalancing and offset handling.
+  mocked broker. The interesting bugs live in consumer-group rebalancing and offset handling.
 - The frontend dev server runs in a container with hot reload intact: source bind-mounted,
   `node_modules` and `.next` on named volumes so host-arch binaries never leak into the image.
-- One-off tooling — linting, codegen, OpenAPI generation, `psql` and Kafka CLI shells,
-  Terraform, Locust, Playwright — is a `make` target wrapping `docker run`.
+- One-off tooling (linting, codegen, OpenAPI generation, `psql` and Kafka CLI shells,
+  Terraform, Locust, Playwright) is a `make` target wrapping `docker run`.
 - CI uses **no** `actions/setup-go` and **no** `actions/setup-node`. Every job runs
   `make <target>`. The runner is treated as a bare machine with Docker and nothing else.
   This is what mechanically enforces the directive: any step that quietly depends on a
@@ -333,8 +350,8 @@ Consequences that are honored rather than worked around:
 - Base images are pinned by `@sha256:` digest, not by floating tag.
 - Build contexts are pruned where BuildKit actually reads the rules. Every Go service
   build passes the repository root as its context, so the ignore file that applies is
-  `deploy/docker/go.Dockerfile.dockerignore` — the per-Dockerfile sibling, which wins
-  outright — with `/.dockerignore` as the conservative fallback for every other
+  `deploy/docker/go.Dockerfile.dockerignore`, the per-Dockerfile sibling, which wins
+  outright, with `/.dockerignore` as the conservative fallback for every other
   root-context build. The naming is load-bearing: a file at `deploy/docker/.dockerignore`
   is never consulted for a root context, and one sitting there looks live while doing
   nothing. Pruning cuts the Go context from 712 kB to 8.6 kB, and more importantly stops a
@@ -387,8 +404,8 @@ sharpline/
 
 **Local.** `make up` brings up the data plane, all six Go services, the frontend, and the
 proxy. The observability stack sits behind a compose profile. Every long-running container
-has a real healthcheck — the stateful ones through their own CLI, the distroless Go
-services through the binary's own `healthcheck` self-probe — so `depends_on` gates on
+has a real healthcheck, the stateful ones through their own CLI and the distroless Go
+services through the binary's own `healthcheck` self-probe, so `depends_on` gates on
 readiness rather than on process spawn. `migrate` runs to completion before `api` starts;
 all persistent state is on named volumes so `docker compose down -v` is the reset button.
 
@@ -397,17 +414,17 @@ an internal bridge network with service-name DNS. This mirrors the Kubernetes In
 topology exactly, so the compose stack and the cluster stack cannot drift into being two
 different systems.
 
-**Kubernetes — Helm only.** One chart, `values-dev.yaml` and `values-prod.yaml`. Kustomize
+**Kubernetes, Helm only.** One chart, `values-dev.yaml` and `values-prod.yaml`. Kustomize
 is deliberately not used ([ADR 0005](docs/adr/0005-helm-not-kustomize.md)). Every workload
-runs in-cluster, stateful ones included — Postgres, Redis, and Kafka are StatefulSets with
+runs in-cluster, stateful ones included. Postgres, Redis, and Kafka are StatefulSets with
 PVCs, not managed cloud services, because the entire point is that this computes on
 hardware the author controls. Each Deployment carries resource requests and limits,
 liveness/readiness/startup probes, a PodDisruptionBudget, and a default-deny NetworkPolicy
 with explicit allows. `stream` must scale horizontally, so there is no session affinity,
 which is why subscription state lives in Redis rather than in a pod.
 
-HPA on CPU for `pricer`, and on a custom metric — active WebSocket connections, exported
-via the Prometheus adapter — for `stream`.
+HPA on CPU for `pricer`, and on a custom metric for `stream`: active WebSocket
+connections, exported via the Prometheus adapter.
 
 **Terraform.** Nothing is provisioned by hand: the kind cluster, Kafka topics and their
 per-topic retention and compaction settings, Grafana dashboards and alert rules, and
@@ -417,7 +434,7 @@ namespaces are all declared. It runs from the `tools` container like everything 
 update can be followed end to end. Prometheus metrics feed a pre-built Grafana dashboard:
 odds staleness p50/p99, provider quota remaining, WebSocket connections and dropped
 clients, pricing latency, bus lag. Structured JSON logging via `log/slog` with trace
-correlation. **Odds staleness is the headline SLO** — it is defined, alerted on, and on
+correlation. **Odds staleness is the headline SLO.** It is defined, alerted on, and on
 the dashboard.
 
 ---
@@ -436,7 +453,7 @@ Every test tier runs in a container.
 
 Honest note on Locust: it generates fewer connections per worker than k6 would, because
 each user is a Python greenlet rather than a Go goroutine. Compensate with worker count.
-The tradeoff was accepted for stack parity and because distributed mode demos better —
+The tradeoff was accepted for stack parity and because distributed mode demos better.
 driving the `stream` HPA from a Locust worker pool and watching both scale is the single
 best demo this project produces.
 
@@ -456,7 +473,7 @@ Each phase ends in a working, demoable system. The tree is never left in a state
 | 4 | Pricing engine: devig, fair value, EV, arbitrage |
 | 5 | REST API + auth + OpenAPI |
 | 6 | WebSocket gateway: snapshot/delta, resync, backpressure |
-| 7 | Frontend — design system first, then the live odds board |
+| 7 | Frontend: design system first, then the live odds board |
 | 8 | Bet slip, wagering, double-entry ledger, settlement |
 | 9 | Analytics **in Go**: +EV finder, arbitrage scanner, steam detection, CLV tracking |
 | 10 | Kubernetes: Helm chart, Terraform, StatefulSets, HPA on WS connections, kind demo |
@@ -466,7 +483,7 @@ Each phase ends in a working, demoable system. The tree is never left in a state
 Phase 9 is built in plain Go *before* phase 12's Flink SQL, deliberately. Flink is the
 steepest learning curve here and the likeliest thing to become a half-finished distraction
 that blocks a working demo. Building Go first means the system is complete regardless, and
-the Go implementation becomes the reference the streaming jobs are validated against —
+the Go implementation becomes the reference the streaming jobs are validated against:
 same inputs, same outputs, or the Flink job is wrong.
 
 ---
@@ -484,7 +501,7 @@ matches, where it defers, and where it diverges on purpose.
 | Helm | Yes | Sole deploy path |
 | Terraform | Yes | Cluster, topics, dashboards |
 | Apache Kafka | Yes | KRaft, `franz-go` client |
-| Apache Flink | Phase 12 | Flink SQL — no JVM code |
+| Apache Flink | Phase 12 | Flink SQL, no JVM code |
 | Locust | Yes | Distributed, drives the HPA demo |
 | Python | Yes | Locust + `analysis/` only |
 | Kong | Phase 12 | Caddy until then |
@@ -522,11 +539,11 @@ Decisions that would otherwise be re-argued in six months are written down.
 |---|---|
 | [0001](docs/adr/0001-go-no-jvm.md) | Go for all backend services, and explicitly no JVM service |
 | [0002](docs/adr/0002-container-mandate.md) | Everything runs in a container; the host's only dependency is a container runtime |
-| [0003](docs/adr/0003-odds-provider.md) | The Odds API as the odds provider, with a synthetic fallback — including the quota math |
+| [0003](docs/adr/0003-odds-provider.md) | The Odds API as the odds provider, with a synthetic fallback, including the quota math |
 | [0004](docs/adr/0004-kafka-over-nats.md) | Apache Kafka over NATS JetStream, and `franz-go` over `confluent-kafka-go` |
 | [0005](docs/adr/0005-helm-not-kustomize.md) | Helm as the sole Kubernetes deploy path; no Kustomize |
 
-The full project charter — the document every one of these ADRs elaborates on — is
+The full project charter, the document every one of these ADRs elaborates on, is
 `CLAUDE.md` at the repository root.
 
 ---
