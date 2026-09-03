@@ -230,6 +230,7 @@ export function MarketPanel({
                   <td className="w-40 px-2 py-2 align-middle">
                     <PriceCell
                       eventId={eventId}
+                      eventName={eventName}
                       marketId={market.id}
                       marketType={market.type}
                       marketStatus={market.status}

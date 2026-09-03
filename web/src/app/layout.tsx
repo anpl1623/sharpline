@@ -5,6 +5,7 @@ import { Providers } from '@/components/layout/providers';
 import { SiteHeader } from '@/components/layout/site-header';
 import { StatusRail } from '@/components/layout/status-rail';
 import { LiveAnnouncer } from '@/components/live/live-announcer';
+import { BetSlipDock, BetSlipRail } from '@/components/slip/bet-slip';
 import { fontVariables } from '@/lib/fonts';
 
 import './globals.css';
@@ -84,9 +85,23 @@ export default function RootLayout({
 
           <SiteHeader />
 
-          <main id="main" tabIndex={-1} className="min-w-0 flex-1">
-            {children}
-          </main>
+          {/* The page and the bet slip are SIBLINGS in a flex row, so the rail
+              takes width out of the page rather than floating over it — the
+              board is full bleed and an overlaid rail would sit on top of live
+              prices. Below 1000px the rail is `display: none` and this row is a
+              row of one, which is why no layout arithmetic changes there.
+              `min-w-0` on the row is what stops the board's horizontally
+              scrolling table from forcing the row wider than the viewport. */}
+          <div className="flex min-w-0 flex-1">
+            <main id="main" tabIndex={-1} className="min-w-0 flex-1">
+              {children}
+            </main>
+            <BetSlipRail />
+          </div>
+
+          {/* Below the row rather than inside it: the dock's flow spacer has to
+              reserve HEIGHT, and a spacer inside a flex row reserves width. */}
+          <BetSlipDock />
 
           <StatusRail />
           <LiveAnnouncer />

@@ -31,11 +31,18 @@ import { infiniteQueryOptions, queryOptions } from '@tanstack/react-query';
 
 import { browserApi } from '@/lib/api/client';
 import type {
+  AccountCLVParams,
+  ArbitrageSignalParams,
   BoardParams,
   BookFilterParams,
+  EVSignalParams,
   HistoryParams,
+  LeaderboardParams,
   SearchParams,
+  SteamSignalParams,
+  WagerListParams,
 } from '@/lib/api/client';
+import type { SchemaSlipQuoteRequest } from '@/lib/api/schema';
 
 /** Catalogue reads are cached this long. They do not tick. */
 export const CATALOGUE_STALE_TIME_MS = 5 * 60 * 1_000;
@@ -75,6 +82,89 @@ function boardKeyPart(params?: BoardParams): BoardKeyPart {
 
 function bookKeyPart(params?: BookFilterParams): readonly string[] {
   return [...(params?.book ?? [])].sort();
+}
+
+/**
+ * The part of the wager parameters that identifies WHICH list. The cursor is
+ * excluded for the same reason the board's is: it identifies a page, not a list.
+ *
+ * The status set is sorted so "open then placed" and "placed then open" are one
+ * cache entry. It is NOT de-duplicated here — a repeated status is a caller bug
+ * that should be visible as a distinct key rather than quietly folded away.
+ */
+function wagerKeyPart(params?: WagerListParams): Record<string, unknown> {
+  return {
+    status: [...(params?.status ?? [])].sort(),
+    limit: params?.limit ?? null,
+  };
+}
+
+/**
+ * The parts of each analytics query that identify WHICH listing. The cursor is
+ * excluded everywhere, because it identifies a PAGE of a listing and an infinite
+ * query carries it as a page parameter instead.
+ *
+ * Every array is sorted, so selecting two books or two market types in either
+ * order is one cache entry — and, more importantly, one server-side cursor
+ * scope. The server fingerprints its cursors over the sorted filter, so a client
+ * that reordered its own parameters between pages would be told its cursor
+ * belongs to a different query.
+ */
+function evSignalKeyPart(params?: EVSignalParams): Record<string, unknown> {
+  return {
+    league: params?.league ?? null,
+    book: [...(params?.book ?? [])].sort(),
+    marketType: [...(params?.marketType ?? [])].sort(),
+    minEvPercent: params?.minEvPercent ?? null,
+    observedAfter: params?.observedAfter ?? null,
+    limit: params?.limit ?? null,
+  };
+}
+
+function arbitrageKeyPart(
+  params?: ArbitrageSignalParams,
+): Record<string, unknown> {
+  return {
+    league: params?.league ?? null,
+    marketType: [...(params?.marketType ?? [])].sort(),
+    minReturnPercent: params?.minReturnPercent ?? null,
+    maxLegAgeSeconds: params?.maxLegAgeSeconds ?? null,
+    maxSpreadSeconds: params?.maxSpreadSeconds ?? null,
+    minDistinctBooks: params?.minDistinctBooks ?? null,
+    observedAfter: params?.observedAfter ?? null,
+    limit: params?.limit ?? null,
+  };
+}
+
+function steamKeyPart(params?: SteamSignalParams): Record<string, unknown> {
+  return {
+    marketType: [...(params?.marketType ?? [])].sort(),
+    minMagnitude: params?.minMagnitude ?? null,
+    minParticipatingBooks: params?.minParticipatingBooks ?? null,
+    windowEndAfter: params?.windowEndAfter ?? null,
+    limit: params?.limit ?? null,
+  };
+}
+
+function leaderboardKeyPart(
+  params?: LeaderboardParams,
+): Record<string, unknown> {
+  return {
+    basis: params?.basis ?? null,
+    minSettledWagers: params?.minSettledWagers ?? null,
+    minClvSamples: params?.minClvSamples ?? null,
+    from: params?.from ?? null,
+    to: params?.to ?? null,
+    limit: params?.limit ?? null,
+  };
+}
+
+function clvKeyPart(params?: AccountCLVParams): Record<string, unknown> {
+  return {
+    gradedFrom: params?.gradedFrom ?? null,
+    gradedTo: params?.gradedTo ?? null,
+    limit: params?.limit ?? null,
+  };
 }
 
 function historyKeyPart(params: HistoryParams): Record<string, unknown> {
@@ -146,6 +236,66 @@ export const queryKeys = {
 
   /** No token in the key. See the file comment. */
   account: () => ['sharpline', 'account'] as const,
+
+  /**
+   * The derived balances.
+   *
+   * Its own key rather than a branch of `account`, because it is invalidated on
+   * a completely different event: placing a wager moves money and does not
+   * touch the profile, and settling one moves money with no request from this
+   * client at all.
+   */
+  balance: () => ['sharpline', 'balance'] as const,
+
+  wagers: (params?: WagerListParams) =>
+    ['sharpline', 'wagers', wagerKeyPart(params), params?.cursor ?? null] as const,
+  wagersInfinite: (params?: WagerListParams) =>
+    ['sharpline', 'wagers', 'infinite', wagerKeyPart(params)] as const,
+  wager: (wagerId: string) => ['sharpline', 'wager', wagerId] as const,
+  cashOutQuote: (wagerId: string) =>
+    ['sharpline', 'cash-out-quote', wagerId] as const,
+
+  /**
+   * The +EV finder.
+   *
+   * EVERY filter is in the key, and that is not the usual "include the params"
+   * habit — it mirrors the server's cursor scope exactly. On this endpoint each
+   * filter changes WHICH ROWS are in the set, so a cache entry shared across two
+   * filter sets would hand page 2 of one listing to page 1 of another and the
+   * server would answer 400.
+   */
+  evSignals: (params?: EVSignalParams) =>
+    ['sharpline', 'signals', 'ev', evSignalKeyPart(params)] as const,
+
+  arbitrageSignals: (params?: ArbitrageSignalParams) =>
+    ['sharpline', 'signals', 'arbitrage', arbitrageKeyPart(params)] as const,
+
+  steamSignals: (params?: SteamSignalParams) =>
+    ['sharpline', 'signals', 'steam', steamKeyPart(params)] as const,
+
+  /**
+   * The public leaderboard. The basis and both sample floors are in the key: a
+   * board ranked on ROI and one ranked on CLV are different answers to different
+   * questions, and so is the same board at a different minimum sample.
+   */
+  leaderboard: (params?: LeaderboardParams) =>
+    ['sharpline', 'leaderboard', leaderboardKeyPart(params)] as const,
+
+  /** No token in the key, for the reason `account` gives. */
+  accountCLV: (params?: AccountCLVParams) =>
+    ['sharpline', 'account-clv', clvKeyPart(params)] as const,
+
+  /**
+   * The priced slip.
+   *
+   * Keyed by the slip's whole CANONICAL request body, which is what makes the
+   * cadence right: the quote refetches when the customer changes something —
+   * a leg, the stake, the kind, an acceptance — and not when a price ticks.
+   * Movement is detected over the WebSocket, which costs nothing; see
+   * `components/slip/use-slip-quote.ts` for why the two are separated.
+   */
+  slipQuote: (body: SchemaSlipQuoteRequest) =>
+    ['sharpline', 'slip-quote', body] as const,
 } as const;
 
 // -----------------------------------------------------------------------------
@@ -348,5 +498,259 @@ export function accountQueryOptions(accessToken: string | null) {
       browserApi.getAccount({ accessToken: accessToken ?? undefined, signal }),
     staleTime: 60 * 1_000,
     enabled: accessToken !== null && accessToken !== '',
+  });
+}
+
+// -----------------------------------------------------------------------------
+// Betting
+// -----------------------------------------------------------------------------
+
+/**
+ * Whether a credential is present. Every factory below is disabled without one:
+ * these endpoints answer 401 to an anonymous caller, and issuing a request whose
+ * only possible outcome is a 401 turns a signed-out page into an error state.
+ */
+function signedIn(accessToken: string | null): boolean {
+  return accessToken !== null && accessToken !== '';
+}
+
+/**
+ * The spendable and escrowed balances.
+ *
+ * `staleTime: 0` because the number moves for reasons this client never sees:
+ * a settlement, a void, a grant. Unlike the board there is no socket carrying
+ * it, so the honest policy is "re-read it whenever something asks", and the
+ * things that ask are a mounted slip and a wager list.
+ */
+export function balanceQueryOptions(accessToken: string | null) {
+  return queryOptions({
+    queryKey: queryKeys.balance(),
+    queryFn: ({ signal }) =>
+      browserApi.getBalance({ accessToken: accessToken ?? undefined, signal }),
+    staleTime: 0,
+    enabled: signedIn(accessToken),
+  });
+}
+
+/**
+ * The wager history, keyset-paginated on `(placed_at, id)`.
+ *
+ * `placed_at` alone is not a total order — a round robin writes N tickets at one
+ * instant — so the identifier is part of the key and a cursor is unambiguous.
+ *
+ * The status filter is applied to the page the server SCANNED, so a filtered
+ * page can hold fewer than `limit` rows while `has_more` is still true. Callers
+ * must follow `next_cursor` until `has_more` is false rather than stopping at a
+ * short page; `getNextPageParam` below reads `has_more` and not the row count
+ * for exactly that reason.
+ */
+export function wagersInfiniteQueryOptions(
+  accessToken: string | null,
+  params?: WagerListParams,
+) {
+  return infiniteQueryOptions({
+    queryKey: queryKeys.wagersInfinite(params),
+    queryFn: ({ pageParam, signal }) =>
+      browserApi.listWagers(
+        {
+          status: params?.status,
+          limit: params?.limit,
+          cursor: pageParam,
+        },
+        { accessToken: accessToken ?? undefined, signal },
+      ),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) =>
+      lastPage.page.has_more ? (lastPage.page.next_cursor ?? undefined) : undefined,
+    staleTime: 0,
+    enabled: signedIn(accessToken),
+  });
+}
+
+/**
+ * One ticket with its legs.
+ *
+ * A running ticket's legs grade at different times and its status changes with
+ * no request from here, so this does not cache. Somebody else's wager id is a
+ * 404 and not a 403 — the ownership comparison happens on the row as it is read,
+ * so there is no branch anywhere that could tell the two apart, which is the
+ * point: a 403 would confirm the id exists.
+ */
+export function wagerQueryOptions(accessToken: string | null, wagerId: string) {
+  return queryOptions({
+    queryKey: queryKeys.wager(wagerId),
+    queryFn: ({ signal }) =>
+      browserApi.getWager(wagerId, {
+        accessToken: accessToken ?? undefined,
+        signal,
+      }),
+    staleTime: 0,
+    enabled: signedIn(accessToken) && wagerId !== '',
+  });
+}
+
+/**
+ * What the book will pay to close a ticket now.
+ *
+ * `enabled` is passed in rather than derived, because the caller knows something
+ * this factory cannot: a cash-out quote should be fetched when the customer ASKS
+ * for one, not on every render of a wager row. Quoting a page of open tickets
+ * eagerly would be a request per row for a number most of them will never show.
+ *
+ * `staleTime: 0` and no `refetchInterval`. The quote is a SNAPSHOT at
+ * `quoted_at`, not an offer held open — the spec is explicit that there is no
+ * expiry field because an expiry would imply the book stands behind the number
+ * until then. Polling it would animate a number the book is not committed to;
+ * the customer refreshes it deliberately, and whatever takes the cash-out
+ * re-prices while holding the wager row anyway.
+ */
+export function cashOutQuoteQueryOptions(
+  accessToken: string | null,
+  wagerId: string,
+  enabled: boolean,
+) {
+  return queryOptions({
+    queryKey: queryKeys.cashOutQuote(wagerId),
+    queryFn: ({ signal }) =>
+      browserApi.getCashOutQuote(wagerId, {
+        accessToken: accessToken ?? undefined,
+        signal,
+      }),
+    staleTime: 0,
+    gcTime: 0,
+    // A 409 `cash_out_unavailable` is a STATE, not a fault — the ticket is
+    // terminal, a leg is void, a reference price went stale — and retrying it
+    // would just ask the same question again. `ApiError.isRetryable` already
+    // says no to a 4xx; this is here so the intent is legible at the endpoint.
+    retry: false,
+    enabled: enabled && signedIn(accessToken) && wagerId !== '',
+  });
+}
+
+// -----------------------------------------------------------------------------
+// Analytics — signals, the leaderboard, and CLV
+// -----------------------------------------------------------------------------
+
+/**
+ * How long a signal page is considered fresh.
+ *
+ * Between the two policies at the top of this file rather than at either
+ * extreme. A finding is not a tick — it is written when a detector fires, which
+ * is far less often than a price moves — but it is not catalogue data either: a
+ * +EV price that has since been taken is a finding a reader should stop seeing.
+ *
+ * There is NO `refetchInterval` on any of these. Polling an analytics feed would
+ * make the page re-render while somebody is reading a row, and none of these
+ * surfaces is on the WebSocket. The reader refreshes.
+ */
+export const SIGNAL_STALE_TIME_MS = 15 * 1_000;
+
+/**
+ * The leaderboard changes when a wager settles and when a leg is graded, neither
+ * of which this browser sees. A minute is short enough that a refresh after a
+ * settlement shows the new order and long enough that navigating between the two
+ * bases does not re-read the same window twice.
+ */
+export const LEADERBOARD_STALE_TIME_MS = 60 * 1_000;
+
+/**
+ * The +EV finder, keyset-paginated.
+ *
+ * EVERY parameter is re-sent unchanged on every page. The cursor is bound to the
+ * whole filter set — unlike the board, where `book` only changes rendering — so
+ * a page fetched with a different `min_ev_percent` would be a 400 rather than a
+ * differently filtered page.
+ */
+export function evSignalsInfiniteQueryOptions(params?: EVSignalParams) {
+  return infiniteQueryOptions({
+    queryKey: queryKeys.evSignals(params),
+    queryFn: ({ pageParam, signal }) =>
+      browserApi.listEVSignals(
+        {
+          league: params?.league,
+          book: params?.book,
+          marketType: params?.marketType,
+          minEvPercent: params?.minEvPercent,
+          observedAfter: params?.observedAfter,
+          limit: params?.limit,
+          cursor: pageParam,
+        },
+        { signal },
+      ),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) =>
+      lastPage.page.has_more ? (lastPage.page.next_cursor ?? undefined) : undefined,
+    staleTime: SIGNAL_STALE_TIME_MS,
+  });
+}
+
+/**
+ * Live arbitrage. A plain query, not an infinite one, because the endpoint has
+ * no cursor: the staleness bounds make the live set small and it turns over in
+ * seconds, so paging it would walk a list that no longer exists.
+ */
+export function arbitrageSignalsQueryOptions(params?: ArbitrageSignalParams) {
+  return queryOptions({
+    queryKey: queryKeys.arbitrageSignals(params),
+    queryFn: ({ signal }) => browserApi.listArbitrageSignals(params, { signal }),
+    staleTime: SIGNAL_STALE_TIME_MS,
+  });
+}
+
+/** The steam feed, keyset-paginated and ordered by recency. */
+export function steamSignalsInfiniteQueryOptions(params?: SteamSignalParams) {
+  return infiniteQueryOptions({
+    queryKey: queryKeys.steamSignals(params),
+    queryFn: ({ pageParam, signal }) =>
+      browserApi.listSteamSignals(
+        {
+          marketType: params?.marketType,
+          minMagnitude: params?.minMagnitude,
+          minParticipatingBooks: params?.minParticipatingBooks,
+          windowEndAfter: params?.windowEndAfter,
+          limit: params?.limit,
+          cursor: pageParam,
+        },
+        { signal },
+      ),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) =>
+      lastPage.page.has_more ? (lastPage.page.next_cursor ?? undefined) : undefined,
+    staleTime: SIGNAL_STALE_TIME_MS,
+  });
+}
+
+/** The public leaderboard. No credential: it names nobody. */
+export function leaderboardQueryOptions(params?: LeaderboardParams) {
+  return queryOptions({
+    queryKey: queryKeys.leaderboard(params),
+    queryFn: ({ signal }) => browserApi.getLeaderboard(params, { signal }),
+    staleTime: LEADERBOARD_STALE_TIME_MS,
+  });
+}
+
+/**
+ * The signed-in customer's CLV.
+ *
+ * Disabled while anonymous, like every other account read: issuing a request
+ * whose only possible outcome is a 401 turns a signed-out page into an error
+ * state.
+ *
+ * `staleTime: 0` because the number moves for a reason this client never sees —
+ * a leg grading, which happens in `settle` with no request from here.
+ */
+export function accountCLVQueryOptions(
+  accessToken: string | null,
+  params?: AccountCLVParams,
+) {
+  return queryOptions({
+    queryKey: queryKeys.accountCLV(params),
+    queryFn: ({ signal }) =>
+      browserApi.getAccountCLV(params, {
+        accessToken: accessToken ?? undefined,
+        signal,
+      }),
+    staleTime: 0,
+    enabled: signedIn(accessToken),
   });
 }

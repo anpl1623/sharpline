@@ -1,11 +1,36 @@
-// Command pricer consumes the compacted odds.normalized topic, devigs every
+// Command pricer runs TWO stages in one process.
+//
+// The PRICING stage consumes the compacted odds.normalized topic, devigs every
 // market that moved, computes no-vig fair value, EV%, Kelly sizing, arbitrage
 // and middles, and publishes the result to the compacted price.computed topic
 // (CLAUDE.md §3).
 //
-// This file is the wiring only. internal/pricing is the composition root and
-// carries the argument for the engine seam, the warm start, the change-detection
-// guards and the shutdown order; read its doc.go before changing anything here.
+// The SIGNALS stage — phase 9 — consumes that output and turns it into findings:
+// positive expected value, arbitrage under a staleness discipline, and steam.
+// CLAUDE.md §3's service table has exactly six binaries and phase 9 adds none, so
+// the analytics detectors live here, beside the stage whose output they read.
+//
+// # Why the signals stage is a SECOND CONSUMER and not a hook
+//
+// internal/pricing requires that [pricing.PriceFunc] be a PURE FUNCTION of the
+// record, because the pricer suppresses a republication whose input fingerprint
+// has not changed and that suppression is only sound if two calls over one record
+// produce one answer. A detector that wrote to Postgres and Kafka from inside
+// that call would break the property the whole change-detection path rests on.
+// Consuming price.computed instead costs one extra decode of a record already in
+// the page cache, and buys the ability to lift the analytics stage into its own
+// deployment later without touching a line of it.
+//
+// The two stages share this process's producer, its metric registry and its bus
+// client options, and they share NOTHING else: different consumer groups,
+// different topics, independent readiness checkers, and a failure in one does not
+// stop the other.
+//
+// This file is the wiring only. internal/pricing carries the argument for the
+// engine seam, the warm start, the change-detection guards and the shutdown
+// order; internal/analytics carries the argument for the detectors, their
+// thresholds and their replayability. Read both doc.go files before changing
+// anything here.
 //
 // It is deliberately the sibling of cmd/ingest/main.go rather than a second
 // idiom: the same probe branch, the same registry-before-collectors ordering,
@@ -26,6 +51,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/anpl1623/sharpline/internal/analytics"
+	analyticspg "github.com/anpl1623/sharpline/internal/analytics/pgstore"
 	"github.com/anpl1623/sharpline/internal/domain"
 	"github.com/anpl1623/sharpline/internal/ingest/normalizer"
 	"github.com/anpl1623/sharpline/internal/ingest/provider/theoddsapi"
@@ -34,6 +61,7 @@ import (
 	"github.com/anpl1623/sharpline/internal/platform/httpx"
 	"github.com/anpl1623/sharpline/internal/platform/kafka"
 	"github.com/anpl1623/sharpline/internal/platform/logging"
+	"github.com/anpl1623/sharpline/internal/platform/postgres"
 	"github.com/anpl1623/sharpline/internal/pricing"
 )
 
@@ -205,6 +233,97 @@ func run() error {
 			slog.String("error", err.Error()))
 	}
 
+	// -------------------------------------------------------------------------
+	// The signals stage (phase 9)
+	// -------------------------------------------------------------------------
+
+	// The database half of the analytics surface.
+	//
+	// config.Pricer declares RequirePostgres, so config.Load has already REFUSED
+	// to start this binary without a DSN and the branch below is not conditional
+	// in practice. Phase 2's rule is that a declared dependency must be OPENED by
+	// the binary — api and settle once declared Postgres without opening a pool
+	// and /readyz returned 200 with the database stopped, a probe worse than none
+	// — which is why the pool is opened here and joins the readiness set below.
+	//
+	// The pricing pass still touches no database. This pool belongs entirely to
+	// the signals stage; internal/pricing/doc.go argues why the pricing fold must
+	// not acquire one.
+	db, err := postgres.Connect(ctx, postgres.Options{
+		DSN:      cfg.PostgresDSN,
+		Service:  service,
+		Logger:   log,
+		Registry: registry,
+	})
+	if err != nil {
+		return fmt.Errorf("%s: %w", service, err)
+	}
+	defer db.Close()
+
+	store, err := analyticspg.New(db)
+	if err != nil {
+		return fmt.Errorf("%s: %w", service, err)
+	}
+
+	// The bus half, on the producer this process already owns.
+	//
+	// *kafka.OddsProducer's publish path is unexported and typed per topic on
+	// purpose — that is what makes PublishNormalized(ctx, someEventID, msg) fail
+	// to compile rather than key a record wrongly — so the three signals topics
+	// are reached through three named methods beside PublishPrice, and this
+	// assignment is a compile-time check that they exist and are keyed by market.
+	var signalPublisher analytics.Publisher = producer
+
+	// A SECOND consumer group, on this process's own output. ErrorPolicySkip for
+	// the same reason the pricing loop uses it: a poison record must not freeze
+	// every other market on the partition, and the signals stage returns an error
+	// only for a TRANSIENT sink failure, which under this policy is still logged,
+	// counted and skipped with its offset uncommitted.
+	//
+	// StartAtEnd is deliberately left false. A fresh group replays price.computed
+	// from the beginning, which on a COMPACTED topic is the current slate, so the
+	// +EV and arbitrage surfaces are complete on a first deploy rather than holding
+	// only the markets that happened to move since. That replay produces no steam
+	// findings, correctly: a compacted snapshot holds one record per market, and
+	// one observation is not a window.
+	signalConsumer, err := kafka.NewConsumer(ctx, kafka.ConsumerOptions{
+		ClientOptions: bus,
+		Group:         analytics.GroupSignals,
+		Topics:        []string{kafka.TopicPriceComputed},
+		ErrorPolicy:   kafka.ErrorPolicySkip,
+	})
+	if err != nil {
+		return fmt.Errorf("%s: %w", service, err)
+	}
+	defer func() {
+		if err := signalConsumer.Close(); err != nil {
+			log.Error("closing the signals consumer failed", slog.String("error", err.Error()))
+		}
+	}()
+
+	// Every detector is left at its package defaults, which internal/analytics
+	// argues for field by field alongside the alternatives. They are NOT restated
+	// here: a second copy of a threshold is a second copy that drifts, and the
+	// values travel on every finding anyway, so a deployment that re-tunes one
+	// leaves a stored population that can still be separated into the two regimes.
+	//
+	// The one value that must agree with something outside internal/analytics is
+	// the Kelly multiplier, because price.computed carries the full and fractional
+	// stakes but not the ratio between them. Both halves take it from
+	// pricing.DefaultKellyMultiplier, which is also what newEngine leaves the
+	// engine at, so the two cannot disagree.
+	signals, err := analytics.New(analytics.ServiceOptions{
+		EV:        analytics.EVConfig{KellyFraction: pricing.DefaultKellyMultiplier},
+		Store:     store,
+		Publisher: signalPublisher,
+		Consumer:  signalConsumer,
+		Logger:    log,
+		Registry:  registry,
+	})
+	if err != nil {
+		return fmt.Errorf("%s: %w", service, err)
+	}
+
 	srv, err := httpx.NewServer(httpx.ServerOptions{
 		Service:  service,
 		Addr:     cfg.HTTPAddr,
@@ -222,24 +341,35 @@ func run() error {
 		// three round trips to answer one question and collapse into one JSON key
 		// anyway.
 		//
-		// There is no Postgres checker because this binary opens no pool, and no
-		// Redis checker because it opens no client. config.Pricer declares
-		// RequireRedis, which under the phase-2 rule would oblige one — but there
-		// is no internal/platform/redis in the tree, so no service opens Redis and
-		// inventing a client to satisfy the declaration would reproduce the
-		// phase-2 defect rather than avoid it. Reported upward for reconciliation;
-		// a probe that stays silent about a dependency is honest, one that returns
-		// 200 for a dependency the binary never opened is not.
-		Checkers: []httpx.Checker{producer, svc},
+		// *analytics.Service is listed for the same reason and answers a DIFFERENT
+		// question: a replica whose signals consumer has exited while its pricing
+		// consumer is healthy would otherwise look entirely fine while the
+		// analytics surface silently stopped updating.
+		//
+		// The Postgres pool IS listed, because phase 9 made config.Pricer declare
+		// RequirePostgres and this binary therefore opens one. The declaration and
+		// the probe have to move together: a binary that declared a dependency and
+		// never opened it answered 200 with the database stopped, which is the
+		// phase-2 defect the contract ledger records and is worse than no probe at
+		// all. There is deliberately NO Redis checker, and that is the same rule
+		// read the other way — config.Pricer does not declare RequireRedis and this
+		// binary opens no client, so there is nothing to probe.
+		Checkers: checkers(producer, svc, signals, db),
 	})
 	if err != nil {
 		return fmt.Errorf("%s: build operational listener: %w", service, err)
 	}
 
-	// The listener and the pricing loop run together and stop together: both
-	// observe ctx, so SIGTERM drains the loop while /readyz is still answering,
+	// The listener and BOTH consumer loops run together and stop together: all
+	// three observe ctx, so SIGTERM drains them while /readyz is still answering,
 	// which is what lets an orchestrator take this replica out of rotation before
-	// its consumer finishes committing.
+	// its consumers finish committing.
+	//
+	// The two loops are independent. A failure in either is collected and the other
+	// keeps running until ctx is cancelled, because a signals stage that cannot
+	// reach Postgres is no reason to stop pricing the board — the priced topic is
+	// what `stream` serves, and it is strictly more important than the analytics
+	// surface built on top of it.
 	var (
 		wg   sync.WaitGroup
 		mu   sync.Mutex
@@ -254,7 +384,7 @@ func run() error {
 		mu.Unlock()
 	}
 
-	wg.Add(2)
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
 		fail(srv.Run(ctx))
@@ -262,6 +392,10 @@ func run() error {
 	go func() {
 		defer wg.Done()
 		fail(svc.Run(ctx))
+	}()
+	go func() {
+		defer wg.Done()
+		fail(signals.Run(ctx))
 	}()
 	wg.Wait()
 
@@ -359,4 +493,24 @@ func newEngine(cfg *config.Config, registry prometheus.Registerer) (pricing.Pric
 	// configuration would silently hold yesterday's numbers for every market
 	// that had not moved. See pricing.Engine.ConfigDigest.
 	return price, engine.ConfigDigest(), nil
+}
+
+// checkers assembles the readiness set, including the database only when this
+// binary actually opened one.
+//
+// It exists to make a typed-nil trap impossible rather than merely unlikely. A
+// nil *postgres.DB assigned into an httpx.Checker interface is a NON-NIL
+// interface holding a nil pointer, so appending it unconditionally and relying on
+// a nil check inside httpx would produce a probe that reported on a pool that was
+// never opened — which is precisely the phase-2 defect the contract ledger
+// records, and precisely the shape it took.
+//
+// The argument is therefore the concrete type, and the conversion happens on the
+// inside of the check.
+func checkers(producer *kafka.OddsProducer, priced *pricing.Service, signals *analytics.Service, db *postgres.DB) []httpx.Checker {
+	out := []httpx.Checker{producer, priced, signals}
+	if db != nil {
+		out = append(out, db)
+	}
+	return out
 }

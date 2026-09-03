@@ -40,6 +40,8 @@ const CELL =
 
 export interface MarketColumnProps {
   readonly eventId: string;
+  /** Threaded down so a slip leg can name the event it is on. */
+  readonly eventName: string;
   readonly column: BoardColumn;
   /** Null when this event does not offer the column's market. */
   readonly market: SchemaMarket | null;
@@ -49,6 +51,7 @@ export interface MarketColumnProps {
 
 export function MarketColumn({
   eventId,
+  eventName,
   column,
   market,
   catalogue,
@@ -85,6 +88,7 @@ export function MarketColumn({
             <PriceCell
               key={selection.id}
               eventId={eventId}
+              eventName={eventName}
               marketId={market.id}
               marketType={market.type}
               marketStatus={market.status}

@@ -17,8 +17,8 @@ import (
 // in particular exists to fail on a rename, loudly, next to a comment explaining
 // why a rename is not a refactor.
 
-// TestTopicNamesAreTheFrozenLiterals pins the four names against the strings
-// Terraform declares.
+// TestTopicNamesAreTheFrozenLiterals pins every declared name, plus the odds.raw.
+// prefix, against the strings Terraform declares.
 //
 // Renaming one is a breaking change that orphans a compacted log: the old topic
 // keeps every market's current line, the new one starts empty, and every client
@@ -36,6 +36,15 @@ func TestTopicNamesAreTheFrozenLiterals(t *testing.T) {
 		{"price.computed", TopicPriceComputed, "price.computed"},
 		{"wager.events", TopicWagerEvents, "wager.events"},
 		{"odds.raw. prefix", TopicOddsRawPrefix, "odds.raw."},
+		// Phase 9. Three of these are named in CLAUDE.md §3's event-flow
+		// diagram (`signals.steam | signals.arb | signals.clv`); signals.ev is
+		// the documented addition. Same rule as the four above -- a rename here
+		// is a breaking change, not a refactor, because a consumer group's
+		// committed offsets are keyed by topic name.
+		{"signals.ev", TopicSignalsEV, "signals.ev"},
+		{"signals.arb", TopicSignalsArb, "signals.arb"},
+		{"signals.steam", TopicSignalsSteam, "signals.steam"},
+		{"signals.clv", TopicSignalsCLV, "signals.clv"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -161,6 +170,57 @@ func TestRegistryTopics(t *testing.T) {
 			wantCompacted: false,
 			wantKey:       KeyKindWagerID,
 			wantString:    "wager.events[delete,key=wager_id]",
+		},
+		{
+			// NOT compacted, and that is the decision the whole signals family
+			// turns on. Compaction keeps the latest record per key, which only
+			// means something when the latest record SUPERSEDES the earlier
+			// ones. "The latest +EV finding for market X" supersedes nothing:
+			// the previous finding is a different event that also happened.
+			name:          "signals.ev is retention-based and keyed by market",
+			topic:         SignalsEV(),
+			wantName:      "signals.ev",
+			wantRetention: RetentionDelete,
+			wantCompacted: false,
+			wantKey:       KeyKindMarketID,
+			wantString:    "signals.ev[delete,key=market_id]",
+		},
+		{
+			name:          "signals.arb is retention-based and keyed by market",
+			topic:         SignalsArb(),
+			wantName:      "signals.arb",
+			wantRetention: RetentionDelete,
+			wantCompacted: false,
+			wantKey:       KeyKindMarketID,
+			wantString:    "signals.arb[delete,key=market_id]",
+		},
+		{
+			// CLAUDE.md §3: "hopping window over line-movement velocity, keyed
+			// by market, across books." The bus key is the market even though
+			// migration 00009 keys the TABLE by (market, selection, window),
+			// because steam is directional -- the finer key belongs where the
+			// row is stored, not where ordering is bought.
+			name:          "signals.steam is retention-based and keyed by market",
+			topic:         SignalsSteam(),
+			wantName:      "signals.steam",
+			wantRetention: RetentionDelete,
+			wantCompacted: false,
+			wantKey:       KeyKindMarketID,
+			wantString:    "signals.steam[delete,key=market_id]",
+		},
+		{
+			// The one signals topic keyed by WAGER. odds/clv.go: "the settle
+			// service writes one per graded leg" -- a CLV record is a fact about
+			// a wager, so keying it by wager_id co-partitions it with
+			// wager.events and keeps a wager's placement, settlement and CLV
+			// ordered against each other.
+			name:          "signals.clv is retention-based and keyed by wager",
+			topic:         SignalsCLV(),
+			wantName:      "signals.clv",
+			wantRetention: RetentionDelete,
+			wantCompacted: false,
+			wantKey:       KeyKindWagerID,
+			wantString:    "signals.clv[delete,key=wager_id]",
 		},
 		{
 			// Keyed by EVENT, not market — the provider returns one payload per
@@ -359,15 +419,28 @@ func TestOddsRawBuildsAValidTopicName(t *testing.T) {
 }
 
 // TestTopicsListsTheNamedTopicsOnly checks that Topics() enumerates exactly the
-// three topics whose existence is not a deployment decision.
+// seven topics whose existence is not a deployment decision, in pipeline order.
 //
 // odds.raw.* is deliberately absent: which providers exist is held in Terraform's
 // raw_providers, and a Go-side list of them would be a second copy that drifts.
+//
+// The ORDER is asserted, not just the membership. Callers enumerate this list for
+// health checks and operator bookmarks, and pipeline order -- market stream, the
+// signals derived from it, wager stream, the CLV derived from that -- is the one
+// a human reading the output wants.
 func TestTopicsListsTheNamedTopicsOnly(t *testing.T) {
 	t.Parallel()
 
 	got := Topics()
-	want := []string{TopicOddsNormalized, TopicPriceComputed, TopicWagerEvents}
+	want := []string{
+		TopicOddsNormalized,
+		TopicPriceComputed,
+		TopicSignalsEV,
+		TopicSignalsArb,
+		TopicSignalsSteam,
+		TopicWagerEvents,
+		TopicSignalsCLV,
+	}
 	if len(got) != len(want) {
 		t.Fatalf("Topics() returned %d topics, want %d: %v", len(got), len(want), got)
 	}
@@ -421,7 +494,13 @@ func TestLookupTopicRoundTripsTheRegistry(t *testing.T) {
 		{"a near miss", "odds.normalised", "British spelling; the frozen literal is odds.normalized"},
 		{"a raw topic with an illegal provider", "odds.raw.The_Odds_API", "Terraform would reject that provider"},
 		{"a raw topic with a trailing hyphen", "odds.raw.synthetic-", "a trailing hyphen is not a legal provider"},
-		{"a phase-12 signals topic", "signals.steam", "deliberately not enumerated yet"},
+		// signals.steam USED to be the standing example here of a topic this
+		// registry deliberately did not enumerate. Phase 9 declares it, so the
+		// example moves to a name from the family that is still hypothetical --
+		// which keeps the permissive path covered without pretending a declared
+		// topic is unknown.
+		{"an undeclared member of the signals family", "signals.middles", "middles are not a phase-9 alert; see migration 00009"},
+		{"a near miss in the signals family", "signals.arbitrage", "the frozen literal is signals.arb"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -523,7 +602,10 @@ func TestValidateTopicName(t *testing.T) {
 func TestEveryDeclaredTopicNameIsLegal(t *testing.T) {
 	t.Parallel()
 
-	names := []string{TopicOddsNormalized, TopicPriceComputed, TopicWagerEvents}
+	names := []string{
+		TopicOddsNormalized, TopicPriceComputed, TopicWagerEvents,
+		TopicSignalsEV, TopicSignalsArb, TopicSignalsSteam, TopicSignalsCLV,
+	}
 	for _, provider := range []Provider{"synthetic", "the-odds-api"} {
 		topic, err := OddsRaw(provider)
 		if err != nil {

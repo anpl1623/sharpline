@@ -16,6 +16,7 @@
 #   - §9  real healthcheck on every stateful container (postgres/redis/kafka)
 #   - §9  migrate runs to completion before api starts
 #   - §9  named volumes for all persistent state -> `docker compose down -v` resets
+#         it (and ONLY it: the build-input volumes are `external:` -- see below)
 #   - §9  single user-defined bridge network with service-name DNS
 #   - §12 base images pinned by digest, never by floating tag
 #
@@ -106,11 +107,13 @@ x-env-base: &env-base
   # Empty => telemetry export disabled. compose.obs.yaml points this at the collector.
   SHARPLINE_OTEL_ENDPOINT: ${SHARPLINE_OTEL_ENDPOINT:-}
 
-# api, ingest, settle, migrate  (config.RequirePostgres)
+# api, ingest, pricer, settle, migrate  (config.RequirePostgres)
 #
 # ingest is on this list because it hosts the Timescale line-history writer
 # (CLAUDE.md §3: odds.normalized → timescale writer), not because it queries the
-# catalogue.
+# catalogue. pricer joined in phase 9 because it hosts the SIGNALS STAGE, which
+# persists +EV, arbitrage and steam findings — the pricing pass itself still
+# touches no database.
 x-env-postgres: &env-postgres
   SHARPLINE_POSTGRES_DSN: postgres://${POSTGRES_USER:-sharpline}:${POSTGRES_PASSWORD:-sharpline-dev-postgres}@postgres:5432/${POSTGRES_DB:-sharpline}?sslmode=disable
 
@@ -422,6 +425,14 @@ services:
       # changing the monthly bill, so it is deliberately not given a non-default
       # value here.
       SHARPLINE_INGEST_LIVE_INTERVAL: ${SHARPLINE_INGEST_LIVE_INTERVAL:-}
+      # The results poller's cadence and its "plausibly over" horizon (CLAUDE.md
+      # §3's second arrow, `results -> settle`). Empty => the poller's own
+      # defaults of 1m and 2h. Unlike the live cadence above, neither costs odds
+      # credits: the interval buys one indexed read plus one scores call, and the
+      # interval is the FLOOR of how long a customer waits between the final
+      # whistle and their ticket becoming settleable.
+      SHARPLINE_INGEST_RESULTS_INTERVAL: ${SHARPLINE_INGEST_RESULTS_INTERVAL:-}
+      SHARPLINE_INGEST_RESULTS_DELAY: ${SHARPLINE_INGEST_RESULTS_DELAY:-}
     depends_on: *go-deps
     deploy:
       resources:
@@ -437,11 +448,14 @@ services:
         SERVICE: pricer
     image: ${SHARPLINE_IMAGE_PREFIX:-sharpline}/pricer:${SHARPLINE_IMAGE_TAG:-local}
     environment:
-      # config.Pricer = HTTP | Kafka. Pure math over the bus: it opens neither a
-      # database connection nor a Redis client, so it is given neither. Its whole state
-      # is a fold of the compacted price.computed topic and rebuilds from one snapshot
-      # read on start — internal/pricing/doc.go argues why that must not become a cache.
-      <<: [*env-base, *env-kafka]
+      # config.Pricer = HTTP | Postgres | Kafka. The PRICING pass is still pure math
+      # over the bus with no cache: its whole state is a fold of the compacted
+      # price.computed topic and rebuilds from one snapshot read on start —
+      # internal/pricing/doc.go argues why that must not become a cache. The database
+      # credential is for the phase-9 SIGNALS STAGE, a second consumer group in the
+      # same binary that writes the analytics tables. Still no Redis client: nothing
+      # here rate-limits a provider or holds subscription state.
+      <<: [*env-base, *env-postgres, *env-kafka]
       SHARPLINE_HTTP_ADDR: ":8082"
       # Ordered sharp-book preference, most preferred first. It is only consulted for
       # books the provider has NOT designated on the wire; both adapters do designate
@@ -696,13 +710,38 @@ networks:
           # "Address already in use".
           ip_range: 172.28.1.0/24
 
+# TWO CATEGORIES, AND THE DIFFERENCE IS LOAD-BEARING.
+#
+# Above the line: APPLICATION STATE. Project-scoped, so `make down-hard` destroys
+# them -- that is what makes it the reset button, and a volume added here tomorrow
+# inherits that behaviour with no edit anywhere else.
 volumes:
   postgres-data:
   redis-data:
   kafka-data:
   caddy-data:
   caddy-config:
-  # Declared here so both compose.dev.yaml (hot reload) and compose.tools.yaml
-  # (`npm install` inside a container) can attach the same node_modules.
+
+  # Below the line: BUILD INPUTS, and therefore `external: true`.
+  #
+  # Declared in THIS file rather than an overlay because two overlays attach them --
+  # compose.dev.yaml (hot reload) and compose.tools.yaml (`npm install` in a
+  # container) -- and a volume must be in the merged model for both.
+  #
+  # That adjacency is exactly why GAP 4's other candidate fix, scoping `down-hard`'s
+  # `--volumes` to this file, does not work: postgres-data and web-node-modules sit
+  # in the same file and must not share a fate. The category belongs on the volume,
+  # not on the filename. `external:` puts it there. See the `down-hard` recipe.
+  #
+  # Concretely: node_modules is installed from the committed lockfile by `make
+  # web-deps` and reinstalling it needs the network, so destroying it on every reset
+  # made `make down-hard && make up` an online-only operation.
+  #
+  # `make cache-init` creates and seeds these (Compose will not start a service that
+  # mounts a missing external volume); `make cache-clean` is what deletes them.
   web-node-modules:
+    name: sharpline-web-node-modules
+    external: true
   web-next-cache:
+    name: sharpline-web-next-cache
+    external: true

@@ -431,6 +431,36 @@
   }
 
   /* -----------------------------------------------------------------------
+   * ON THE SLIP — the trailing rule.
+   *
+   * A price cell that is on the bet slip carries a 2px rule on its TRAILING
+   * edge, mirroring the delta rail on the leading one. The two never collide:
+   * the leading edge is movement and decays, the trailing edge is intent and
+   * persists until the customer removes the leg.
+   *
+   * IT SPENDS NO HUE, and that is the decision rather than an oversight. The
+   * palette has exactly five colours and each does one job — cyan and amber are
+   * direction, green is money, red is wrong, blue is system state. "This is on
+   * my slip" is none of those, and giving one of them a second job is precisely
+   * what DESIGN.md's colour rule forbids. `ink-2` is a foreground weight, not a
+   * meaning, so the mark reads as a mark and the board stays quiet at rest.
+   *
+   * Colour is not the sole carrier either way: the cell is a toggle button
+   * carrying `aria-pressed`, and its accessible name says "on the bet slip".
+   * --------------------------------------------------------------------- */
+  .price-cell[data-on-slip="true"]::after {
+    content: "";
+    position: absolute;
+    inset-block: 0;
+    inset-inline-end: 0;
+    width: 2px;
+    border-start-end-radius: var(--radius-price);
+    border-end-end-radius: var(--radius-price);
+    background-color: var(--color-ink-2);
+    pointer-events: none;
+  }
+
+  /* -----------------------------------------------------------------------
    * The digit roll. Structure the board should render:
    *
    *   <span class="digit-roll">

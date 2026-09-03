@@ -12,7 +12,7 @@
 // "Deliberately unseeded: ingest creates the synthetic row". The catalogue is a
 // projection of the stream, and these statements are the projection.
 //
-// # Two guards, and they answer different questions
+// # Four guards, and they answer different questions
 //
 //	DISTINCTNESS   Every statement's ON CONFLICT DO UPDATE carries
 //	               `WHERE (stored columns) IS DISTINCT FROM (excluded columns)`.
@@ -41,6 +41,69 @@
 //	               observation column and need none: nothing about them moves.
 //	               A league's name changing is a correction, and last-writer-wins
 //	               is the right resolution for a correction.
+//
+//	FINALITY       `events` additionally carries
+//	               `WHERE events.status NOT IN ('ended', 'settled', 'cancelled')`,
+//	               and monotonicity does not subsume it. The two guards order
+//	               different clocks: monotonicity compares this record against
+//	               the last record from the SAME path, while a result arrives on
+//	               a different path entirely — the results poller, whose write is
+//	               internal/platform/postgres/queries/results.sql. A quote
+//	               observed after the final whistle is genuinely newer, so
+//	               `excluded.observed_at >= events.observed_at` holds and lets it
+//	               through.
+//
+//	               What it would then write is the damage. This path has no
+//	               result to state — RawEvent carries no status or score field and
+//	               the normalizer can only emit `scheduled` or `live`, so
+//	               eventArgs sends NULL for score_home and score_away on every
+//	               record. Without this guard a late quote reverts a finished
+//	               contest to `live` and NULLs the score settlement grades from,
+//	               and it does so silently: the row is a legal event, every
+//	               container stays healthy, and the only symptom is a wager whose
+//	               stake sits in escrow with nothing left to settle it.
+//
+//	               Both guards are needed because either alone leaves a hole:
+//	               drop monotonicity and a replay rolls a live event back to
+//	               scheduled; drop finality and a live quote un-ends a finished
+//	               one. `markets` deliberately does NOT carry finality — a market
+//	               closes on its own status, which the provider does report, and
+//	               freezing markets when their event finalises would be a
+//	               different change with a different owner (nothing yet tombstones
+//	               an ended event's markets off odds.normalized).
+//
+//	               The status vocabulary is the results write's own, deliberately:
+//	               `postponed` is absent from both because a postponed event
+//	               returns to `scheduled` once a new time is known, so it is not
+//	               final and the odds path still has true things to say about it.
+//
+//	UNTOUCHEDNESS  Those same four statements additionally carry a
+//	               `WHERE NOT EXISTS (... IS NOT DISTINCT FROM ...)` anti-join in
+//	               front of the ON CONFLICT, and it is a LOCKING guard rather than
+//	               a writing one. The distinctness guard above stops the write; it
+//	               does NOT stop the lock, because ON CONFLICT DO UPDATE takes an
+//	               exclusive row lock on the conflicting row BEFORE it evaluates
+//	               that WHERE and holds it to COMMIT. A row filtered out here never
+//	               reaches ON CONFLICT and is therefore never locked at all.
+//
+//	               This became load-bearing in phase 9. The signals stage inserts
+//	               ev_signals, whose foreign keys make Postgres take FOR KEY SHARE
+//	               on the very rows this function was locking exclusively — the
+//	               league, the two books, the selection — in referential-integrity
+//	               trigger order, which is not this function's FK order. Two
+//	               orders, two processes, and the cycle is a deadlock; before phase
+//	               9 nothing else wrote these parents, so none was reachable. The
+//	               observable symptom on a running stack was a line-history writer
+//	               silently dropping a few percent of its price batches while every
+//	               container reported healthy. FOR KEY SHARE is compatible with
+//	               itself, so once the steady state stops taking the exclusive
+//	               lock the cycle has no edge to close on.
+//
+//	               `events` and `markets` deliberately do NOT carry it: their
+//	               observed_at moves on every poll, so nothing would ever be
+//	               filtered and the anti-join would be a probe that always misses.
+//	               The rows they lock are the record's own event and market, which
+//	               no second transaction is competing for in a different order.
 //
 // # RETURNING (xmax = 0), and why the row count is not enough
 //
@@ -92,7 +155,11 @@ const (
 
 const upsertSport = `
 INSERT INTO sports (id, slug, name)
-VALUES ($1, $2, $3)
+SELECT $1, $2, $3
+ WHERE NOT EXISTS (
+       SELECT 1 FROM sports s
+        WHERE s.id = $1
+          AND (s.slug, s.name) IS NOT DISTINCT FROM ($2, $3))
 ON CONFLICT (id) DO UPDATE
    SET slug = excluded.slug,
        name = excluded.name
@@ -101,7 +168,11 @@ RETURNING (xmax = 0)`
 
 const upsertLeague = `
 INSERT INTO leagues (id, sport_id, slug, name)
-VALUES ($1, $2, $3, $4)
+SELECT $1, $2, $3, $4
+ WHERE NOT EXISTS (
+       SELECT 1 FROM leagues l
+        WHERE l.id = $1
+          AND (l.sport_id, l.slug, l.name) IS NOT DISTINCT FROM ($2, $3, $4))
 ON CONFLICT (id) DO UPDATE
    SET sport_id = excluded.sport_id,
        slug     = excluded.slug,
@@ -138,6 +209,7 @@ ON CONFLICT (id) DO UPDATE
        score_away           = excluded.score_away,
        observed_at          = excluded.observed_at
  WHERE excluded.observed_at >= events.observed_at
+   AND events.status NOT IN ('ended', 'settled', 'cancelled')
    AND (events.league_id, events.kind, events.name,
         events.home_competitor_id, events.home_competitor_name,
         events.away_competitor_id, events.away_competitor_name,
@@ -176,11 +248,21 @@ RETURNING (xmax = 0)`
 //
 // ON CONFLICT DO UPDATE and not DO NOTHING: a book's display name or its
 // reference flag legitimately changes, and a selection's name does (a provider
-// correcting a player's spelling). The distinctness guard makes the unchanged
-// case free.
+// correcting a player's spelling). The anti-join makes the unchanged case free —
+// free of the WRITE by the distinctness guard, and free of the LOCK by the
+// NOT EXISTS in front of it. See this file's header on why the second is not the
+// same claim as the first.
 const upsertBooks = `
 INSERT INTO books (id, slug, name, kind, is_reference)
-SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::boolean[])
+SELECT t.id, t.slug, t.name, t.kind, t.is_reference
+  FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::boolean[])
+       AS t(id, slug, name, kind, is_reference)
+ WHERE NOT EXISTS (
+       SELECT 1 FROM books b
+        WHERE b.id = t.id
+          AND (b.slug, b.name, b.kind, b.is_reference)
+              IS NOT DISTINCT FROM
+              (t.slug, t.name, t.kind, t.is_reference))
 ON CONFLICT (id) DO UPDATE
    SET slug         = excluded.slug,
        name         = excluded.name,
@@ -193,7 +275,15 @@ RETURNING (xmax = 0)`
 
 const upsertSelections = `
 INSERT INTO selections (id, market_id, market_type, role, name)
-SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[])
+SELECT t.id, t.market_id, t.market_type, t.role, t.name
+  FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[])
+       AS t(id, market_id, market_type, role, name)
+ WHERE NOT EXISTS (
+       SELECT 1 FROM selections s
+        WHERE s.id = t.id
+          AND (s.market_id, s.market_type, s.role, s.name)
+              IS NOT DISTINCT FROM
+              (t.market_id, t.market_type, t.role, t.name))
 ON CONFLICT (id) DO UPDATE
    SET market_id   = excluded.market_id,
        market_type = excluded.market_type,

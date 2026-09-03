@@ -19,6 +19,12 @@ name: sharpline
 
 services:
 
+  # ---- data plane: host port exposed for local dev tooling -----------------------------
+
+  postgres:
+    ports:
+      - "5432:5432"
+
   # ---- frontend: Next dev server in a container, hot reload intact ---------------------
 
   web:
@@ -48,6 +54,19 @@ services:
       - type: bind
         source: ../../web/src
         target: /app/src
+        bind:
+          create_host_path: false
+      # public/ is mounted on exactly the same terms, and for a sharper reason than
+      # convenience. next/font/local resolves web/public/fonts/ClashGrotesk-*.woff2
+      # at COMPILE time from web/src/lib/fonts.ts, so an unreadable public/ does not
+      # degrade to a fallback face — the module fails to resolve and every route that
+      # renders the root layout answers 500 with the container stuck unhealthy.
+      # create_host_path: false for the same reason as src/: if web/public ever goes
+      # missing, that must be a loud failure and not an empty directory Docker
+      # invented, which is the precise shape the outage took the first time.
+      - type: bind
+        source: ../../web/public
+        target: /app/public
         bind:
           create_host_path: false
       # ...but node_modules and .next live on NAMED VOLUMES, so host-architecture

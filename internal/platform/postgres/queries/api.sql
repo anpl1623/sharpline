@@ -500,3 +500,83 @@ VALUES (@occurred_at, @actor_kind, @actor_id, @action,
         @entity_type, @entity_id, @outcome, @reason,
         @state_before, @state_after,
         @trace_id, @span_id, @request_id, @client_ip);
+
+
+-- ============================================================================
+-- Self-exclusion
+-- ============================================================================
+--
+-- CLAUDE.md section 6 (Account): "responsible-gaming-style self-imposed limits
+-- (a nod to how the real domain works)." The limit queries above are the
+-- amount-and-period half of that; this is the other half -- the customer asking
+-- the system to stop them entirely.
+--
+-- users.status has carried 'self_excluded' since migration 00005 and the
+-- placement path has enforced it in three independent layers since 00008 -- the
+-- betting service reads the status inside the placement transaction, the HTTP
+-- layer maps its sentinel to a 403, and a BEFORE INSERT trigger on `wagers`
+-- refuses the row for any writer that reached the table another way. What was
+-- missing was the statement that SETS it. Without this, the control existed and
+-- no customer could reach it.
+
+
+-- Move a user to a status that narrows their own access.
+--
+-- THIS QUERY ONLY EVER NARROWS, AND THAT IS ENFORCED IN THE WHERE CLAUSE RATHER
+-- THAN IN THE CALLER. Both guards are load-bearing:
+--
+--   @status IN ('self_excluded','closed') bounds the DESTINATION. users.status
+--   also admits 'active' and 'suspended', and this statement can reach neither.
+--   So it cannot lift a self-exclusion, cannot lift an operator's suspension,
+--   and cannot reinstate a closed account -- no matter what a caller passes, and
+--   no matter what a bug upstream computes. Migration 00008 makes exactly this
+--   asymmetry the point of putting the guard in the database: "an operator can
+--   lift a suspension they imposed, but nobody may quietly book a bet for a
+--   customer who asked the system to stop them." Widening access is an OPERATOR
+--   action with a different actor, a different authorisation and a different
+--   audit action, and it gets its own statement when the admin console is built.
+--   It does not get this one, and it must not be added to this one.
+--
+--   status NOT IN ('self_excluded','closed') bounds the SOURCE, and it is what
+--   stops the destination guard from being defeated by chaining. Without it,
+--   'self_excluded' -> 'closed' -> ... is still narrowing, but
+--   'closed' -> 'self_excluded' is a WIDENING move dressed as a narrowing one:
+--   a closed account cannot authenticate (auth.UserStatus.CanAuthenticate) and
+--   a self-excluded one deliberately still can, because locking a customer out
+--   of their own history is not a protection. Refusing every already-narrowed
+--   source closes that route and makes the rule statable in one sentence:
+--   a status in this set is a one-way door.
+--
+-- :execrows, and the caller MUST check the count, exactly as SupersedeUserLimit
+-- above requires. ONE means this call was the one that applied it. ZERO IS NOT
+-- AN ERROR AND MUST NOT BE REPORTED AS ONE: it means the customer is already
+-- self-excluded or closed, which is the outcome they asked for and is a success
+-- from where they are standing. Returning a 500 -- or worse, a message implying
+-- the exclusion did not take -- at the moment somebody is trying to stop
+-- themselves gambling is the single worst response this endpoint can produce.
+--
+-- "No such user" is NOT what a zero row count means here, because the caller has
+-- already ruled it out: the write is preceded in the same transaction by
+-- GetAccountProfile, which returns pgx.ErrNoRows for an unknown id and which the
+-- caller needs anyway -- it is the `state_before` of the audit entry this write
+-- is paired with, and the handler must render the resulting state either way.
+-- That is the same read-then-guarded-write shape the limits path uses
+-- (GetCurrentUserLimit, then SupersedeUserLimit).
+--
+-- THE AUDIT ENTRY IS NOT OPTIONAL AND NOT AFTERWARDS. CLAUDE.md section 6
+-- requires an audit record on every state-changing action; this is one, and
+-- InsertAuditEntry above goes in the SAME transaction, so the status change and
+-- its record commit together or neither does.
+--
+-- updated_at is stamped by the users_set_updated_at trigger (00005) and is
+-- deliberately not named here. password_changed_at is untouched: a
+-- self-exclusion is not a credential change and must not invalidate the
+-- customer's refresh-token families -- they can still sign in and read their
+-- history, which is the whole reason CanAuthenticate stays true for this status.
+--
+-- name: UpdateUserStatus :execrows
+UPDATE users
+   SET status = @status
+ WHERE id = @user_id
+   AND @status IN ('self_excluded', 'closed')
+   AND status NOT IN ('self_excluded', 'closed');
