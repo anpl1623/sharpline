@@ -73,7 +73,42 @@ const (
 	// Deliberately looser than [DefaultMaxFairPriceAge] (10s). A placement is a
 	// customer taking a number the book posted; a cash-out is the book quoting
 	// a number back. The side making the offer wears the staleness risk.
-	DefaultMaxQuoteAge = 3 * time.Minute
+	//
+	// # Why it is SEVEN minutes and not three
+	//
+	// Three was derived from the poll cadence alone -- two 90-second live
+	// intervals, covering one fully suppressed sweep -- and that derivation is
+	// incomplete, because the poll cadence is not what bounds how old the
+	// freshest row gets. The NORMALIZER's suppression ceiling is:
+	// normalizer.DefaultRefreshAfter republishes an unchanged market only once
+	// five minutes have passed, and PriceRef.ObservedAt is deliberately excluded
+	// from the change-detection hash (fingerprint.go names it "the staleness
+	// subtrahend"), so a quiet market's newest stored quote does not advance at
+	// all between republications.
+	//
+	// Five minutes of ceiling against a three-minute horizon means a quiet
+	// market is structurally unbettable for the two minutes between them. That
+	// is not a corner case, it is the steady state, and it was measured on a
+	// healthy pipeline rather than reasoned about: quote age climbed past three
+	// minutes and 230 of 978 selections -- 24% of the board -- were refused
+	// simultaneously, on a sawtooth that reset only when the ceiling fired.
+	//
+	// The worst case a quiet market can reach is the ceiling plus one live poll,
+	// because the republish happens on the first sweep AFTER the ceiling
+	// elapses: 5m + 90s = 6m30s, plus pipeline lag from provider to stored row.
+	// Seven minutes clears that with margin and still fails loudly on the
+	// condition this check exists for -- a quote older than seven minutes means
+	// the ceiling itself did not fire, which is a wedged poller or a provider
+	// that has stopped answering, not a quiet line.
+	//
+	// THE THREE CONSTANTS ARE COUPLED and live in three packages, so a guard
+	// test asserts the relationship rather than trusting these comments to be
+	// read: see TestMaxQuoteAgeClearsTheSuppressionCeiling. Retuning the poll
+	// cadence or the ceiling without retuning this fails that test.
+	//
+	// The KNOWN LIMIT below is unchanged and is why this is a generous bound
+	// rather than a tight one.
+	DefaultMaxQuoteAge = 7 * time.Minute
 
 	// DefaultIdempotencyTTL is how long the Redis fast path remembers a key.
 	//
