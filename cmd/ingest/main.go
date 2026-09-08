@@ -14,6 +14,28 @@
 // internal/ingest deliberately names neither of them: it takes a
 // provider.Adapter and cannot tell which one it was handed, which is what makes
 // the offline path exercise the online path's code.
+//
+// # The results poller runs here, beside internal/ingest.Service and not inside it
+//
+// CLAUDE.md §3 draws two arrows into the system and `results → settle` is the
+// second one; internal/ingest/results is the loop that fills it. It is started
+// as a peer goroutine of the pipeline rather than as one of its stages, for two
+// reasons that both point the same way.
+//
+// It shares NOTHING with the pipeline's stages. A stage is a Kafka consumer
+// whose unit of work is a delivery, whose failure mode is an uncommitted offset,
+// and whose shutdown must be ordered before the producer flush. The results
+// poller has no consumer group, no producer and no offsets: it reads a work
+// queue out of Postgres, asks the provider, and writes `events`. Folding it into
+// Service would give the pipeline a Postgres-plus-results-adapter dependency
+// that its own shutdown argument would then have to reason about.
+//
+// And it must NOT gate readiness, which is what being a stage would imply.
+// Service.Check reports "the stages are running", and the poller has a legitimate
+// terminal state that is not a fault: an adapter with no scores endpoint —
+// which is what a deployment with ODDS_API_KEY set has today — makes it log once
+// at WARN and stop. A replica in that state is serving a correct odds board and
+// must stay in rotation.
 package main
 
 import (
@@ -33,6 +55,8 @@ import (
 	"github.com/anpl1623/sharpline/internal/ingest/provider"
 	"github.com/anpl1623/sharpline/internal/ingest/provider/synthetic"
 	"github.com/anpl1623/sharpline/internal/ingest/provider/theoddsapi"
+	"github.com/anpl1623/sharpline/internal/ingest/results"
+	resultspg "github.com/anpl1623/sharpline/internal/ingest/results/pgstore"
 	"github.com/anpl1623/sharpline/internal/ingest/scheduler"
 	"github.com/anpl1623/sharpline/internal/ingest/writer"
 	"github.com/anpl1623/sharpline/internal/platform/buildinfo"
@@ -126,9 +150,27 @@ func run() error {
 		return fmt.Errorf("%s: %w", service, err)
 	}
 
-	adapter, decoder, err := selectAdapter(cfg, log)
+	adapter, resultsSource, decoder, err := selectAdapter(cfg, log)
 	if err != nil {
 		return fmt.Errorf("%s: %w", service, err)
+	}
+	// Prices and outcomes must come from ONE source. selectAdapter returns the
+	// same value twice today, so this cannot fire — which is the point: it is
+	// what keeps that true through a later change that legitimately splits the
+	// two (CLAUDE.md §13 leaves the provider open, and a results vendor separate
+	// from the odds vendor is a real option). A deployment quoting one book's
+	// prices and settling against another's scores would grade tickets against
+	// contests that were never the ones priced, and it would do so silently.
+	//
+	// The name is load-bearing a second way since the results seam became a
+	// window query: internal/ingest/results derives the identifier the database
+	// holds from the provider key an adapter states, and the provider slug is
+	// part of that derivation. A results source whose name disagreed with the
+	// odds source's would resolve every outcome onto an identifier the catalogue
+	// does not contain.
+	if resultsSource.Name() != adapter.Name() {
+		return fmt.Errorf("%s: odds come from %s but results come from %s; a deployment must "+
+			"settle against the source it priced", service, adapter.Name(), resultsSource.Name())
 	}
 
 	icfg, err := ingest.LoadConfig(cfg, adapter)
@@ -223,6 +265,31 @@ func run() error {
 		return fmt.Errorf("%s: %w", service, err)
 	}
 
+	// The second arrow. Its collectors register on the same registry as
+	// everything else, so `sharpline_ingest_results_*` appears on this process's
+	// /metrics beside the odds series and a dashboard can put the settlement lag
+	// next to the staleness it is the downstream twin of.
+	resultsStore, err := resultspg.NewStore(db)
+	if err != nil {
+		return fmt.Errorf("%s: %w", service, err)
+	}
+	resultsPoller, err := results.New(results.Options{
+		Config: results.Config{
+			// Both are zero unless the operator set them, and zero means the
+			// package's own default. config.Load refuses a non-positive value
+			// for either, so a set-but-useless cadence cannot reach here.
+			Interval:    cfg.IngestResultsInterval,
+			SettleDelay: cfg.IngestResultsDelay,
+		},
+		Provider: resultsSource,
+		Store:    resultsStore,
+		Logger:   log,
+		Registry: registry,
+	})
+	if err != nil {
+		return fmt.Errorf("%s: %w", service, err)
+	}
+
 	svc, err := ingest.New(ingest.Options{
 		Config:             icfg,
 		Adapter:            adapter,
@@ -280,7 +347,7 @@ func run() error {
 		mu.Unlock()
 	}
 
-	wg.Add(2)
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
 		fail(srv.Run(ctx))
@@ -288,6 +355,15 @@ func run() error {
 	go func() {
 		defer wg.Done()
 		fail(svc.Run(ctx))
+	}()
+	go func() {
+		defer wg.Done()
+		// Run observes ctx like the other two and returns nil for every ordinary
+		// ending — cancellation, a failed tick it backed off from, and a
+		// provider with no scores endpoint. So this arm cannot take the process
+		// down for a settlement outage, which would mean fixing a stalled feed
+		// by removing the odds board as well.
+		fail(resultsPoller.Run(ctx))
 	}()
 	wg.Wait()
 
@@ -317,12 +393,21 @@ func run() error {
 // makes "two providers produce identical domain values for equivalent input" a
 // property of the architecture rather than of a test.
 //
+// The RESULTS source comes back from the same call and from the same concrete
+// value, which is what makes "a deployment settles against the source it priced"
+// a property of the wiring rather than of a check somebody remembers to write.
+// provider.ResultsProvider is nonetheless a separate interface — see its own
+// doc comment: a results vendor distinct from the odds vendor is a legitimate
+// later choice, and this function is where that choice would be expressed.
+//
 // internal/ingest announces the outcome; this function only decides it.
-func selectAdapter(cfg *config.Config, log *slog.Logger) (provider.Adapter, normalizer.Decoder, error) {
+func selectAdapter(
+	cfg *config.Config, log *slog.Logger,
+) (provider.Adapter, provider.ResultsProvider, normalizer.Decoder, error) {
 	if cfg.HasOddsAPIKey() {
 		acfg, err := theoddsapi.ConfigFromEnv(os.LookupEnv)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		// ConfigFromEnv returns what the environment SAID, with every unset
 		// optional still zero. The adapter defaults them internally, so without
@@ -339,14 +424,14 @@ func selectAdapter(cfg *config.Config, log *slog.Logger) (provider.Adapter, norm
 		// series with different label sets fail the process at startup.
 		metrics, err := theoddsapi.NewMetrics(nil)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		adapter, err := theoddsapi.NewAdapter(acfg,
 			theoddsapi.WithLogger(log),
 			theoddsapi.WithMetrics(metrics),
 		)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		// The format is the adapter's, not a second opinion: the decoder converts
 		// whatever was ASKED FOR into decimal, and asking for one format while
@@ -358,27 +443,27 @@ func selectAdapter(cfg *config.Config, log *slog.Logger) (provider.Adapter, norm
 		// one.
 		decoder, err := theoddsapi.NewDecoder(acfg.OddsFormat, acfg.ReferenceBook, metrics)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		return adapter, decoder, nil
+		return adapter, adapter, decoder, nil
 	}
 
 	// Seeded from SHARPLINE_SYNTHETIC_SEED so a demo replays.
 	adapter, err := synthetic.New(synthetic.Options{Seed: cfg.SyntheticSeed})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	// The synthetic generator has no wire format of its own — it marshals the
 	// normalizer's neutral shape directly — so its decoder is a plain unmarshal.
 	busProvider, err := kafka.NewProvider(provider.NameSynthetic.String())
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	decoder, err := normalizer.NewNeutralDecoder(busProvider)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return adapter, decoder, nil
+	return adapter, adapter, decoder, nil
 }
 
 // newNormalizer builds the odds.raw.{provider} → odds.normalized stage.

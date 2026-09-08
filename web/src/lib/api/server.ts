@@ -51,6 +51,13 @@ export function serverFetch<T>(
     readonly method?: HttpMethod;
     readonly query?: Readonly<Record<string, QueryValue>> | undefined;
     readonly body?: unknown;
+    /**
+     * Forwarded rather than ignored, even though no server render can reach an
+     * endpoint that needs one. A transport that silently dropped a header the
+     * shared client sets would be a footgun waiting for the first caller who
+     * assumed otherwise, and forwarding it costs a line.
+     */
+    readonly headers?: Readonly<Record<string, string>> | undefined;
   } = {},
 ): Promise<T> {
   return request<T>({
@@ -59,6 +66,7 @@ export function serverFetch<T>(
     method: options.method ?? 'GET',
     query: options.query,
     body: options.body,
+    headers: options.headers,
     signal: options.signal,
     timeoutMs: options.timeoutMs ?? SERVER_TIMEOUT_MS,
     cache: 'no-store',

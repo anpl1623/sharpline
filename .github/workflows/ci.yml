@@ -349,6 +349,23 @@ jobs:
     needs: [directive]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    # RYUK_DISABLED: the testcontainers reaper is skipped ON THIS RUNNER ONLY.
+    #
+    # testcontainers-go waits for its reaper inside a backoff whose
+    # MaxElapsedTime is a hardcoded 20s with no environment override
+    # (reaper.go, reaperSpawner.backoff). On a loaded hosted runner that budget
+    # is not always enough, and when it lapses EVERY test in the package reports
+    # "the shared database is unavailable" -- a registry-and-scheduling problem
+    # wearing a database fault's clothes. `make ryuk-warm` takes the image pull
+    # out of the budget and made it rarer; it did not make it go away.
+    #
+    # The Makefile keeps the reaper by default and says why: it is the only
+    # thing that cleans up after a killed run, and this project has filled the
+    # Docker VM's disk once already. That argument is about a machine that
+    # SURVIVES the run. This runner is destroyed when the job ends, so a leaked
+    # container costs nothing here and the reaper is protecting nothing.
+    env:
+      RYUK_DISABLED: "true"
     steps:
       - uses: actions/checkout@v4
       - run: make test-race
@@ -372,6 +389,10 @@ jobs:
     needs: [directive]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    # Same reaper scoping as the race job above, for the same reason: this job
+    # stands up the same containers, on the same ephemeral runner.
+    env:
+      RYUK_DISABLED: "true"
     steps:
       - uses: actions/checkout@v4
       - run: make cover

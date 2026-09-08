@@ -43,6 +43,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/anpl1623/sharpline/internal/domain"
 	"github.com/anpl1623/sharpline/internal/ingest/writer"
 	"github.com/anpl1623/sharpline/internal/platform/kafka"
@@ -605,6 +607,70 @@ func TestOutOfOrderCatalogueObservationIsDiscarded(t *testing.T) {
 	}
 }
 
+// TestALateQuoteCannotUnEndAFinishedEvent.
+//
+// The odds path and the results path write the same row from different clocks.
+// A quote observed after the final whistle is genuinely newer, so the
+// monotonicity guard lets it through — and this path has no result to state:
+// the normalizer can only emit `scheduled` or `live` and eventArgs sends NULL
+// scores on every record. Without the finality guard the late quote reverts the
+// contest to `live` and NULLs the score, leaving a settled-in-principle wager
+// with its stake in escrow and nothing left to grade it.
+func TestALateQuoteCannotUnEndAFinishedEvent(t *testing.T) {
+	db := openPool(t)
+	w, _ := newWriter(t, db)
+	m := newMarket(t)
+
+	// The event exists and is live, written by the odds path as normal.
+	m.eventStatus = domain.EventStatusLive
+	if err := handle(t, w, delivery(t, m.marketID, m.payload(), 1)); err != nil {
+		t.Fatalf("first observation: %v", err)
+	}
+
+	// The results poller records the outcome. This is the shape of
+	// UpsertEventResult in internal/platform/postgres/queries/results.sql —
+	// four columns, not sixteen — issued here directly so the test depends on
+	// the guard under examination and not on the poller's own wiring.
+	finalAt := m.eventObsAt().Add(2 * time.Hour)
+	if err := exec(t, db, `UPDATE events
+	                          SET status = $2, score_home = $3, score_away = $4, observed_at = $5
+	                        WHERE id = $1`,
+		string(m.eventID), domain.EventStatusEnded.String(), 101, 98, finalAt); err != nil {
+		t.Fatalf("record the result: %v", err)
+	}
+
+	// A quote observed AFTER the whistle. Monotonicity does not stop it: its
+	// instant is later than the result's.
+	m.marketObsAt = finalAt.Add(30 * time.Second)
+	m.quoteObsAt = m.marketObsAt
+	if err := handle(t, w, delivery(t, m.marketID, m.payload(), 2)); err != nil {
+		t.Fatalf("late observation: %v", err)
+	}
+
+	if got := scalar[string](t, db,
+		`SELECT status FROM events WHERE id = $1`, string(m.eventID)); got != domain.EventStatusEnded.String() {
+		t.Errorf("events.status = %q after a late quote, want %q — the odds path un-ended a finished "+
+			"contest, and every stake on it is now stranded in escrow", got, domain.EventStatusEnded)
+	}
+	if got := scalar[int32](t, db,
+		`SELECT score_home FROM events WHERE id = $1`, string(m.eventID)); got != 101 {
+		t.Errorf("events.score_home = %d after a late quote, want 101 — the odds path carries no score "+
+			"and overwrote the recorded one with NULL", got)
+	}
+	if got := scalar[int32](t, db,
+		`SELECT score_away FROM events WHERE id = $1`, string(m.eventID)); got != 98 {
+		t.Errorf("events.score_away = %d after a late quote, want 98", got)
+	}
+
+	// The QUOTES still land. Finality freezes the event row, not the line
+	// history: a price observed after the whistle is a real observation, and
+	// refusing it would lose the closing line CLV is measured against.
+	if got := len(pricesFor(t, db, m)); got != 8 {
+		t.Errorf("prices has %d rows, want 8 — the finality guard is on the event row only and must "+
+			"not discard a late record's quotes", got)
+	}
+}
+
 // -----------------------------------------------------------------------------
 // Tombstones
 // -----------------------------------------------------------------------------
@@ -762,6 +828,149 @@ func TestRejectedRecordsWriteNothing(t *testing.T) {
 // payload cannot declare even ONE reference book, let alone two. Asserting a
 // rollback through a state the pipeline cannot produce would be testing the
 // harness rather than the writer.
+// TestAnUnchangedCatalogueRowIsNotLocked is the phase-9 regression guard on the
+// LOCK rather than on the write.
+//
+// TestUnchangedCatalogueRowsAreNotRewritten already proves the distinctness
+// guard stops the UPDATE. It does not prove the row is left alone, and it cannot:
+// ON CONFLICT DO UPDATE takes an exclusive row lock on the conflicting row
+// BEFORE evaluating that WHERE and holds it to COMMIT, so a statement that writes
+// nothing was still blocking every foreign-key check against the row for the life
+// of the transaction. That is what deadlocked against the signals stage, whose
+// ev_signals insert takes FOR KEY SHARE on the same books, leagues and selections
+// rows in a different order.
+//
+// The test holds exactly the lock a foreign-key check holds — FOR KEY SHARE, from
+// a second connection — and requires the writer to commit anyway, under a flush
+// timeout short enough that blocking is a failure rather than a delay. Against the
+// statement as it stood before the anti-join, this fails by timeout.
+func TestAnUnchangedCatalogueRowIsNotLocked(t *testing.T) {
+	db := openPool(t)
+	w, _ := newWriter(t, db, func(o *writer.Options) { o.FlushTimeout = 3 * time.Second })
+	m := newMarket(t)
+
+	// First pass creates the spine. Nothing is contended yet.
+	if err := handle(t, w, delivery(t, m.marketID, m.payload(), 1)); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	conn, err := db.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer conn.Release()
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Exactly the row lock a referential-integrity trigger takes when another
+	// table's insert references these rows. Every book and the league, because a
+	// single row cannot close a cycle on its own.
+	var one int
+	err = tx.QueryRow(ctx,
+		`SELECT 1 FROM books WHERE id = ANY($1::text[]) FOR KEY SHARE`,
+		[]string{string(m.bookA), string(m.bookB)}).Scan(&one)
+	if err != nil {
+		t.Fatalf("lock books: %v", err)
+	}
+	err = tx.QueryRow(ctx,
+		`SELECT 1 FROM leagues WHERE id = $1 FOR KEY SHARE`, string(m.leagueID)).Scan(&one)
+	if err != nil {
+		t.Fatalf("lock league: %v", err)
+	}
+
+	// The same unchanged catalogue, re-asserted while those locks are held.
+	if err := handle(t, w, delivery(t, m.marketID, m.payload(), 2)); err != nil {
+		t.Fatalf("re-asserting an UNCHANGED catalogue blocked on a FOR KEY SHARE lock "+
+			"that a foreign-key check holds: %v", err)
+	}
+}
+
+// deadlockingDB is the real pool with a deadlock injected in front of it.
+//
+// It is NOT a mocked database: every statement still runs against TimescaleDB.
+// What it fakes is only the ONE condition an integration test cannot arrange
+// deterministically — Postgres choosing this transaction as a deadlock victim —
+// and it fakes it with the SQLSTATE the server actually sends, so the classifier
+// under test (postgres.IsSerializationFailure) is the shipped one.
+type deadlockingDB struct {
+	db       writer.DB
+	deadlock int // how many leading attempts to fail
+	attempts int
+}
+
+func (d *deadlockingDB) InTx(ctx context.Context, fn postgres.TxFunc) error {
+	d.attempts++
+	if d.attempts <= d.deadlock {
+		return &pgconn.PgError{Code: "40P01", Message: "deadlock detected", Severity: "ERROR"}
+	}
+	return d.db.InTx(ctx, fn)
+}
+
+// TestADeadlockedWriteIsRetriedAndLands is the phase-9 regression guard.
+//
+// Phase 9 put a second writer on this transaction's foreign-key parents: the
+// signals stage inserts ev_signals, whose FKs make Postgres take FOR KEY SHARE on
+// the same leagues, books, markets and selections rows that upsertCatalogue takes
+// an exclusive lock on — in a different order. The observable symptom, before the
+// retry existed, was a line-history writer silently dropping a few percent of its
+// price batches on a running stack while every container reported healthy.
+//
+// The assertion that matters is the ROW COUNT: a deadlock guarantees a full
+// rollback, so a retry must produce exactly the rows one clean attempt would,
+// never a partial or doubled set.
+func TestADeadlockedWriteIsRetriedAndLands(t *testing.T) {
+	db := openPool(t)
+	gate := &deadlockingDB{db: db, deadlock: 1}
+	w, _ := newWriter(t, gate)
+	m := newMarket(t)
+
+	if err := handle(t, w, delivery(t, m.marketID, m.payload(), 1)); err != nil {
+		t.Fatalf("HandleMessage: %v; a deadlock victim must be re-run, not dropped", err)
+	}
+	if gate.attempts != 2 {
+		t.Fatalf("the pool saw %d transactions, want 2 (one victim, one that landed)", gate.attempts)
+	}
+	if rows := pricesFor(t, db, m); len(rows) != 4 {
+		t.Fatalf("prices has %d rows, want 4 (2 selections × 2 books)", len(rows))
+	}
+}
+
+// TestSustainedDeadlockingIsReportedRatherThanAbsorbed asserts the loop is
+// bounded and that the SQLSTATE survives it.
+//
+// An unbounded loop would convert sustained contention into unbounded handler
+// latency, which internal/platform/kafka's Consumer answers by fencing the group
+// member — a worse failure than the one being avoided, and one no metric names.
+// The record must fail so its offset stays uncommitted and the operator sees a
+// 40P01 rather than a timeout.
+func TestSustainedDeadlockingIsReportedRatherThanAbsorbed(t *testing.T) {
+	db := openPool(t)
+	gate := &deadlockingDB{db: db, deadlock: 99}
+	w, _ := newWriter(t, gate)
+	m := newMarket(t)
+
+	err := handle(t, w, delivery(t, m.marketID, m.payload(), 1))
+	if err == nil {
+		t.Fatal("sustained deadlocking was absorbed; the record must fail")
+	}
+	if got := postgres.SQLState(err); got != "40P01" {
+		t.Errorf("SQLSTATE = %q, want 40P01 carried through the retry loop: %v", got, err)
+	}
+	if gate.attempts < 2 {
+		t.Fatalf("the pool saw %d transactions; the write was not retried at all", gate.attempts)
+	}
+	if rows := pricesFor(t, db, m); len(rows) != 0 {
+		t.Fatalf("prices has %d rows after a transaction that never committed", len(rows))
+	}
+}
+
 func TestATransactionThatFailsMidwayLeavesNothing(t *testing.T) {
 	db := openPool(t)
 	w, reg := newWriter(t, db)

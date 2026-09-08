@@ -148,6 +148,33 @@ sql:
       # consumer, where catalogue.sql's are shared with ingest's polling
       # scheduler and must not grow the API's pagination parameters.
       - internal/platform/postgres/queries/api.sql
+      # Phase 8. Grading, settlement and cash-out: the UPDATE half of the
+      # betting domain. Separate from betting.sql because the two are governed
+      # by opposite mechanisms -- placement is INSERT work judged by DEFERRED
+      # constraint triggers at COMMIT, settlement is UPDATE work judged by
+      # IMMEDIATE row triggers per statement, and every statement in this file
+      # is `:execrows` guarded by its expected current status. That file's
+      # header has the full argument.
+      - internal/platform/postgres/queries/settlement.sql
+      # Phase 8. The RESULTS arm of ingest -- the second arrow of CLAUDE.md
+      # section 3's event flow, which draws `results` as an input to settle
+      # rather than as something carried on odds.normalized. Two statements: a
+      # work queue of contests that should have finished, and the guarded write
+      # of the outcome one came back with. Separate from catalogue.sql because
+      # that file's writes assert what an event IS on every poll across sixteen
+      # columns, and these assert what a contest FINALLY WAS, once, across four
+      # -- and must not be able to touch the other twelve.
+      - internal/platform/postgres/queries/results.sql
+      # Phase 9. The analytics surface: the three signal tables the pricer
+      # writes, the CLV ledger settle writes, the closing-price snapshot both
+      # of them read, and the API's ranked/paged reads plus the leaderboard.
+      # Separate from api.sql because these queries have THREE consumers with
+      # disjoint halves -- pricer writes, settle writes and reads, api reads --
+      # and because they are the surface phase 12's Flink SQL jobs have to
+      # reproduce. That file's header states the four replay keys and the exact
+      # definition of "the close"; both are cross-language contracts, and
+      # burying them among the REST layer's pagination queries would hide them.
+      - internal/platform/postgres/queries/analytics.sql
 
     gen:
       go:
@@ -318,6 +345,91 @@ sql:
           - column: "market_suspensions.market_id"
             go_type: "github.com/anpl1623/sharpline/internal/domain.MarketID"
 
+          # -------------------------------------------------------------------
+          # Phase 9 (migration 00009). Same rule as everything above: every
+          # identifier column gets its domain type, every decimal-odds column
+          # gets odds.Decimal.
+          #
+          # THREE KINDS OF COLUMN ARE DELIBERATELY NOT OVERRIDDEN HERE:
+          #
+          #   * Probabilities (fair_probability, taken_fair, implied_sum,
+          #     cross_book_correlation, ...) stay float64 rather than becoming
+          #     odds.Probability. odds.Probability is a named float64 with a
+          #     validating constructor, and pgx WOULD scan into it -- but every
+          #     one of these is a DERIVED statistic rather than a probability the
+          #     domain owns: a correlation is not a probability at all, and a
+          #     stored fair probability has already been validated by the type
+          #     that produced it. The read boundary converts where the domain
+          #     type is actually wanted.
+          #   * Threshold and velocity columns stay float64 for the same reason:
+          #     they are detector configuration recorded on the row, not domain
+          #     values.
+          #   * `line` columns stay pgtype.Float8, per note 2 in this file's
+          #     header -- domain.Line has unexported fields, so pgx cannot build
+          #     one, and pgtype.Float8{Float64, Valid} is the same shape as
+          #     {value, present}.
+          # -------------------------------------------------------------------
+          - column: "ev_signals.selection_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.SelectionID"
+          - column: "ev_signals.market_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.MarketID"
+          - column: "ev_signals.league_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.LeagueID"
+          - column: "ev_signals.book_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.BookID"
+          - column: "ev_signals.reference_book_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.BookID"
+          # The offered quote and the fair price are both decimal odds in the
+          # canonical format; EV, edge and Kelly are ratios and stay float64.
+          - column: "ev_signals.offered_decimal"
+            go_type: "github.com/anpl1623/sharpline/internal/domain/odds.Decimal"
+          - column: "ev_signals.fair_decimal"
+            go_type: "github.com/anpl1623/sharpline/internal/domain/odds.Decimal"
+
+          - column: "arbitrage_signals.market_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.MarketID"
+          - column: "arbitrage_signals.league_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.LeagueID"
+
+          - column: "arbitrage_signal_legs.selection_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.SelectionID"
+          - column: "arbitrage_signal_legs.book_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.BookID"
+          - column: "arbitrage_signal_legs.decimal_odds"
+            go_type: "github.com/anpl1623/sharpline/internal/domain/odds.Decimal"
+
+          - column: "steam_signals.market_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.MarketID"
+          - column: "steam_signals.selection_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.SelectionID"
+          - column: "steam_signals.league_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.LeagueID"
+          - column: "steam_signals.lead_book_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.BookID"
+
+          - column: "wager_leg_clv.leg_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.LegID"
+          - column: "wager_leg_clv.wager_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.WagerID"
+          - column: "wager_leg_clv.user_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.UserID"
+          - column: "wager_leg_clv.market_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.MarketID"
+          - column: "wager_leg_clv.selection_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.SelectionID"
+          - column: "wager_leg_clv.league_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.LeagueID"
+          - column: "wager_leg_clv.taken_book_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.BookID"
+          - column: "wager_leg_clv.closing_book_id"
+            go_type: "github.com/anpl1623/sharpline/internal/domain.BookID"
+          # The two FAIR prices, 1/p. Decimal odds, so odds.Decimal -- these are
+          # what odds.CLVResult carries as TakenPrice and ClosingPrice.
+          - column: "wager_leg_clv.taken_price"
+            go_type: "github.com/anpl1623/sharpline/internal/domain/odds.Decimal"
+          - column: "wager_leg_clv.closing_price"
+            go_type: "github.com/anpl1623/sharpline/internal/domain/odds.Decimal"
+
           # account_balances is a VIEW, and sqlc types a view's columns from its
           # definition, so it needs its own entries. account_user_id is nullable
           # there (the house and issuance singletons have no owner); it is a
@@ -367,6 +479,28 @@ sql:
             go_type: "github.com/anpl1623/sharpline/internal/domain.Money"
           - column: "user_limits.amount_minor"
             go_type: "github.com/anpl1623/sharpline/internal/domain.Money"
+
+          # NOT OVERRIDDEN, and it took a wrong turn to establish why:
+          # betting.sql's SumLedgerEntriesSince (phase 8, the responsible-gaming
+          # enforcement query) returns `total_minor`, which is money and comes
+          # back as a bare int64.
+          #
+          # A `column: "*.total_minor"` entry was tried here and does NOT work.
+          # sqlc matches an override against a column's TABLE identifier, and an
+          # aggregate expression has none, so no pattern -- wildcard or
+          # otherwise -- reaches it. The generated field is int64 whatever this
+          # table says.
+          #
+          # Which turns out to be the RIGHT type anyway, so the entry stays
+          # removed rather than being worked around. Every override above maps a
+          # STORED column, and each of those is already bounded by a CHECK to
+          # +/- domain.MaxSafeMoney (2^53-1). A SUM is not: a hundred thousand
+          # in-bounds entries can add up to something no Money may hold, and
+          # scanning that straight into a domain.Money would produce a silently
+          # invalid value in the one place that decides whether a customer has
+          # hit their own loss limit. internal/betting/pgstore passes it through
+          # domain.FromMinorUnits instead, which returns an error on exactly
+          # that overflow. The int64 is what forces that call to exist.
 
           # -------------------------------------------------------------------
           # Odds. DOUBLE PRECISION -> odds.Decimal, the canonical price type

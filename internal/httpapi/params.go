@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -369,4 +370,208 @@ func renderOdds(d odds.Decimal, format odds.Format) *string {
 		return nil
 	}
 	return &s
+}
+
+// -----------------------------------------------------------------------------
+// Analytics parameters
+//
+// The same collector discipline as everything above: accumulate into `bad`,
+// answer once, and REJECT an out-of-range value rather than clamping it.
+// parseLimit's argument applies to every one of these — silently serving a
+// narrower window than the caller asked for makes the caller believe it has seen
+// the whole set, and the bug surfaces much later and somewhere else.
+// -----------------------------------------------------------------------------
+
+// parseFloatParam reads a bounded floating-point parameter.
+//
+// The bounds are INCLUSIVE at both ends and are the spec's own; a value outside
+// them is a 400 naming the parameter. NaN and the infinities are rejected by the
+// range test itself — every comparison against NaN is false, so `n < lo` and
+// `n > hi` both being false cannot happen for it, and the `!(lo <= n && n <= hi)`
+// spelling below is what makes that true rather than an accident.
+func parseFloatParam(q map[string][]string, name string, fallback, lo, hi float64, bad *badParams) float64 {
+	raw := first(q, name)
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		bad.add(name, "must be a number")
+		return fallback
+	}
+	if !(n >= lo && n <= hi) {
+		bad.add(name, fmt.Sprintf("must be between %g and %g", lo, hi))
+		return fallback
+	}
+	return n
+}
+
+// parseSecondsParam reads a strictly positive duration expressed in seconds.
+//
+// Seconds rather than a Go duration string because this is an HTTP query
+// parameter read by browsers and curl, and `30` is unambiguous where `30s` needs
+// a parser the spec would have to document. The upper bound is what stops a
+// caller passing a value large enough to overflow the multiplication into
+// nanoseconds.
+func parseSecondsParam(q map[string][]string, name string, fallback time.Duration, bad *badParams) time.Duration {
+	raw := first(q, name)
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		bad.add(name, "must be a number of seconds")
+		return fallback
+	}
+	if !(n > 0 && n <= maxSignalSeconds) {
+		bad.add(name, fmt.Sprintf("must be greater than 0 and at most %d", maxSignalSeconds))
+		return fallback
+	}
+	return time.Duration(n * float64(time.Second))
+}
+
+// parseInt32Param reads a bounded 32-bit integer parameter.
+func parseInt32Param(q map[string][]string, name string, fallback, lo, hi int32, bad *badParams) int32 {
+	raw := first(q, name)
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.ParseInt(raw, 10, 32)
+	if err != nil || int32(n) < lo || int32(n) > hi {
+		bad.add(name, fmt.Sprintf("must be an integer between %d and %d", lo, hi))
+		return fallback
+	}
+	return int32(n)
+}
+
+// parseInt64Param reads a bounded 64-bit integer parameter.
+func parseInt64Param(q map[string][]string, name string, fallback, lo, hi int64, bad *badParams) int64 {
+	raw := first(q, name)
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n < lo || n > hi {
+		bad.add(name, fmt.Sprintf("must be an integer between %d and %d", lo, hi))
+		return fallback
+	}
+	return n
+}
+
+// parseMarketTypes reads the repeatable `market_type` filter.
+//
+// An unknown member is a 400 rather than a silently narrower filter, for
+// parseBookFilter's reason. The returned slice is SORTED and de-duplicated: it
+// feeds a cursor fingerprint, so `?market_type=total&market_type=spread` and the
+// reverse order must hash alike or a client reordering its own parameters
+// between pages would be told its cursor belongs to a different query.
+//
+// nil means "every type", which is what an absent filter means. An empty
+// non-nil slice cannot occur, because an empty filter is a parameter error.
+func parseMarketTypes(q map[string][]string, bad *badParams) []domain.MarketType {
+	raw := q["market_type"]
+	if len(raw) == 0 {
+		return nil
+	}
+	if len(raw) > maxMarketTypeFilter {
+		bad.add("market_type", fmt.Sprintf("at most %d types may be named", maxMarketTypeFilter))
+		return nil
+	}
+	out := make([]domain.MarketType, 0, len(raw))
+	for _, s := range raw {
+		t, err := domain.ParseMarketType(s)
+		if err != nil {
+			bad.add("market_type", "names a market type that does not exist")
+			continue
+		}
+		out = append(out, t)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+// parseLowerBound reads the required-in-substance lower time bound every signal
+// feed takes.
+//
+// # Why it has a default AND a ceiling
+//
+// `ev_signals` and `steam_signals` are hypertables with no retention policy, so
+// an unbounded read consults an index on every chunk that has ever existed —
+// history.go states the rule for `prices`. Unlike a line-movement chart, though,
+// these feeds have an obviously correct default ("recently"), so refusing a
+// request that omitted the parameter would be ceremony rather than protection.
+//
+// The CEILING is what actually keeps the promise. It is the retention of the
+// matching Kafka topic in every case, so the window this API will serve and the
+// window the bus can replay are the same window — which means a reader cannot
+// ask REST for a range that phase 12's stream job could not reproduce.
+//
+// A bound in the future is accepted rather than rejected: it is a strange
+// request, but it is a well-defined one that returns nothing, and the caller
+// most likely has a clock that is ahead. A bound past the ceiling is refused,
+// because that one has a plausible-looking wrong answer.
+func parseLowerBound(
+	q map[string][]string,
+	name string,
+	now time.Time,
+	window, maxLookback time.Duration,
+	bad *badParams,
+) time.Time {
+	fallback := now.Add(-window)
+	raw := first(q, name)
+	if raw == "" {
+		return fallback
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		bad.add(name, "must be an RFC 3339 timestamp")
+		return fallback
+	}
+	t = t.UTC()
+	if t.Before(now.Add(-maxLookback)) {
+		bad.add(name, fmt.Sprintf("may not be earlier than %s before now", maxLookback))
+		return fallback
+	}
+	return t
+}
+
+// parseWindow reads a half-open [from, to) pair of instants.
+//
+// `to` defaults to now, which is unambiguous and cannot be unbounded. `from`
+// defaults to `now - window`. A `from` at or after `to` is a 422 rather than a
+// 400 and rather than an empty result: it is syntactically valid and
+// semantically impossible, which is exactly the distinction respond.go keeps,
+// and an empty page would be indistinguishable from a customer with no history.
+func parseWindow(
+	q map[string][]string,
+	fromName, toName string,
+	now time.Time,
+	window time.Duration,
+	bad *badParams,
+) (from, to time.Time) {
+	to = parseTime(q, toName, now, bad)
+	from = parseTime(q, fromName, to.Add(-window), bad)
+	return from, to
+}
+
+// parseLeaderboardBasis reads the `basis` parameter.
+//
+// There is no member for raw profit and the parser cannot be made to produce
+// one: CLAUDE.md §6 ranks the public board "on ROI and CLV, not raw profit",
+// because a profit board ranks stake size and variance. Making it
+// unrepresentable is stronger than documenting that it is not offered.
+func parseLeaderboardBasis(q map[string][]string, bad *badParams) LeaderboardBasis {
+	raw := first(q, "basis")
+	if raw == "" {
+		return LeaderboardByROI
+	}
+	basis, err := ParseLeaderboardBasis(raw)
+	if err != nil {
+		bad.add("basis", "must be one of roi, clv")
+		return LeaderboardByROI
+	}
+	return basis
 }

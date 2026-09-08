@@ -279,6 +279,13 @@ func TestInTxSurfacesTheDeferredLedgerViolationRaisedByCommit(t *testing.T) {
 			"written when the database refused it — and because balances are derived (CLAUDE.md §4), " +
 			"that is a wrong balance forever rather than a visible failure once.")
 	}
+	// Logged, not merely asserted: the SQLSTATE and the server's own sentence
+	// are the evidence that the DEFERRED constraint trigger — and not some
+	// application-level check — is what refused the movement, and they are worth
+	// reading when this test is the thing being trusted.
+	t.Logf("COMMIT refused with SQLSTATE %q; error reaching the caller: %v",
+		postgres.SQLState(err), err)
+
 	if !postgres.IsCheckViolation(err) {
 		t.Errorf("InTx error is not a check violation (SQLSTATE %q): %v", postgres.SQLState(err), err)
 	}

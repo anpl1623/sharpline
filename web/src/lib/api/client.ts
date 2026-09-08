@@ -44,6 +44,8 @@ export function browserFetch<T>(
     readonly method?: HttpMethod;
     readonly query?: Readonly<Record<string, QueryValue>> | undefined;
     readonly body?: unknown;
+    /** `Idempotency-Key` on the two money endpoints, and nothing else today. */
+    readonly headers?: Readonly<Record<string, string>> | undefined;
   } = {},
 ): Promise<T> {
   return request<T>({
@@ -52,6 +54,7 @@ export function browserFetch<T>(
     method: options.method ?? 'GET',
     query: options.query,
     body: options.body,
+    headers: options.headers,
     accessToken: options.accessToken,
     signal: options.signal,
     timeoutMs: options.timeoutMs ?? BROWSER_TIMEOUT_MS,
@@ -71,13 +74,20 @@ export {
   buildQueryString,
 } from '@/lib/api/transport';
 export type {
+  AccountCLVParams,
   ApiClient,
+  ArbitrageSignalParams,
   BoardParams,
   BookFilterParams,
   BrowserCallOptions,
   CallOptions,
+  EVSignalParams,
   HistoryParams,
+  IdempotencyKey,
+  LeaderboardParams,
   QueryValue,
   SearchParams,
+  SteamSignalParams,
+  WagerListParams,
 } from '@/lib/api/transport';
 export { ApiError } from '@/lib/api/errors';

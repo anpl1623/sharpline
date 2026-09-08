@@ -65,8 +65,14 @@
 // no schema enforcement, and float64 round-tripping through decimal text is a
 // real hazard for a system whose core type is a price. Three mitigations:
 //
-//  1. Batch compression (lz4) recovers most of the size difference, because
-//     JSON from one topic is highly repetitive.
+//  1. The volume this buys is small enough not to matter. Records are ~3.7 KB
+//     and the whole retained odds.raw log measured 291 KB against a 1 GiB
+//     retention cap, so the 2-4x is a rounding error rather than a cost. Batch
+//     compression WAS the mitigation here and is now off: lz4 OOM-killed the
+//     broker on that 291 KB log, because pierrec/lz4 declares a 4 MiB maximum
+//     block in every frame and Kafka sizes its decompression buffer from the
+//     declaration. See producer.go's ProducerBatchCompression for the
+//     measurements and for what to reach for if volume ever changes this.
 //  2. The envelope is VERSIONED — see EnvelopeVersion. A decoder refuses a
 //     version it does not know rather than silently reading half a record, which
 //     is the failure mode that would otherwise poison a compacted topic that
@@ -110,10 +116,9 @@
 //     constrains max in-flight requests per broker to 5, which franz-go enforces
 //     for us. On a compacted topic a duplicate is merely wasteful; on
 //     wager.events it is a phantom entry in an audit trail.
-//   - lz4 batch compression, falling back to no compression if the broker
-//     refuses. Not zstd: zstd's Go implementation costs more CPU per byte, and
-//     the target is a 2 OCPU Ampere box shared with Postgres and the whole
-//     service set.
+//   - NO batch compression. lz4 was here and killed the broker's heap on a
+//     291 KB log; the mechanism, the measurements, and the codec to pick if
+//     compression is ever needed again are in producer.go beside the option.
 //
 // What DIFFERS, and it is not acks — it is what happens when delivery keeps
 // failing:

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/anpl1623/sharpline/internal/auth"
+	"github.com/anpl1623/sharpline/internal/betting"
 	"github.com/anpl1623/sharpline/internal/domain"
 	"github.com/anpl1623/sharpline/internal/httpapi/gen"
 )
@@ -35,6 +36,90 @@ func (a *API) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respond(w, http.StatusOK, wireProfile(profile))
+}
+
+// handleGrant credits the caller's balance with play money.
+//
+// # Why this endpoint exists, and why a customer may call it for themselves
+//
+// It is the ONLY path by which money enters the system. Every other movement in
+// the ledger is zero-sum between accounts that already hold a balance — a stake
+// moves cash to escrow, a settlement moves escrow to cash or to the house — so
+// without an issuance path every balance is permanently zero and the whole
+// betting surface is unreachable. migration 00006 names the gap directly:
+// "Money enters through EntryKindGrant, written by the application." This is the
+// application writing it.
+//
+// It is not a deposit and must never be described as one. CLAUDE.md §0 is
+// explicit that no real money moves and that there is no payment processing and
+// no custody of funds; a grant is the play-money analogue, and the OpenAPI
+// document says the same at the `grant` limit kind.
+//
+// The control on issuance is therefore not an authorisation check but the
+// customer's OWN self-imposed `grant` limit, evaluated inside the transaction
+// against the same ledger sum the limit is defined over, plus a hard
+// per-request ceiling. That is the design the rest of the tree already
+// committed to: auth.LimitKindGrant, user_limits' CHECK and
+// internal/betting/limits.go all carry a 'grant' limit end to end, and a limit
+// bounding something no customer could do would bound nothing.
+//
+// 201 when this request wrote the movement, 200 when a previous one already
+// had, on the same reasoning as [API.handlePlaceWager]: a client that retried
+// after a timeout learns from the status line whether its first attempt landed.
+// The body reports what the ORIGINAL request credited, not what this one asked
+// for.
+func (a *API) handleGrant(w http.ResponseWriter, r *http.Request) {
+	user, ok := a.caller(w, r)
+	if !ok {
+		return
+	}
+
+	key, ok := a.idempotencyKey(w, r)
+	if !ok {
+		return
+	}
+
+	var body gen.GrantRequest
+	if err := decodeJSON(r, &body); err != nil {
+		a.badBody(w, r, err)
+		return
+	}
+
+	grant, err := a.betting.Grant(r.Context(), betting.GrantRequest{
+		UserID:         user,
+		Amount:         domain.Money(body.AmountMinor),
+		IdempotencyKey: key,
+		Audit:          a.auditContext(r).forBetting(),
+	})
+	if err != nil {
+		a.failBetting(w, r, "grant play money", err)
+		return
+	}
+
+	// The audit entry — `ledger.grant`, against the ledger transaction — is
+	// written by internal/betting INSIDE the grant transaction, from the
+	// provenance handed to Grant above, so the record of who minted the money
+	// commits with the money. a.record is deliberately not called here; see
+	// [API.handlePlaceWager] for why an after-the-fact write on another
+	// connection is the wrong shape, and betting.Tx.RecordAudit for the full
+	// argument.
+	//
+	// It matters more on this path than on any other. A grant is the only
+	// operation in the system that CREATES value, and a doubled or
+	// unattributed one leaves a ledger that still balances afterwards — so the
+	// audit trail is the only place the anomaly would ever surface. A replay
+	// writes no row, because it writes no money.
+	status := http.StatusCreated
+	if grant.Replayed {
+		status = http.StatusOK
+	}
+	respond(w, status, gen.GrantResponse{
+		TransactionId: grant.TransactionID.String(),
+		AmountMinor:   grant.Amount.MinorUnits(),
+		BalanceMinor:  grant.Balance.MinorUnits(),
+		OccurredAt:    grant.OccurredAt,
+		Replayed:      grant.Replayed,
+	})
 }
 
 // handleGetBalance serves the derived play-money balance.
@@ -115,6 +200,98 @@ func (a *API) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 	out.TotalMinor = total.MinorUnits()
 
 	respond(w, http.StatusOK, out)
+}
+
+// handleSelfExclude stops the caller wagering, permanently.
+//
+// # The strongest control in §6, and the only irreversible one
+//
+// CLAUDE.md §6 asks for "responsible-gaming-style self-imposed limits".
+// [API.handleSetLimit] is the amount-and-period half; this is the other half —
+// the customer asking the system to stop them entirely. `users.status` has
+// carried `self_excluded` since migration 00005 and the placement path has
+// enforced it in three independent layers since 00008, but until this handler
+// existed nothing could SET it: the control was implemented everywhere except
+// where a customer could reach it.
+//
+// # Irreversibility is structural, not a policy this handler enforces
+//
+// The statement behind [Accounts.SelfExclude] can reach `self_excluded` and
+// `closed` and no other status, and refuses a source that is already one of
+// those. So there is no request to this endpoint, and no bug in this package,
+// that can lift a self-exclusion — or an operator's suspension. That asymmetry
+// is migration 00008's own: an operator may lift a suspension they imposed, and
+// nobody may quietly book a bet for a customer who asked the system to stop
+// them. Reinstatement gets its own statement, its own actor and its own audit
+// action when the admin console is built. It does not get this one.
+//
+// # What "immediately" means, exactly
+//
+// After this returns, a placement is refused at all three layers: the betting
+// service reads the status inside the placement transaction against a locked
+// row, this package maps its sentinel to 403, and migration 00008's BEFORE
+// INSERT trigger on `wagers` refuses the row for any writer that reached the
+// table another way. There is NO CACHED STATUS anywhere in between —
+// middleware.Identity carries the user id, the session id and the token's
+// bounds and deliberately no status, so nothing has to be invalidated.
+//
+// ONE REQUEST CAN STILL COMPLETE AFTER THIS ONE STARTS, and it is stated rather
+// than glossed: a placement that already holds the lock on the customer's users
+// row finishes, and this call waits behind it. The window is exactly one
+// in-flight placement transaction, it exists because that lock is what
+// serialises the two, and it cannot admit a slip submitted after this handler
+// has responded.
+//
+// # The session is deliberately NOT ended
+//
+// auth.UserStatus.CanAuthenticate stays true for this status and
+// `password_changed_at` is untouched, so refresh-token families survive and the
+// access token keeps working. Locking a customer out of their own history and
+// balance is not a protection; it is an obstacle to the person the control is
+// for. `GET /account` reports the new status so a client can render the state.
+//
+// Audited as `user.self_exclude`, INSIDE the same transaction as the change.
+func (a *API) handleSelfExclude(w http.ResponseWriter, r *http.Request) {
+	user, ok := a.caller(w, r)
+	if !ok {
+		return
+	}
+
+	var body gen.SelfExclusionRequest
+	if err := decodeJSON(r, &body); err != nil {
+		a.badBody(w, r, err)
+		return
+	}
+	if body.Confirm != gen.SelfExclude {
+		// The confirmation is the whole reason the body exists. An action this
+		// final must not be reachable by an empty object or by a button wired
+		// to the wrong path, so the check is explicit here rather than left to
+		// the generated type's Valid() — which would also accept a value added
+		// to the enum later.
+		failInvalid(w, r, http.StatusUnprocessableEntity, gen.ErrorCodeUnprocessable, msgUnprocessable,
+			[]gen.InvalidParam{{
+				Name:   "confirm",
+				Reason: `must be the literal string "self_exclude"`,
+			}})
+		return
+	}
+
+	profile, err := a.accounts.SelfExclude(r.Context(), SelfExclusion{
+		UserID: user,
+		Audit:  a.auditContext(r),
+	})
+	if err != nil {
+		// A token that verifies but names a user who does not exist is the same
+		// server-side inconsistency [API.handleGetAccount] describes, and is
+		// answered the same way. Everything else is a 500: there is no
+		// customer-fixable failure on this path, and in particular "you are
+		// already self-excluded" is NOT one — the store reports that as success
+		// with the profile, because it is the outcome the customer asked for.
+		a.notFoundOr(w, r, "self-exclusion", err)
+		return
+	}
+
+	respond(w, http.StatusOK, wireProfile(profile))
 }
 
 func (a *API) handleListLimits(w http.ResponseWriter, r *http.Request) {

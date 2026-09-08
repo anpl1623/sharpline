@@ -155,12 +155,54 @@ COMPOSE_ALL       = $(COMPOSE) $(COMPOSE_OVERLAYS) --profile "*"
 DOCKER_USER ?= $(shell id -u):$(shell id -g)
 DOCKER_AS_USER := --user $(DOCKER_USER)
 
+# BUILD-INPUT VOLUMES -- every named volume in this project that holds something
+# DOWNLOADED or COMPILED rather than something a user produced: Go modules and build
+# objects, the golangci-lint cache, Terraform provider plugins, the npm cache,
+# node_modules, the Next build cache.
+#
+# They are enumerated HERE, in one block, because that list is now load-bearing in
+# two places at once. `cache-init` creates and seeds them, and -- since GAP 4 --
+# deploy/compose/compose.yaml and compose.tools.yaml declare the compose-side ones
+# `external:` under exactly these names, so that `down-hard` cannot reach them. See
+# the `down-hard` recipe for the full argument.
+#
+# THE DASH IS THE POINT. Compose prefixes the volumes it owns with `<project>_`
+# (underscore) -- `sharpline_postgres-data`. A dash name is therefore visibly
+# not-compose-owned in `docker volume ls`, which is exactly the distinction
+# `external:` encodes, made legible at a glance rather than only in `inspect`.
+#
+# The literal names are repeated in the compose files rather than interpolated,
+# matching the precedent already set there (`name: sharpline` is hardcoded while
+# this file passes `--project-name $(PROJECT)`). A `PROJECT=` override therefore
+# desynchronises them -- loudly and immediately, because Compose refuses to start a
+# service whose external volume is absent: "external volume ... not found".
 GOMOD_VOLUME       ?= $(PROJECT)-go-mod-cache
 GOBUILD_VOLUME     ?= $(PROJECT)-go-build-cache
 GOBIN_VOLUME       ?= $(PROJECT)-go-bin
 TOOLS_CACHE_VOLUME ?= $(PROJECT)-tools-cache
+TRIVY_CACHE_VOLUME ?= $(PROJECT)-trivy-cache
 
-CACHE_VOLUMES := $(GOMOD_VOLUME) $(GOBUILD_VOLUME) $(GOBIN_VOLUME) $(TOOLS_CACHE_VOLUME) $(PROJECT)-trivy-cache
+# The compose-declared half of the same list -- mounted by services in
+# deploy/compose/*.yaml rather than by a `docker run` in this file.
+#
+# TOOLS_GOMOD_VOLUME is deliberately NOT the same volume as GOMOD_VOLUME even though
+# both cache Go modules: compose.tools.yaml mounts it at /go/pkg/mod while
+# DOCKER_GO_FLAGS below mounts GOMOD_VOLUME one level up at /go/pkg (see the comment
+# there for why the parent is the right mountpoint). One volume cannot be rooted at
+# two depths, so unifying them would mean moving a mountpoint, and the mountpoint is
+# the part that is carefully chosen. TOOLS_CACHE_VOLUME by contrast IS shared with
+# compose: both sides mount it at /home/sharpline/.cache in the same tools image, so
+# it was only ever one cache that had accidentally been declared twice.
+TOOLS_GOMOD_VOLUME ?= $(PROJECT)-tools-go-mod-cache
+TF_PLUGIN_VOLUME   ?= $(PROJECT)-terraform-plugin-cache
+NPM_CACHE_VOLUME   ?= $(PROJECT)-npm-cache
+WEB_MODULES_VOLUME ?= $(PROJECT)-web-node-modules
+WEB_NEXT_VOLUME    ?= $(PROJECT)-web-next-cache
+
+CACHE_VOLUMES := \
+	$(GOMOD_VOLUME) $(GOBUILD_VOLUME) $(GOBIN_VOLUME) $(TOOLS_CACHE_VOLUME) $(TRIVY_CACHE_VOLUME) \
+	$(TOOLS_GOMOD_VOLUME) $(TF_PLUGIN_VOLUME) $(NPM_CACHE_VOLUME) \
+	$(WEB_MODULES_VOLUME) $(WEB_NEXT_VOLUME)
 
 # Mounts/env for any container running the Go toolchain from the golang image.
 # CGO_ENABLED=0 everywhere (CLAUDE.md section 9) except the race detector.
@@ -231,6 +273,18 @@ export DOCKER_SOCKET
 
 RYUK_DISABLED ?= false
 
+# The reaper image testcontainers-go spawns, pinned to what THIS version asks
+# for: internal/config/config.go's `ReaperDefaultImage`, currently
+# "testcontainers/ryuk:0.14.0" in v0.44.0. `make ryuk-warm` verifies that rather
+# than trusting this line, so a testcontainers bump that moves the tag fails
+# loudly instead of silently un-fixing the pull below.
+#
+# It is a TAG and not a digest, which is the one deliberate exception to
+# CLAUDE.md section 12's pinning rule: the tag is chosen by the library, not by
+# us, and pulling some other digest would leave the tag testcontainers actually
+# requests still unresolved and still pulled inside the 20s budget.
+RYUK_IMAGE ?= testcontainers/ryuk:0.14.0
+
 # GO_TEST_P caps how many package test BINARIES run at once. It is not a tuning
 # knob, it is a correctness one.
 #
@@ -245,11 +299,19 @@ RYUK_DISABLED ?= false
 # It surfaced on a DIFFERENT package on each run, which is what a thundering herd
 # looks like rather than a defect in any one test.
 #
-# Two other fixes were considered and rejected. TESTCONTAINERS_RYUK_DISABLED=true
-# removes the race by removing the reaper, but the reaper is the only thing that
-# cleans up after a panicking or killed test run, and this project has already had
-# the Docker VM reach 100% disk once. Retrying is not available: the failure is
-# inside testcontainers' own reaper bootstrap, not in code we call.
+# Two other fixes were considered and rejected FOR A DEVELOPER MACHINE.
+# TESTCONTAINERS_RYUK_DISABLED=true removes the race by removing the reaper, but
+# the reaper is the only thing that cleans up after a panicking or killed test
+# run, and this project has already had the Docker VM reach 100% disk once.
+# Retrying is not available: the failure is inside testcontainers' own reaper
+# bootstrap, not in code we call.
+#
+# CI SCOPES THAT DECISION RATHER THAN OVERTURNING IT. The disk argument is about
+# a machine that survives the run; a GitHub-hosted runner is destroyed when the
+# job ends, so a leaked container there costs nothing and the reaper protects
+# nothing. ci.yml therefore sets RYUK_DISABLED=true on the two jobs that spawn
+# containers, and only there -- see the comment on those jobs. A local `make
+# test` keeps the reaper, which is where the disk actually fills.
 #
 # Serialising the binaries keeps Ryuk and makes the race impossible. t.Parallel()
 # inside a package is unaffected, so the cost is only the loss of cross-package
@@ -425,6 +487,66 @@ doctor: ## Verify the one and only host dependency (the container runtime) is al
 # Failing here, with the path printed, is the whole point: the alternative is Docker
 # creating a directory at the missing bind source and testcontainers-go failing
 # several minutes later with an error that names neither the socket nor this file.
+.PHONY: ryuk-warm
+ryuk-warm: ## Pre-pull the testcontainers reaper so its spawn budget is not spent pulling
+# WHY THIS TARGET EXISTS
+#
+# testcontainers-go spawns one Ryuk reaper per test process and waits for it to
+# report ready. That wait is bounded by a backoff whose MaxElapsedTime is a
+# HARDCODED 20 SECONDS (reaper.go, `func (r *reaperSpawner) backoff()`), with no
+# environment variable and no option to raise it.
+#
+# On a warm machine the reaper starts in well under a second and the budget is
+# invisible. On a cold CI runner the image is not present, so the pull happens
+# INSIDE those 20 seconds, and the whole package dies with
+#
+#   reaper: from container "<id>": wait for reaper <id>: context deadline exceeded
+#
+# followed by every test in the package reporting "the shared database is
+# unavailable". It reads like a database fault and is a registry round trip.
+#
+# Pulling first moves the download out of the budget. This is NOT the same
+# failure the GO_TEST_P comment above describes -- that one is a thundering herd
+# racing on a reaper in "created", fixed by serialising the binaries; this one is
+# a single reaper that is simply not downloaded yet, and serialising does nothing
+# for it.
+#
+# Disabling the reaper would also "fix" it and is rejected for the reason
+# recorded above: Ryuk is the only thing that cleans up after a killed run, and
+# this project has already filled the Docker VM's disk once.
+	@if [ '$(RYUK_DISABLED)' = 'true' ]; then \
+	   printf 'OK  reaper disabled for this run; nothing to pull\n'; \
+	 elif docker image inspect '$(RYUK_IMAGE)' >/dev/null 2>&1; then \
+	   printf 'OK  reaper image present: %s\n' '$(RYUK_IMAGE)'; \
+	 else \
+	   printf '==> pulling the testcontainers reaper (%s)\n' '$(RYUK_IMAGE)'; \
+	   docker pull -q '$(RYUK_IMAGE)' >/dev/null || { \
+	     printf 'FAIL  could not pull %s.\n' '$(RYUK_IMAGE)'; \
+	     printf '      Tests would still run, but each package pays the pull inside\n'; \
+	     printf '      the reaper spawn budget and may time out. Check registry access.\n'; \
+	     exit 1; \
+	   }; \
+	 fi
+
+.PHONY: verify-ryuk-image
+verify-ryuk-image: ## Fail if RYUK_IMAGE has drifted from what testcontainers-go asks for
+	@want=$$(docker run --rm -v $(GOMOD_VOLUME):/go/pkg $(GO_IMAGE) \
+	   sh -c "grep -rhoE '\"testcontainers/ryuk:[0-9.]+\"' \
+	     /go/pkg/mod/github.com/testcontainers/testcontainers-go@*/internal/config/config.go \
+	     2>/dev/null | tr -d '\"' | head -1"); \
+	 if [ -z "$$want" ]; then \
+	   printf 'SKIP  testcontainers-go is not in the module cache; run `make test` first.\n'; \
+	   exit 0; \
+	 fi; \
+	 if [ "$$want" != '$(RYUK_IMAGE)' ]; then \
+	   printf 'FAIL  RYUK_IMAGE is %s but testcontainers-go asks for %s.\n' '$(RYUK_IMAGE)' "$$want"; \
+	   printf '      The pre-pull is now warming an image nothing uses, so the 20s\n'; \
+	   printf '      reaper budget is back to including a registry pull on a cold runner.\n'; \
+	   printf '      Update RYUK_IMAGE in the Makefile to %s.\n' "$$want"; \
+	   exit 1; \
+	 fi; \
+	 printf 'OK  reaper image matches testcontainers-go: %s\n' "$$want"
+
 .PHONY: docker-socket
 docker-socket: ## Resolve and validate the Docker socket the test containers mount
 	@sock='$(DOCKER_SOCKET)'; \
@@ -513,7 +635,7 @@ env: ## Create .env from .env.example if it does not exist yet
 	fi
 
 .PHONY: up
-up: env ## Bring up the full stack (proxy is the only published port)
+up: env cache-init ## Bring up the full stack (proxy is the only published port)
 	@# Staged, and the stages are not interchangeable.
 	@#
 	@# CLAUDE.md §9: "One command to a working system is a hard requirement" and
@@ -558,14 +680,14 @@ topics: ## Converge the Kafka topics for TF_ENV (idempotent; run automatically b
 	@$(MAKE) --no-print-directory tf-apply ARGS=-auto-approve
 
 .PHONY: up-dev
-up-dev: env ## Bring up the stack with hot-reload overrides + kafka-ui (dev profile)
+up-dev: env cache-init ## Bring up the stack with hot-reload overrides + kafka-ui (dev profile)
 	$(COMPOSE_DEV) up --detach --build --remove-orphans --wait postgres redis kafka
 	@$(MAKE) --no-print-directory topics
 	$(COMPOSE_DEV) up --detach --build --remove-orphans
 	$(COMPOSE_DEV) ps
 
 .PHONY: up-obs
-up-obs: env ## Bring up the stack plus observability (otel/prometheus/grafana/jaeger)
+up-obs: env cache-init ## Bring up the stack plus observability (otel/prometheus/grafana/jaeger)
 	@# STAGED FOR THE SAME REASON `up` IS, and it was not.
 	@#
 	@# Kafka runs with auto-topic-creation OFF and CLAUDE.md §9 puts topic
@@ -594,7 +716,56 @@ down: ## Stop and remove containers (volumes survive)
 	$(COMPOSE_ALL) down --remove-orphans
 
 .PHONY: down-hard
-down-hard: ## Stop and remove containers AND named volumes -- the reset button
+down-hard: ## Stop and remove containers AND all APPLICATION STATE -- the reset button
+	@# THE RESET BUTTON RESETS APPLICATION STATE. It does not delete build inputs.
+	@#
+	@# It used to delete both, and the difference was not visible from here: the
+	@# recipe is unchanged, and the fix is entirely in what the compose files
+	@# declare. The bug it closes:
+	@#
+	@#   compose.tools.yaml declared go-mod-cache / tools-cache /
+	@#   terraform-plugin-cache / npm-cache as ordinary project volumes, so Docker
+	@#   named them `sharpline_*` and `down --volumes` -- which sweeps every overlay,
+	@#   by design -- destroyed them. compose.yaml did the same for web-node-modules.
+	@#   Meanwhile this file's own caches are `sharpline-*` (dash), invisible to
+	@#   Compose, and survived. Two naming schemes, two fates, one command, and
+	@#   nothing anywhere said which volume was in which set.
+	@#
+	@#   The visible cost was terraform. TF_PLUGIN_CACHE_DIR points into
+	@#   terraform-plugin-cache, so deploy/terraform/envs/local/.terraform/providers
+	@#   is a tree of SYMLINKS into that volume and the provider binary lived only
+	@#   there. Destroying it turned `make down-hard && make up` into a target that
+	@#   could not start the stack without reaching registry.terraform.io -- a reset
+	@#   button that requires the internet to undo.
+	@#
+	@# WHY external: true AND NOT A NARROWER --volumes.
+	@#
+	@# The obvious alternative is to scope this line to compose.yaml and take the
+	@# overlays down without --volumes. It does not work and, more importantly, it
+	@# would not deserve to: the boundary that matters is WHAT A VOLUME HOLDS, and
+	@# that boundary does not line up with WHICH FILE DECLARES IT. compose.yaml
+	@# declares postgres-data (state, must die) and web-node-modules (a build input,
+	@# must live) side by side. Scoping by file encodes a coincidence -- and the
+	@# coincidence is already false today, so the narrower command would still have
+	@# deleted node_modules.
+	@#
+	@# Marking each build input `external:` puts the classification on the volume
+	@# itself, where it is checkable, and leaves THIS command blunt on purpose.
+	@# Blunt is the drift-proof direction: a volume added tomorrow is application
+	@# state by default and gets destroyed here with no edit to this recipe. Only an
+	@# explicit `external:` opts out, and writing that word is a deliberate act.
+	@#
+	@# Verified rather than assumed, on Compose v5.3.1:
+	@#   - `down --volumes` removes a project volume even when it carries a custom
+	@#     `name:` -- so a rename alone buys nothing; `external: true` is the
+	@#     mechanism, not the naming.
+	@#   - `down --volumes`, `ps` and `config` all tolerate an external volume that
+	@#     does not exist. Only starting a service that MOUNTS one fails, with
+	@#     "external volume ... not found" -- which is why `cache-init` creates them
+	@#     and every target that starts such a service depends on it.
+	@#
+	@# `make clean` remains the total wipe: down-hard then cache-clean, which drops
+	@# every volume in CACHE_VOLUMES -- the externals included.
 	$(COMPOSE_ALL) down --volumes --remove-orphans
 
 .PHONY: down-v
@@ -763,7 +934,7 @@ migrate-down-to: ## Roll back down to a version (TO=0 empties the schema)
 	$(COMPOSE) run --rm migrate down-to $(TO)
 
 .PHONY: migrate-create
-migrate-create: ## Scaffold a new SQL migration (NAME=add_prices_hypertable)
+migrate-create: cache-init ## Scaffold a new SQL migration (NAME=add_prices_hypertable)
 	@if [ -z "$(NAME)" ]; then printf "usage: make migrate-create NAME=add_prices_hypertable\n"; exit 2; fi
 	$(COMPOSE_TOOLS) run --rm --no-deps $(DOCKER_AS_USER) goose goose create $(NAME) sql
 
@@ -882,7 +1053,7 @@ migrate-dry-run: build-tools ## Apply + roll back every migration on a THROWAWAY
 # $(PKG) stays a separate variable and stays LAST, so a package pattern in ARGS
 # would be a second pattern rather than a replacement -- pass PKG for that.
 .PHONY: test
-test: cache-init docker-socket ## Run the Go suite in a container (ARGS='-v -run X', PKG=./internal/...)
+test: cache-init docker-socket ryuk-warm ## Run the Go suite in a container (ARGS='-v -run X', PKG=./internal/...)
 	docker run --rm \
 	  $(DOCKER_GO_FLAGS) \
 	  $(DOCKER_TESTCONTAINERS_FLAGS) \
@@ -897,7 +1068,7 @@ test: cache-init docker-socket ## Run the Go suite in a container (ARGS='-v -run
 # the script makes the shell do the splitting, so any quoting the caller writes
 # survives intact. `go-test` is $0 and exists only to occupy that slot.
 .PHONY: test-race
-test-race: cache-init docker-socket ## Run the suite under the race detector (ARGS/PKG as above; needs CGO + a C toolchain)
+test-race: cache-init docker-socket ryuk-warm ## Run the suite under the race detector (ARGS/PKG as above; needs CGO + a C toolchain)
 	docker run --rm \
 	  $(DOCKER_GO_FLAGS) \
 	  $(DOCKER_TESTCONTAINERS_FLAGS) \
@@ -1017,7 +1188,7 @@ COVER_MAX_ODDS_UNCOVERED ?= 16
 COVER_ODDS_PKG           ?= github.com/anpl1623/sharpline/internal/domain/odds
 
 .PHONY: cover
-cover: cache-init docker-socket ## Coverage: per-package rollup + HTML, cross-package attribution via -coverpkg, gated
+cover: cache-init docker-socket ryuk-warm ## Coverage: per-package rollup + HTML, cross-package attribution via -coverpkg, gated
 	@# The profile is written to the container's own filesystem and copied out as a
 	@# single sequential write. Writing it DIRECTLY to /src corrupts it on Docker
 	@# Desktop for macOS: `go test` streams the merged profile through the virtiofs
@@ -1102,11 +1273,11 @@ cover: cache-init docker-socket ## Coverage: per-package rollup + HTML, cross-pa
 	  }' coverage.out
 
 .PHONY: e2e
-e2e: ## Playwright critical-path E2E through the proxy (one-shot container)
+e2e: cache-init ## Playwright critical-path E2E through the proxy (one-shot container)
 	$(COMPOSE_TOOLS) run --rm e2e
 
 .PHONY: load
-load: ## Distributed Locust WebSocket-fanout load test, headless (LOCUST_WORKERS=4)
+load: cache-init ## Distributed Locust WebSocket-fanout load test, headless (LOCUST_WORKERS=4)
 	$(COMPOSE_TOOLS) --profile load up --build \
 	  --abort-on-container-exit --exit-code-from locust-master \
 	  --scale locust-worker=$(LOCUST_WORKERS) \
@@ -1146,7 +1317,7 @@ vuln: cache-init ## Run govulncheck in a container (cached in a named GOBIN volu
 scan: docker-socket ## Trivy image scan (SCAN_TARGET=ghcr.io/anpl1623/sharpline/api:dev)
 	docker run --rm \
 	  -v $(DOCKER_SOCKET):/var/run/docker.sock \
-	  -v $(PROJECT)-trivy-cache:/root/.cache \
+	  -v $(TRIVY_CACHE_VOLUME):/root/.cache \
 	  $(TRIVY_IMAGE) image \
 	    --severity $(SCAN_SEVERITY) \
 	    --exit-code 1 \
@@ -1160,7 +1331,7 @@ scan-all: ## Trivy scan every built service image
 	done
 
 .PHONY: check
-check: verify-no-host-toolchain fmt-check vet lint tidy-check codegen-check test ## The full local gate CI mirrors
+check: verify-no-host-toolchain verify-ryuk-image fmt-check vet lint tidy-check codegen-check test ## The full local gate CI mirrors
 
 # =============================================================================
 ##@ Dependencies
@@ -1475,7 +1646,7 @@ query-plans: build-tools ## EXPLAIN every sqlc query on a THROWAWAY database; fa
 # =============================================================================
 
 .PHONY: psql
-psql: ## Interactive SQL prompt against Postgres (brings it up healthy first)
+psql: cache-init ## Interactive SQL prompt against Postgres (brings it up healthy first)
 	$(COMPOSE_TOOLS) run --rm psql
 
 .PHONY: redis-cli
@@ -1483,22 +1654,22 @@ redis-cli: ## Interactive Redis prompt inside the running redis container
 	$(COMPOSE) exec redis sh -lc 'exec redis-cli --no-auth-warning $${SHARPLINE_REDIS_PASSWORD:+-a "$$SHARPLINE_REDIS_PASSWORD"} $(ARGS)'
 
 .PHONY: kafka-topics
-kafka-topics: ## List topics, or ARGS="--describe --topic odds.normalized"
+kafka-topics: cache-init ## List topics, or ARGS="--describe --topic odds.normalized"
 	$(COMPOSE_TOOLS) run --rm kafka-cli -lc \
 	  'kafka-topics.sh --bootstrap-server $$KAFKA_BOOTSTRAP $(if $(ARGS),$(ARGS),--list)'
 
 .PHONY: kafka-console
-kafka-console: ## Tail a Kafka topic (KAFKA_TOPIC=price.computed)
+kafka-console: cache-init ## Tail a Kafka topic (KAFKA_TOPIC=price.computed)
 	$(COMPOSE_TOOLS) run --rm kafka-cli -lc \
 	  'kafka-console-consumer.sh --bootstrap-server $$KAFKA_BOOTSTRAP --topic $(KAFKA_TOPIC) --from-beginning --property print.key=true --property print.timestamp=true'
 
 .PHONY: kafka-groups
-kafka-groups: ## Show consumer groups and lag
+kafka-groups: cache-init ## Show consumer groups and lag
 	$(COMPOSE_TOOLS) run --rm kafka-cli -lc \
 	  'kafka-consumer-groups.sh --bootstrap-server $$KAFKA_BOOTSTRAP --all-groups --describe'
 
 .PHONY: kafka-shell
-kafka-shell: ## Drop into a shell with the Kafka CLI on PATH
+kafka-shell: cache-init ## Drop into a shell with the Kafka CLI on PATH
 	$(COMPOSE_TOOLS) run --rm kafka-cli -l
 
 # =============================================================================
@@ -1506,10 +1677,14 @@ kafka-shell: ## Drop into a shell with the Kafka CLI on PATH
 # =============================================================================
 
 # `node_modules` lives on a NAMED VOLUME, not in the repo (CLAUDE.md section 7: the
-# host arch must never leak into the image). `make down-hard` deletes named volumes --
-# that is what makes it the reset button -- so the volume is routinely empty, and every
-# frontend target below would then fail with `sh: tsc: not found`, which names neither
-# the cause nor the fix.
+# host arch must never leak into the image). It is empty on a fresh clone and after
+# `make clean`, and every frontend target below would then fail with
+# `sh: tsc: not found`, which names neither the cause nor the fix.
+#
+# `make down-hard` is NOT one of those moments any more. The volume is declared
+# `external:` in compose.yaml (see down-hard for the argument), so the reset button
+# resets application state and leaves an installed node_modules alone -- which is
+# what makes `make down-hard && make up` work with no network.
 #
 # This guard populates it from the COMMITTED LOCKFILE when, and only when, it is empty.
 # When it is populated this is a container start and an `-x` test: cheap enough to be a
@@ -1522,7 +1697,7 @@ kafka-shell: ## Drop into a shell with the Kafka CLI on PATH
 # codegen-check-ts) and `make web-ci` were run at the same time. Making the common path
 # a no-op removes almost all of that window.
 .PHONY: web-deps
-web-deps: ## Populate the web dependency volume from the lockfile IF it is empty (no-op otherwise)
+web-deps: cache-init ## Populate the web dependency volume from the lockfile IF it is empty (no-op otherwise)
 	@$(COMPOSE_TOOLS) run --rm npm sh -c '\
 	  if [ -x node_modules/.bin/next ] && [ -x node_modules/.bin/tsc ] && [ -x node_modules/.bin/eslint ]; then \
 	    exit 0; \
@@ -1531,11 +1706,11 @@ web-deps: ## Populate the web dependency volume from the lockfile IF it is empty
 	  npm ci --no-audit --no-fund'
 
 .PHONY: web-install
-web-install: ## Install/refresh web deps INSIDE the container; lockfile round-trips via the mount
+web-install: cache-init ## Install/refresh web deps INSIDE the container; lockfile round-trips via the mount
 	$(COMPOSE_TOOLS) run --rm npm npm install $(ARGS)
 
 .PHONY: web-ci
-web-ci: ## Reproducible install from the committed lockfile
+web-ci: cache-init ## Reproducible install from the committed lockfile
 	$(COMPOSE_TOOLS) run --rm npm npm ci
 
 .PHONY: web-lint
@@ -1600,7 +1775,7 @@ TF_LOCK_PLATFORMS ?= linux_amd64 linux_arm64
 # Failing with the target name is better than failing with terraform's own
 # "Missing required provider" wall of text.
 .PHONY: tf-preflight
-tf-preflight: ## Check TF_ENV is real, it has been init'ed, and (local) that the broker is up
+tf-preflight: cache-init ## Check TF_ENV is real, it has been init'ed, and (local) that the broker is up
 	@case '$(TF_ENV)' in \
 	   local|prod) ;; \
 	   *) printf 'FAIL  TF_ENV=%s is not an environment root.\n' '$(TF_ENV)'; \
@@ -1613,16 +1788,28 @@ tf-preflight: ## Check TF_ENV is real, it has been init'ed, and (local) that the
 	   exit 1; \
 	 fi
 	@# A present .terraform is NOT proof the providers are usable. TF_PLUGIN_CACHE_DIR
-	@# points at the `terraform-plugin-cache` compose volume, so what lands under
-	@# .terraform/providers is a tree of SYMLINKS into that volume -- and
-	@# `make down-hard` removes it along with every other project volume. The
-	@# result is a host directory that looks initialised and a run that dies with
-	@# "Required plugins are not installed", which reads like a lock-file problem
+	@# points at the terraform-plugin-cache volume, so what lands under
+	@# .terraform/providers is a tree of SYMLINKS into that volume. Lose the volume
+	@# and the result is a host directory that looks initialised and a run that dies
+	@# with "Required plugins are not installed", which reads like a lock-file problem
 	@# and is not one. Re-linking is what init does and it is idempotent, so the
 	@# recovery is automatic rather than a documented ritual.
+	@#
+	@# `make down-hard` NO LONGER CAUSES THIS, and that was the whole of GAP 4: the
+	@# volume is declared `external:` in compose.tools.yaml now, so the reset button
+	@# cannot reach it. Which matters here specifically, because the recovery below
+	@# is `terraform init` -- a registry.terraform.io round trip. When down-hard took
+	@# the plugin cache with it, `make down-hard && make up` could not converge the
+	@# topics without egress, and a reset button that needs the internet to undo is
+	@# not a reset button. This check stays because `make clean`, a manual
+	@# `docker volume rm`, and a first-ever clone all still land here legitimately.
 	@if find '$(ROOT_DIR)/deploy/terraform/envs/$(TF_ENV)/.terraform' -type l ! -exec test -e {} \; -print 2>/dev/null | grep -q .; then \
-	   printf 'NOTE  provider plugins are unresolvable (the plugin cache volume was removed,\n'; \
-	   printf '      most likely by `make down-hard`). Re-linking them.\n'; \
+	   printf 'NOTE  provider plugins are unresolvable: the %s volume is\n' '$(TF_PLUGIN_VOLUME)'; \
+	   printf '      empty or absent, so .terraform/providers is a tree of dangling symlinks.\n'; \
+	   printf '      Expected after `make clean`, `make cache-clean`, a manual `docker volume\n'; \
+	   printf '      rm`, or on a first-ever clone. NOT after `make down-hard` -- that volume is\n'; \
+	   printf '      external precisely so the reset button cannot reach it.\n'; \
+	   printf '      Re-linking them, which needs registry.terraform.io.\n'; \
 	   $(MAKE) --no-print-directory tf-init ARGS=; \
 	 fi
 	@# NOTE: do NOT write the bare word `terraform` in a recipe MESSAGE. It is in
@@ -1653,7 +1840,7 @@ tf-preflight-kafka: tf-preflight ## Local only: refuse to plan/apply against a b
 	 printf 'OK  kafka: healthy\n'
 
 .PHONY: tf-init
-tf-init: ## terraform init for TF_ENV (local|prod); writes the committed .terraform.lock.hcl
+tf-init: cache-init ## terraform init for TF_ENV (local|prod); writes the committed .terraform.lock.hcl
 	$(TF_RUN) init -input=false $(ARGS)
 
 .PHONY: tf-validate
@@ -1661,11 +1848,11 @@ tf-validate: tf-preflight ## Static validation of TF_ENV: syntax, types, variabl
 	$(TF_RUN) validate $(ARGS)
 
 .PHONY: tf-fmt
-tf-fmt: ## Rewrite every .tf file under deploy/terraform to canonical form
+tf-fmt: cache-init ## Rewrite every .tf file under deploy/terraform to canonical form
 	$(COMPOSE_TOOLS) run --rm $(DOCKER_AS_USER) terraform terraform fmt -recursive /workspace/deploy/terraform
 
 .PHONY: tf-fmt-check
-tf-fmt-check: ## Fail if any .tf file is not canonically formatted (CI-safe, writes nothing)
+tf-fmt-check: cache-init ## Fail if any .tf file is not canonically formatted (CI-safe, writes nothing)
 	$(COMPOSE_TOOLS) run --rm $(DOCKER_AS_USER) terraform terraform fmt -recursive -check -diff /workspace/deploy/terraform
 
 .PHONY: tf-plan
@@ -1705,7 +1892,7 @@ tf-show: tf-preflight ## Show the recorded state for TF_ENV
 	$(TF_RUN) show $(ARGS)
 
 .PHONY: tf-lock
-tf-lock: ## Re-record provider checksums for EVERY target platform into .terraform.lock.hcl
+tf-lock: cache-init ## Re-record provider checksums for EVERY target platform into .terraform.lock.hcl
 	$(TF_RUN) providers lock $(addprefix -platform=,$(TF_LOCK_PLATFORMS)) $(ARGS)
 
 .PHONY: tf-providers
@@ -1878,21 +2065,53 @@ deploy-vm-status: ## Check health and container status on remote VM host
 # Seeding the volumes once as 0777 makes them writable whichever uid a target
 # picks -- the invoking user for targets that write source files, root for the
 # test container which must open the Docker socket.
+#
+# SINCE GAP 4 THIS TARGET ALSO CREATES THE COMPOSE-SIDE BUILD INPUTS, and creating
+# them is not optional the way it used to be. They are declared `external:` in
+# deploy/compose/*.yaml so that `down-hard` cannot destroy them, and Compose refuses
+# to start a service that mounts an external volume which does not exist. So this is
+# now a prerequisite of `up`/`up-dev`/`up-obs` and of every compose-tools target,
+# not merely a permissions convenience.
+#
+# AND THE 0777 SEEDING IS NOT OPTIONAL FOR THEM EITHER -- for a reason that only
+# appears once the volume is pre-created. Docker copies an image directory's contents
+# AND ITS PERMISSIONS into a named volume only while that volume is still EMPTY. The
+# four compose caches used to rely on exactly that: tools.Dockerfile chmods
+# /go/pkg/mod and /home/sharpline/.terraform.d/plugin-cache to 0777, Compose created
+# the volume empty at first mount, and the copy-up carried 0777 across. Creating the
+# volume here fills it with a root-owned 0755 directory first, the copy-up no longer
+# happens, and uid 65532 inside the tools image can no longer write its own plugin
+# cache. Seeding them 0777 restores the property the copy-up used to provide.
+#
+# Everything is mounted under /v/ rather than at its real in-container path, because
+# only the VOLUME ROOT's mode matters and alpine has none of these paths anyway.
 .PHONY: cache-init
-cache-init: ## Create the named build-cache volumes and make them writable
+cache-init: ## Create the named build-input volumes and make them writable
 	@docker run --rm \
 	  -v $(GOMOD_VOLUME):/v/gopkg \
 	  -v $(GOBUILD_VOLUME):/v/gobuild \
 	  -v $(GOBIN_VOLUME):/v/gobin \
 	  -v $(TOOLS_CACHE_VOLUME):/v/toolscache \
-	  $(ALPINE_IMAGE) sh -c 'mkdir -p /v/gopkg/mod /v/gopkg/sumdb && chmod 0777 /v/gopkg /v/gopkg/mod /v/gopkg/sumdb /v/gobuild /v/gobin /v/toolscache'
+	  -v $(TOOLS_GOMOD_VOLUME):/v/toolsgomod \
+	  -v $(TF_PLUGIN_VOLUME):/v/tfplugin \
+	  -v $(NPM_CACHE_VOLUME):/v/npmcache \
+	  -v $(WEB_MODULES_VOLUME):/v/webmodules \
+	  -v $(WEB_NEXT_VOLUME):/v/webnext \
+	  $(ALPINE_IMAGE) sh -c 'mkdir -p /v/gopkg/mod /v/gopkg/sumdb && chmod 0777 /v/gopkg /v/gopkg/mod /v/gopkg/sumdb /v/gobuild /v/gobin /v/toolscache /v/toolsgomod /v/tfplugin /v/npmcache /v/webmodules /v/webnext'
 
+# The counterweight to `down-hard`. Since the build inputs are `external:` and the
+# reset button can no longer reach them, THIS is the only thing that deletes them --
+# so it is what `clean` needs in order to still mean "everything".
 .PHONY: cache-clean
-cache-clean: ## Delete every named build-cache volume
+cache-clean: ## Delete every named build-input volume (Go, tools, terraform, npm, node_modules)
 	docker volume rm --force $(CACHE_VOLUMES)
 
+# Still the total wipe, and still the ONLY total wipe: application state via
+# down-hard, build inputs via cache-clean. Expect the next `make up` to need the
+# network -- it re-downloads the Go module graph, the Terraform providers and
+# node_modules. That is the difference between this and `down-hard`.
 .PHONY: clean
-clean: down-hard cache-clean ## Full reset: stack down with volumes, caches dropped
+clean: down-hard cache-clean ## Full reset: application state AND every build input dropped
 
 .PHONY: clean-images
 clean-images: ## Remove locally built Sharpline images

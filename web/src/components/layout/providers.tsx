@@ -30,15 +30,24 @@ import type { ReactNode } from 'react';
 import { QueryProvider } from '@/lib/query/provider';
 import { useAuthHydration } from '@/lib/store/auth';
 import { usePreferencesHydration } from '@/lib/store/preferences';
+import { useSlipHydration } from '@/lib/store/slip';
 import { StreamProvider } from '@/lib/ws/provider';
 
 function StoreHydration({ children }: { readonly children: ReactNode }) {
-  // Both are no-ops on the server and read `localStorage` once after mount. The
-  // stores ship with `skipHydration`, so the first client render matches the
-  // server render exactly and only the second one carries stored preferences —
-  // which is why the odds-format toggle cannot mismatch during hydration.
+  // All three are no-ops on the server and read `localStorage` once after mount.
+  // The stores ship with `skipHydration`, so the first client render matches the
+  // server render exactly and only the second one carries stored state — which
+  // is why the odds-format toggle cannot mismatch during hydration, and why a
+  // restored six-leg slip does not arrive as a hydration error.
   usePreferencesHydration();
   useAuthHydration();
+  // Called here as well as inside the slip panel, and that is not a duplicate
+  // that matters: `useSlipHydration` is idempotent — it rehydrates only while
+  // `hydrated` is false — where `useAuthHydration` is not, because a second
+  // caller could redeem the same refresh token twice and get the whole family
+  // revoked. Hoisting it means the mobile dock knows whether the slip is empty
+  // before the panel that would read storage has ever been mounted.
+  useSlipHydration();
 
   return <>{children}</>;
 }

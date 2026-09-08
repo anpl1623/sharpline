@@ -47,6 +47,7 @@ export function BoardRow({ entry, catalogue, bookFilter, timeZone }: BoardRowPro
         <MarketColumn
           key={column}
           eventId={event.id}
+          eventName={event.name}
           column={column}
           market={marketForColumn(markets, column)}
           catalogue={catalogue}

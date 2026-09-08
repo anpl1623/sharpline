@@ -327,8 +327,49 @@ services:
     networks:
       - sharpline
 
+# EVERY VOLUME HERE IS A BUILD INPUT -- something downloaded or compiled, never
+# something a user produced -- so every one of them is `external: true`.
+#
+# That keeps them OUT of the Compose project, which is the entire point: `make
+# down-hard` runs `down --volumes` across all four overlays, and it is supposed to.
+# Declared normally these become `sharpline_go-mod-cache` and friends, Compose owns
+# them, and the reset button deletes the Terraform provider plugins and the npm
+# cache along with the Postgres data. `deploy/terraform/envs/local/.terraform` is a
+# tree of SYMLINKS into terraform-plugin-cache, so that turned `make down-hard &&
+# make up` into an operation that could not converge the Kafka topics without
+# reaching registry.terraform.io. See the `down-hard` recipe in the Makefile for the
+# full argument, including why scoping `--volumes` to compose.yaml is NOT the fix.
+#
+# A custom `name:` alone does not do this -- verified: `down --volumes` still removes
+# a project volume that carries one. `external: true` is the mechanism.
+#
+# THE PRICE, PAID KNOWINGLY: Compose refuses to start a service mounting an external
+# volume that does not exist ("external volume ... not found"). `make cache-init`
+# creates and 0777-seeds all of them and is a prerequisite of every target that runs
+# one of these services, so the Makefile path never sees it. A raw `docker compose
+# ... run` on a machine that has never run a make target will, and the message says
+# what to do. `down`, `ps` and `config` all tolerate them being absent.
+#
+# The names are `sharpline-*` with a DASH, matching the Makefile's own cache volumes
+# and deliberately unlike Compose's own `sharpline_*` prefix, so `docker volume ls`
+# shows at a glance which volumes survive a reset. They are kept in lockstep with the
+# *_VOLUME variables in the Makefile by hand; a mismatch fails loudly at `up`.
 volumes:
+  # NOT the Makefile's sharpline-go-mod-cache. That one is mounted at /go/pkg (it has
+  # to cover sumdb/ as well as mod/); this one is mounted at /go/pkg/mod, and one
+  # volume cannot be rooted at two depths.
   go-mod-cache:
+    name: sharpline-tools-go-mod-cache
+    external: true
+  # This one IS the Makefile's TOOLS_CACHE_VOLUME. Same tools image, same
+  # /home/sharpline/.cache mountpoint, same uid mix -- it was one cache that had
+  # been declared twice, and `make lint` and `make tf-plan` now share it.
   tools-cache:
+    name: sharpline-tools-cache
+    external: true
   terraform-plugin-cache:
+    name: sharpline-terraform-plugin-cache
+    external: true
   npm-cache:
+    name: sharpline-npm-cache
+    external: true

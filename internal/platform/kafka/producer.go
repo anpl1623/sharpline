@@ -248,11 +248,45 @@ func newProducer(ctx context.Context, opts ProducerOptions, profile []kgo.Opt) (
 		// It becomes settable only by disabling idempotence, which is exactly
 		// the combination that reorders.
 
-		// lz4, falling back to none if the broker refuses. Not zstd: its Go
-		// implementation costs more CPU per byte and the deploy target is a
-		// 2 OCPU Ampere box. JSON from one topic is highly repetitive, so lz4
-		// recovers most of the size difference against protobuf (doc.go).
-		kgo.ProducerBatchCompression(kgo.Lz4Compression(), kgo.NoCompression()),
+		// NO COMPRESSION, and the reason is the BROKER's heap rather than this
+		// process's CPU.
+		//
+		// This was lz4. It OOM-killed the broker, repeatably, on a log holding
+		// less than 300 KB:
+		//
+		//   java.lang.OutOfMemoryError: Java heap space
+		//     at Lz4Compression.wrapForInput
+		//     at LogValidator.validateMessagesAndAssignOffsetsCompressed
+		//     at UnifiedLog.append              (topic odds.raw.synthetic)
+		//
+		// The mechanism is a declared buffer size, not a large payload.
+		// franz-go compresses through pierrec/lz4, whose
+		// DefaultBlockSizeOption is Block4Mb, so EVERY frame this producer
+		// writes declares a 4 MiB maximum block — and Kafka sizes its
+		// decompression buffer from that declaration rather than from the
+		// bytes actually present. franz-go builds the writer itself and
+		// applies only a compression level, so there is no option here that
+		// makes the declaration smaller.
+		//
+		// Measured on a running stack: records are ~3.7 KB uncompressed and
+		// ~1.2 KB on the wire, and `kafka-dump-log` reports `count: 1` on every
+		// batch. So the steady state was a 4 MiB broker-side allocation per
+		// 1.2 KB record. At the 192 MiB heap the deploy VM is sized for (see
+		// compose.yaml) the broker died in under four minutes having written
+		// zero prices; at 768 MiB it survived a few minutes and then died the
+		// same way. A bigger heap buys time and does not fix it.
+		//
+		// The cost of turning it off is 3x on the wire and on disk, against
+		// topics whose whole retained volume was 291 KB and whose
+		// retention.bytes is 1 GiB per partition. That is not a trade, it is a
+		// rounding error.
+		//
+		// IF COMPRESSION IS EVER NEEDED AGAIN — a real provider at real volume
+		// — do not simply put lz4 back. Snappy and zstd size their input
+		// buffers from the actual block rather than from a declared maximum,
+		// which is the property that matters here; zstd was already rejected on
+		// CPU in this file's earlier revision, which leaves snappy.
+		kgo.ProducerBatchCompression(kgo.NoCompression()),
 
 		// The murmur2 key partitioner Kafka's own clients use, set explicitly
 		// rather than relied on as a default. A phase-12 Flink SQL job writing
@@ -725,6 +759,54 @@ func (p *OddsProducer) PublishPriceAsync(
 	return p.publishAsync(ctx, PriceComputed(), marketKey(id), msg, done)
 }
 
+// PublishEVSignal publishes one positive-expected-value finding to signals.ev,
+// keyed by market.
+//
+// # Why the signals topics hang off the ODDS producer and are keyed by market
+//
+// The phase-9 signals stage runs inside `pricer` as a second consumer group over
+// price.computed (see cmd/pricer's package comment), so the binary that writes
+// these already holds an *OddsProducer and there is no second producer to own.
+// Keying by market rather than by selection or window is the co-partitioning
+// argument from topics.go: odds.normalized, price.computed and the three
+// market-keyed signals topics put the same market on the same partition INDEX,
+// so phase 12's Flink joins between a finding and the prices that produced it
+// are partition-local rather than a network shuffle. A finer key would buy a
+// granularity nothing consumes and would cost exactly that.
+//
+// # Why there is no async variant of any of the three
+//
+// A price that fails to publish is restated by the next poll, and the compacted
+// snapshot heals. A FINDING is not restated and lives on a retention-based
+// topic, so a fire-and-forget signal that never reached the broker is a loss
+// nobody can detect. All three are synchronous so the error reaches the caller,
+// the consumer's offset stays uncommitted, and the record is redelivered into
+// analytics' idempotent write path.
+func (p *OddsProducer) PublishEVSignal(ctx context.Context, id domain.MarketID, msg Message) error {
+	return p.publish(ctx, SignalsEV(), marketKey(id), msg)
+}
+
+// PublishArbitrageSignal publishes one cross-book arbitrage finding to
+// signals.arb, keyed by market. See PublishEVSignal for why it is market-keyed
+// and why there is no async variant.
+func (p *OddsProducer) PublishArbitrageSignal(ctx context.Context, id domain.MarketID, msg Message) error {
+	return p.publish(ctx, SignalsArb(), marketKey(id), msg)
+}
+
+// PublishSteamSignal publishes one steam-move finding to signals.steam, keyed by
+// market.
+//
+// The finding's own natural key is (market, selection, window), which is finer
+// than the bus key on purpose: the finer key is what makes the row idempotent
+// where rows are STORED, and per-key ordering is what is being bought here. A
+// market's steam findings therefore arrive in a total order, which is what a
+// consumer folding them into a per-market view needs; ordering across markets is
+// neither offered nor required, because every payload carries its own window_end
+// to order by. See PublishEVSignal for why there is no async variant.
+func (p *OddsProducer) PublishSteamSignal(ctx context.Context, id domain.MarketID, msg Message) error {
+	return p.publish(ctx, SignalsSteam(), marketKey(id), msg)
+}
+
 // TombstoneNormalized permanently deletes a market from the odds.normalized
 // snapshot.
 //
@@ -800,4 +882,31 @@ func NewAuditProducer(ctx context.Context, opts ProducerOptions) (*AuditProducer
 // idempotency key in Postgres is what absorbs them.
 func (p *AuditProducer) PublishWagerEvent(ctx context.Context, id domain.WagerID, msg Message) error {
 	return p.publish(ctx, WagerEvents(), wagerKey(id), msg)
+}
+
+// PublishCLVSignal publishes one graded leg's closing line value to signals.clv,
+// keyed by WAGER, and blocks until the broker has acknowledged it.
+//
+// # Why this is on the AUDIT producer and not the odds producer
+//
+// Because of the KEY. signals.clv is the one member of the signals family keyed
+// by wager_id rather than market_id (see topics.go), so that a wager's placement,
+// settlement and CLV stay ordered relative to one another on one partition for a
+// consumer building a user's record. wagerKey is only reachable from here, and a
+// market-keyed producer could not express this topic's key at all.
+//
+// The posture is a slightly better fit than it first looks. A lost CLV record is
+// NOT recoverable by a poller the way a lost odds record is — nothing re-derives
+// it from a provider — but it is recoverable by the settle service's own work
+// queue, which re-measures any graded leg that has no stored row. So the
+// unbounded retries this producer applies are a convenience here rather than the
+// correctness requirement they are for wager.events, and the caller's context
+// deadline is what bounds them, as always.
+//
+// There is deliberately no asynchronous sibling, matching PublishWagerEvent. The
+// caller declines to store the measurement until the record is acknowledged —
+// publish first, then persist — so a fire-and-forget path would remove the only
+// signal it has that the record landed.
+func (p *AuditProducer) PublishCLVSignal(ctx context.Context, id domain.WagerID, msg Message) error {
+	return p.publish(ctx, SignalsCLV(), wagerKey(id), msg)
 }

@@ -225,9 +225,19 @@ func TestFollowerOptionsResolveTopic(t *testing.T) {
 		{name: "wager.events is retention-based", topic: TopicWagerEvents, wantErr: ErrNotCompacted},
 		{name: "a raw provider topic is retention-based", topic: TopicOddsRawPrefix + "synthetic",
 			wantErr: ErrNotCompacted},
-		{name: "an unregistered topic is refused by default", topic: "signals.steam", wantErr: ErrNotCompacted},
-		{name: "an unregistered topic is allowed on request", topic: "signals.steam", allow: true,
-			wantName: "signals.steam"},
+		// "signals.middles" rather than a signals.* name that exists: phase 9
+		// registered signals.ev, signals.arb, signals.steam and signals.clv, and a
+		// REGISTERED retention-based topic is refused even with AllowUnregistered
+		// set — the flag bypasses the registry lookup, not the compaction
+		// requirement. Middles are deliberately not a topic (they are a position,
+		// not an event), so the name is stable as a stand-in for "not enumerated".
+		{name: "an unregistered topic is refused by default", topic: "signals.middles", wantErr: ErrNotCompacted},
+		{name: "an unregistered topic is allowed on request", topic: "signals.middles", allow: true,
+			wantName: "signals.middles"},
+		// A registered retention-based topic stays refused WITH the flag, which is
+		// the distinction the two cases above would otherwise stop making.
+		{name: "a registered retention-based topic is refused even on request",
+			topic: TopicSignalsSteam, allow: true, wantErr: ErrNotCompacted},
 	}
 
 	for _, tc := range cases {

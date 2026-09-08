@@ -52,8 +52,50 @@ environment root.
 | `odds.normalized` | 6 | `compact` | snapshot, forever | `market_id` |
 | `price.computed` | 6 | `compact` | snapshot, forever | `market_id` |
 | `wager.events` | 3 | `delete` | 90 d, unlimited bytes | wager-shaped |
+| `signals.ev` | 3 | `delete` | 7 d, ≤ 512 MiB/partition | `market_id` |
+| `signals.arb` | 3 | `delete` | 30 d, ≤ 256 MiB/partition | `market_id` |
+| `signals.steam` | 3 | `delete` | 30 d, ≤ 256 MiB/partition | `market_id` |
+| `signals.clv` | 3 | `delete` | 90 d, unlimited bytes | `wager_id` |
 
-21 application partitions in total. `terraform output total_partitions` reports it.
+33 application partitions in total. `terraform output total_partitions` reports it.
+
+### The signals family (phase 9)
+
+Three of the four names come from CLAUDE.md §3's event-flow diagram
+(`signals.steam | signals.arb | signals.clv`). **`signals.ev` is an addition** —
+the diagram does not name it, but §6's Analytics bullet leads with the
+positive-EV finder and phase 9 needs it on the bus for the same reason as the
+other three.
+
+They are declared in phase 9 rather than in phase 12 on purpose. §11 row 9 calls
+the Go analytics "the reference implementation phase 12 validates against"; if
+the Go detectors publish to the same topics with the same keys and the same
+retention that the Flink jobs will, the cutover is a like-for-like swap that can
+be diffed rather than a new pipeline that has to be trusted.
+
+**All four are `delete`, never `compact`,** and that is the decision worth
+guarding. Compaction is right when the newest record per key *supersedes* the
+older ones — true of a market's current line, false of a finding. "The latest
+steam move for market X" is one event, not a snapshot; the one before it is a
+different event that also happened, and a consumer computing hit rates needs
+both. Compacting these would do to the signal history what compacting
+`wager.events` would do to the audit trail, and would do it invisibly, because
+the head of the log would still look right.
+
+These topics are not the system of record either — migration `00009_analytics.sql`
+is, and its tables carry no expiry. The windows above are **replay** windows, each
+sized by "how far back would someone reset a consumer group to?": a week to re-run
+a slate through a corrected +EV detector, a month to audit whether reported
+arbitrage and steam were real, and a season for CLV because it is measured from
+the same graded legs `wager.events` keeps for 90 days.
+
+**3 partitions each, not 6.** The co-partitioning argument that makes
+`odds.normalized` and `price.computed` both 6 does not extend, because signals are
+join *outputs*, not join inputs — a sink's partition count has no bearing on
+whether the join upstream of it shuffles, and nothing joins two signals topics to
+each other. What is left is volume (thresholded output, not a firehose) and
+consumer parallelism (one low-concurrency group), and both say 3. It also keeps
+`total_partitions` at 33 rather than 45 on a single-node deploy target.
 
 ## Two traps this module refuses to let you fall into
 

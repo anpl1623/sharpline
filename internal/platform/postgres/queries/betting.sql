@@ -226,3 +226,613 @@ INSERT INTO ledger_entries (transaction_id, entry_index,
 VALUES (@transaction_id, @entry_index,
         @account_kind, @account_user_id,
         @amount_minor, @kind, @occurred_at);
+
+
+
+/*
+ * ============================================================================
+ * Phase 8 additions: the reads a placement authorises itself with
+ * ============================================================================
+ *
+ * Everything above this line is an INSERT: the placement write path, unchanged.
+ * Everything below is a READ, and every one of them is read INSIDE the same
+ * transaction that performs the write it authorises. internal/betting's
+ * ports.go declares the seam these back -- Store.InTx and the Tx interface --
+ * and states the rule in one sentence: "EVERY METHOD ON Tx RUNS INSIDE THE SAME
+ * DATABASE TRANSACTION."
+ *
+ * WHY THAT IS NOT A PERFORMANCE PREFERENCE
+ *
+ * Two of the decisions a placement makes are read-then-write over a DERIVED
+ * quantity with no database constraint behind it:
+ *
+ *   * the affordability fold over ledger_entries. There is no non-negative
+ *     CHECK on a balance, and there must not be -- the issuance and house
+ *     accounts go negative by design (ledger.go). So two concurrent placements
+ *     that each fold the same balance both see enough money and both commit.
+ *
+ *   * the responsible-gaming limit sums. Same shape: two placements that each
+ *     read the period's stake total before either has written its own each fit
+ *     under a cap that the pair of them breaks.
+ *
+ * Neither is fixed by being in one transaction. Both are fixed by the FOR
+ * UPDATE on GetUserStatus below, which serialises one customer's placements on
+ * the row this transaction has to read anyway. The transaction is what makes
+ * the wager and the facts that authorised it commit or fail TOGETHER, and what
+ * lets the database's own backstops -- migration 00008's
+ * wagers_refuse_excluded_user and 00006's deferred balance trigger -- get the
+ * final word at COMMIT.
+ *
+ * The design is "the service is the trust boundary, and the database is the
+ * backstop". These queries are the trust boundary's half of it.
+ *
+ * NO UPDATE STATEMENTS BELOW EITHER. Grading is settlement.sql's, and that file
+ * is separate for a reason its header states.
+ * ============================================================================
+ */
+
+
+-- The wagering gate: users.status, read inside the placement transaction, WITH
+-- THE ROW LOCKED.
+--
+-- auth.UserStatus.CanWager() is true for 'active' ONLY. This query is how the
+-- placement service asks; auth/status.go is where the decision is argued, and it
+-- rejects the two cheaper placements outright -- a hidden bet slip is not a
+-- control because curl exists, and a JWT claim is a snapshot minted at login so
+-- an HTTP-middleware check has a window exactly the width of the access-token
+-- lifetime.
+--
+-- WHAT THE LOCK IS FOR, AND WHAT IT IS NOT FOR
+--
+-- It is NOT for the self-exclusion race, and reading it that way would make it
+-- look removable. Under READ COMMITTED this SELECT sees its own statement's
+-- snapshot, so an exclusion committing a microsecond later is invisible with or
+-- without a lock, and auth/status.go already accepts BOTH orderings: "an
+-- exclusion that commits first is seen, and one that commits after was not in
+-- force when the wager was accepted. Either outcome is defensible to the
+-- customer, which is the actual requirement."
+--
+-- It IS for the two read-then-write decisions this file's header names -- the
+-- balance fold and the limit sums -- neither of which has a constraint behind
+-- it, and both of which are wrong under concurrency without something
+-- serialising one customer's placements. This is that something. It is taken on
+-- a row the transaction must read anyway, and it costs nothing in practice
+-- because a customer places one bet at a time. internal/betting/ports.go
+-- declares the lock as part of Tx.UserStatus's contract, so it is not an
+-- implementation detail an adapter may drop.
+--
+-- The lock is on `users` and not on `account_balances`, because a view has no
+-- rows to lock, and not on ledger_entries, because there is nothing there yet
+-- to lock -- the rows this placement is racing are the ones the other
+-- transaction has not written. The customer's own profile row is the only thing
+-- both transactions are guaranteed to touch, which is exactly what a
+-- serialisation point has to be.
+--
+-- NO `NOWAIT` AND NO `SKIP LOCKED`. The second placement must WAIT and then see
+-- the first one's committed entries; skipping the row would defeat the entire
+-- purpose, and failing fast would turn a customer double-clicking Place into an
+-- error when the correct answer is the idempotency key's answer.
+--
+-- THE RAW STRING IS RETURNED, not a parsed status. Parsing belongs in the
+-- service, where an unrecognised value fails closed with ErrAccountNotWagerable;
+-- a store that parsed would have to decide what to do with a status its build
+-- predates, and that decision is not a store's to make.
+--
+-- Returns NO ROW for an unknown user. The caller is already authenticated, so
+-- that is a programming error rather than a customer-facing one -- and the
+-- wagers.user_id foreign key would refuse the INSERT one statement later with a
+-- worse error anyway.
+--
+-- internal/auth/pgstore has a hand-written, LOCK-FREE twin of this statement
+-- (selectUserStatusSQL) reached through auth.StatusReader. Both exist on
+-- purpose: that one answers "may this session continue" and has nothing to
+-- serialise; this one is the placement gate and does.
+--
+-- name: GetUserStatus :one
+SELECT id, status
+  FROM users
+ WHERE id = @user_id
+   FOR UPDATE;
+
+
+-- The customer's self-imposed limits BINDING at an instant.
+--
+-- CLAUDE.md section 6 (Account): "responsible-gaming-style self-imposed limits".
+-- Migration 00005 records the decision this query depends on: user_limits.kind
+-- is spelled 'grant', 'stake' and 'loss' precisely so the money kinds match
+-- domain.EntryKind character for character, which is what lets enforcement be a
+-- SUM over ledger_entries on the same string -- see SumLedgerEntriesSince below.
+-- No mapping table sits between a limit and the entries it bounds, because a
+-- mapping table is where a limit silently stops matching them.
+--
+-- WHY THE PREDICATE IS NOT `superseded_at IS NULL`
+--
+-- Those are different rows during a cooling-off period, and picking the wrong
+-- one silently disables the control at the one moment it matters. Migration
+-- 00005 makes the limit history append-only and ASYMMETRIC: a TIGHTENING binds
+-- immediately, a LOOSENING only after a cooling-off period. api.sql's
+-- ListCurrentUserLimits filters on `superseded_at IS NULL`, which is correct for
+-- DISPLAY -- it is what the customer has asked for -- and wrong for
+-- ENFORCEMENT, because between the request and the cooling-off expiry that row
+-- is the LOOSER limit which is not yet in force.
+--
+-- So "in force at an instant" is the half-open interval
+-- [effective_from, superseded_at), which is exactly the predicate below and
+-- exactly what internal/betting/ports.go's Tx.LimitsInForce specifies.
+--
+-- IT CARRIES A REQUIREMENT ON THE WRITE SIDE that this file does not own and
+-- cannot enforce: when a loosening supersedes a row, the superseded row's
+-- superseded_at must be stamped with the NEW row's effective_from, not with
+-- now(). Then this predicate returns the old, tighter row throughout the
+-- cooling-off and the new one afterwards, with no gap and no overlap. Stamping
+-- it with now() opens a gap exactly the width of the cooling-off period during
+-- which NO limit is in force -- which is worse than either row. internal/httpapi
+-- Limits.Set is where that is decided; ports.go states the same requirement from
+-- the consumer's side.
+--
+-- `at` is a parameter and not now(), for the reason every instant in this schema
+-- is: one placement must have ONE instant. The limit windows, the sums, the
+-- ledger transaction's occurred_at and wagers.placed_at are all this value, read
+-- once at the top of Place. Three calls to time.Now() in one placement put three
+-- different instants in one ticket.
+--
+-- SESSION LIMITS ARE RETURNED, not filtered out, and that is why the amount
+-- arrives as a value plus a flag. A session limit is a DURATION and has NULL
+-- amount_minor (00005's user_limits_money_is_amount states the biconditional),
+-- so returning the column bare would scan a NULL into a non-pointer integer and
+-- fail at runtime -- on the session row specifically, which a money-limit test
+-- never reaches. The value is coalesced and its PRESENCE projected beside it,
+-- exactly as api.sql does. Zero is a safe sentinel only because it is
+-- unstorable: the CHECK requires amount_minor > 0, so a zero here can only mean
+-- NULL. betting's Limit carries an auth.LimitKind and the evaluator skips
+-- anything that is not Kind.IsMoney(), which is where a session limit stops.
+--
+-- The consequence of the coalesce is that amount_minor comes back as a bare
+-- int64 rather than domain.Money -- a cast produces a computed column and sqlc
+-- loses the `user_limits.amount_minor` identity that the override table matches
+-- on. internal/betting/pgstore converts through domain.FromMinorUnits, which is
+-- the bounds check a raw scan would have skipped.
+--
+-- At most one row per (kind, period) is returned, and that is a guarantee rather
+-- than an ORDER BY trick: the intervals [effective_from, superseded_at) for one
+-- (user, kind, period) tile without overlapping, because 00005's partial unique
+-- index permits exactly one open row and every closed one was closed at its
+-- successor's effective_from.
+--
+-- name: GetCurrentLimits :many
+SELECT id,
+       kind,
+       period,
+       coalesce(amount_minor, 0)::BIGINT   AS amount_minor,
+       (amount_minor IS NOT NULL)::BOOLEAN AS has_amount,
+       requested_at,
+       effective_from
+  FROM user_limits
+ WHERE user_id = @user_id
+   AND effective_from <= @at
+   AND (superseded_at IS NULL OR superseded_at > @at)
+ ORDER BY kind, period;
+
+
+-- The period-scoped sum a money limit is compared against.
+--
+-- THIS IS THE RESPONSIBLE-GAMING ENFORCEMENT QUERY. Migration 00005 lists how
+-- each money kind is evaluated and every one of them is this statement with
+-- different arguments:
+--
+--   grant   kinds={'grant'}                       money entering the account
+--   stake   kinds={'stake'}                       what was risked in the period
+--   loss    kinds={'stake','payout','refund',
+--                  'cash_out'}                    the NET against cash
+--
+-- THE KINDS ARE A SET, NOT ONE VALUE, and the loss limit is why. A net loss is
+-- not the sum of one entry kind -- it is what the customer put in minus what
+-- came back, which spans the stake that left and the payout, refund and
+-- cash-out that returned. Asking for it one kind at a time is four round trips
+-- inside a placement transaction where one does, and four separately-read sums
+-- can each be from a different snapshot under READ COMMITTED. The set is passed
+-- as a TEXT[] and the kinds are domain.EntryKind.String() values;
+-- ledger_entries_kind_defined constrains the column to the same seven
+-- spellings, so an unrecognised element matches nothing rather than erroring,
+-- which is why internal/betting validates the set before calling.
+--
+-- SIGN. amount_minor is SIGNED -- positive credits the account, negative debits
+-- it -- so a 'stake' sum over user_cash is NEGATIVE and a 'grant' sum is
+-- POSITIVE. The raw sum is returned unchanged rather than wrapped in abs(): the
+-- sign convention is the ledger's own, and a second spelling of it here is how
+-- two parts of the codebase come to disagree about which way money is moving.
+-- internal/betting negates where the question calls for it, at a call site where
+-- the negation can be read.
+--
+-- WHY THE ACCOUNT KIND IS A PARAMETER. An account IS its (kind, owner) pair
+-- (ledger.go: there is no accounts table). A stake movement touches BOTH
+-- user_cash and user_escrow -- cash debited, escrow credited, by the same
+-- transaction -- so summing without naming the account counts one movement
+-- twice and nets to zero. Naming it is not optional, and making it a parameter
+-- rather than hard-coding 'user_cash' is what lets the exposure metric ask the
+-- same question of escrow.
+--
+-- WHY `occurred_at` AND NOT `created_at`. occurred_at is EVENT time, from the
+-- acting service's clock. A settlement replayed from Kafka writes rows whose
+-- created_at is hours after the movement happened, and a limit window measured
+-- on created_at would count that replay into today's total. 00006 keeps both
+-- columns exactly so this query can pick the right one.
+--
+-- The bound is INCLUSIVE and there is no upper one, matching Tx.SumEntries: a
+-- period window is "since the period began", and an upper bound would have to be
+-- the same instant as `at`, which would exclude a movement this very transaction
+-- is about to make. There is nothing after `since` that is not in the period.
+--
+-- INDEX-ONLY. ledger_entries_account_idx is (account_kind, account_user_id,
+-- occurred_at) INCLUDE (amount_minor, kind): two leading equalities, a range on
+-- the third column, and both payload columns carried in the index, so no heap
+-- visit per entry. Migration 00006 names this query as one of the two reasons
+-- that index has an INCLUDE clause at all.
+--
+-- coalesce(...) makes an empty window return 0 rather than NULL, which is the
+-- right answer: a customer who has staked nothing this week has staked zero.
+-- entry_count distinguishes that from "no rows matched because the arguments
+-- were wrong", which a bare zero cannot.
+--
+-- THE ::BIGINT CAST IS LOAD-BEARING. sum(bigint) is NUMERIC in PostgreSQL, and
+-- numeric arrives in Go as a decimal string -- which would put a parse, and a
+-- possible parse FAILURE, on the path that decides whether a customer has hit
+-- their own loss limit. account_balances' view definition casts for the same
+-- reason.
+--
+-- total_minor COMES BACK AS int64, NOT domain.Money, and that is deliberate --
+-- sqlc.yaml explains at the override table why it must be and why it should be.
+-- Every money override maps a STORED column bounded by a CHECK to
+-- domain.MaxSafeMoney; a SUM has no such bound, so the conversion belongs at
+-- domain.FromMinorUnits in internal/betting/pgstore, where an overflowing total
+-- is an error instead of a silently invalid Money.
+--
+-- name: SumLedgerEntriesSince :one
+SELECT coalesce(sum(amount_minor), 0)::BIGINT AS total_minor,
+       count(*)::BIGINT                       AS entry_count
+  FROM ledger_entries
+ WHERE account_kind = @account_kind
+   AND account_user_id = @account_user_id
+   AND kind = ANY(@kinds::TEXT[])
+   AND occurred_at >= @since;
+
+
+-- The credit a GRANT transaction made to one customer's cash account.
+--
+-- Answers the replayed top-up: internal/betting derives a grant's transaction id
+-- from (user, Idempotency-Key), so a resubmitted grant collides with
+-- ledger_transactions' primary key, and the service reports what the ORIGINAL
+-- request credited rather than echoing what this one asked for.
+--
+-- WHY THIS IS A SCALAR READ AND NOT A REHYDRATION. The service needs two values
+-- -- how much was credited, and when -- to answer the replay. Rehydrating a whole
+-- domain.Transaction would mean a second statement for the entries, an ordering
+-- guarantee on entry_index, and a mapping function, all to discard the debit half
+-- immediately: a grant is issuance -> user_cash, and only the credit side is the
+-- customer's.
+--
+-- THE THREE PREDICATES ARE ALL LOAD-BEARING, none is belt-and-braces:
+--
+--   t.kind = 'grant'          a transaction id that is not a grant must not be
+--                             reported as one. The id derivation tags grants
+--                             separately, so this can only fail on a derivation
+--                             bug -- which should surface as "no row" and a
+--                             refusal, not as a settlement being described to a
+--                             customer as a top-up.
+--   e.account_kind = 'user_cash'
+--                             the credit half. The debit half is the issuance
+--                             account and is negative; returning it would report
+--                             a top-up as a withdrawal.
+--   e.account_user_id = @owner
+--                             the id is derived FROM the user, so a mismatch is
+--                             unreachable by a correct client. Asserting it in
+--                             the predicate means a derivation collision returns
+--                             no row instead of returning one customer's amount
+--                             to another.
+--
+-- name: GetGrantCreditForUser :one
+SELECT e.amount_minor,
+       t.occurred_at
+  FROM ledger_entries e
+  JOIN ledger_transactions t ON t.id = e.transaction_id
+ WHERE e.transaction_id = @transaction_id
+   AND t.kind = 'grant'
+   AND e.account_kind = 'user_cash'
+   AND e.account_user_id = @owner;
+
+
+-- The current quote for one selection at one book, with everything a leg needs.
+--
+-- THE ONLY ROUTE BY WHICH A PRICE REACHES A LEG. internal/betting constructs no
+-- domain.Price from request input -- the customer names a selection and a book,
+-- and the number they are booked at is whatever this statement returns, re-read
+-- inside the placement transaction. That is what makes "the customer never
+-- determines the price" structural rather than a validation rule somebody has
+-- to remember to apply.
+--
+-- WHY THE MARKET, EVENT, TYPE AND ROLE TRAVEL WITH THE PRICE. domain.NewLeg
+-- needs all six values and refuses a leg whose price quotes a different
+-- selection (ErrLegPriceMismatch) or whose role its market type does not admit
+-- (ErrRoleNotApplicable). Gathering them in one round trip per selection rather
+-- than four is the difference between a three-leg parlay costing three queries
+-- and costing twelve, inside a transaction that is holding a row lock. And it is
+-- the shape leg.go asks for: "A leg carries everything the grader needs."
+--
+-- WHY THIS EXISTS RATHER THAN REUSING prices.sql's
+-- LatestPriceForEachBookOnSelections. That statement is the BOARD's read: the
+-- latest price per (selection, book) for a page of selections, across every
+-- book, and it returns the price and nothing else -- no market, no event, no
+-- role. A slip needs one book's quote plus the catalogue context, so the two
+-- differ in both directions and neither is a subset of the other. They do share
+-- the index that matters: prices_natural_key_idx (selection_id, book_id,
+-- observed_at DESC) serves both, and both are bounded index scans that stop at
+-- the first row of a group.
+--
+-- NO STALENESS FILTER, DELIBERATELY. `observed_after` is a REQUIRED parameter on
+-- the board's read because that statement scans a set of selections and needs
+-- chunk exclusion. This one is two leading equalities into one chunk-ordered
+-- index and stops at the first row, so a bound buys nothing on the plan -- and
+-- Tx.QuoteFor's contract is explicit that the service compares Price.ObservedAt
+-- against its own configured MaxQuoteAge and raises ErrStaleQuote. "How old is
+-- too old" is a reviewable option, not a constant buried in SQL where nobody
+-- looking at the betting service can find it.
+--
+-- ORDER BY observed_at DESC LIMIT 1 rather than DISTINCT ON, because there is
+-- exactly one group: DISTINCT ON is what the multi-selection read needs and is
+-- overhead here.
+--
+-- Returns NO ROW when this book has never quoted this selection, which the
+-- caller maps to ErrQuoteUnavailable -- a real and ordinary outcome on a market
+-- one book does not price.
+--
+-- name: GetCurrentQuoteForSelection :one
+SELECT p.selection_id,
+       p.book_id,
+       p.decimal_odds,
+       p.line,
+       p.observed_at,
+       p.ingested_at,
+       s.market_id,
+       s.market_type,
+       s.role,
+       m.event_id
+  FROM prices     p
+  JOIN selections s ON s.id = p.selection_id
+  JOIN markets    m ON m.id = s.market_id
+ WHERE p.selection_id = @selection_id
+   AND p.book_id = @book_id
+ ORDER BY p.observed_at DESC
+ LIMIT 1;
+
+
+-- Will this market, and the event under it, take a bet?
+--
+-- Two statuses rather than one, because they are INDEPENDENT. market.go says so
+-- ("MarketStatus is the market lifecycle. It is independent of the event's") and
+-- the catalogue migration says it again on the column: "CLAUDE.md section 6 lets
+-- an admin suspend one market while the event trades on". A suspended market on
+-- a live event is the ordinary case during a scoring play, so reading either one
+-- alone answers the wrong question.
+--
+-- scheduled_start is returned FOR THE ERROR MESSAGE, NOT FOR THE DECISION.
+-- Whether a started event takes bets is EventStatus.AcceptsWagers()'s answer --
+-- live betting is a feature (CLAUDE.md section 6), so comparing the wall clock
+-- against a kickoff time here would refuse every in-play wager, which is the
+-- most plausible-looking way to break the product. internal/betting/ports.go
+-- states the same rule on MarketState.ScheduledStart.
+--
+-- WHY NOT api.sql's GetMarketWithEvent. That statement serves the multi-book
+-- comparison endpoint and carries the display fields a breadcrumb needs --
+-- subject, event_name, league_id -- and does NOT carry scheduled_start. This
+-- read runs inside the placement transaction, once per leg, while a row lock is
+-- held, and wants the opposite trade: no strings it will never render, and the
+-- one instant it actually needs.
+--
+-- Returns NO ROW for a market that does not exist. The caller reports that as
+-- ErrMarketNotOpen rather than as a not-found of its own: from the slip's point
+-- of view a market that has vanished and one that is closed are the same
+-- refusal, and giving the customer two different sentences for one situation
+-- buys nothing.
+--
+-- Two primary-key lookups joined. No other index is involved.
+--
+-- name: GetMarketState :one
+SELECT m.id,
+       m.status AS market_status,
+       e.id     AS event_id,
+       e.status AS event_status,
+       e.scheduled_start
+  FROM markets m
+  JOIN events  e ON e.id = m.event_id
+ WHERE m.id = @market_id;
+
+
+-- One ticket, by identifier.
+--
+-- Rehydrates domain.Wager's own fields; its legs come from ListWagerLegs, which
+-- is a separate statement rather than a join because a join would repeat every
+-- wager column once per leg and a 25-leg parlay (domain.MaxWagerLegs) would
+-- carry the ticket's fifteen columns twenty-five times. Two round trips, both
+-- primary-key-driven, beat one that transfers the ticket twenty-five times.
+--
+-- NOT LOCKED, unlike settlement.sql's GetWagerForSettlement. This one is read on
+-- two paths that write nothing to the wager: the idempotent replay path, where
+-- the INSERT reported a primary-key collision and the existing ticket IS the
+-- answer, and the cash-out QUOTE, which prices a buy-back without committing to
+-- it. Taking a row lock to answer a question nobody will act on inside the same
+-- transaction holds a lock across a pricing read for no invariant.
+--
+-- NOT SCOPED BY USER, and the caller must scope it. An API handler serving wager
+-- history MUST compare the returned user_id against the authenticated subject
+-- and answer 404 on a mismatch -- returning 403 would confirm the ticket exists,
+-- which is an enumeration oracle over other customers' wager ids. The write path
+-- that actually needs the scope has it in the predicate instead; see
+-- settlement.sql's OpenWagerForCashOut.
+--
+-- returned_minor and net_return_minor are NULL exactly while the ticket is
+-- running (wagers_return_iff_terminal) and arrive as *domain.Money.
+-- Wager.Returned() and Wager.NetReturn() share ONE presence flag and the schema
+-- guarantees they are both null or both set (wagers_return_pair_complete), so
+-- the caller reconstructs that pair from either pointer.
+--
+-- name: GetWager :one
+SELECT id, user_id, kind, status,
+       stake_minor, accepted_decimal, rounding,
+       potential_payout_minor, potential_profit_minor,
+       teaser_points, round_robin_id,
+       returned_minor, net_return_minor,
+       placed_at, transitioned_at
+  FROM wagers
+ WHERE id = @id;
+
+
+-- Every leg of one ticket, in a stable order.
+--
+-- The price columns are a COPY of one domain.Price taken at placement, never a
+-- reference into the hypertable, and this statement is where that copy is read
+-- back. CLAUDE.md section 4 is emphatic about it and leg.go states the guarantee
+-- the copy buys: "there is no expression anywhere in the program that can
+-- re-resolve a booked leg to a moved line." Reading a leg and then looking up a
+-- current price to grade it would reintroduce exactly the defect the copy
+-- prevents -- and it grades correctly in every test where the line never moves.
+--
+-- ORDER BY selection_id, not by id: legs_wager_selection_key is UNIQUE
+-- (wager_id, selection_id), so this ordering is served by the index the
+-- predicate already uses and costs no sort node, while ORDER BY id would need
+-- one. domain.validateLegSet keeps the caller's leg order as given and refuses a
+-- repeated selection, so ordering by selection is total, deterministic, and does
+-- not claim to reproduce the order the slip was built in -- nothing in the
+-- domain depends on that order.
+--
+-- name: ListWagerLegs :many
+SELECT id, wager_id, event_id, market_id, market_type,
+       selection_id, role,
+       price_book_id, price_decimal, price_line, price_observed_at,
+       teased_line, status, graded_at
+  FROM legs
+ WHERE wager_id = @wager_id
+ ORDER BY selection_id;
+
+
+-- Every leg of a SET of tickets -- the history screen's second round trip.
+--
+-- ListWagerLegs answers one ticket, which is right for a wager-detail read and
+-- wrong for a page of thirty: thirty round trips whose per-call overhead
+-- dominates what is otherwise a bounded index scan. This is the same index
+-- driven by an ANY(...) over the page's wager ids, which is the device
+-- api.sql's ListMarketsForEvents uses for the same reason.
+--
+-- Ordered by (wager_id, selection_id) so the caller groups the result in one
+-- pass rather than building a map, and so the tree does not reshuffle between
+-- renders.
+--
+-- name: ListLegsForWagers :many
+SELECT id, wager_id, event_id, market_id, market_type,
+       selection_id, role,
+       price_book_id, price_decimal, price_line, price_observed_at,
+       teased_line, status, graded_at
+  FROM legs
+ WHERE wager_id = ANY(@wager_ids::TEXT[])
+ ORDER BY wager_id, selection_id;
+
+
+-- Wager history for one customer, newest first -- first page.
+--
+-- CLAUDE.md section 6 (Betting): "wager history; open position tracking".
+--
+-- Served by wagers_user_placed_idx (user_id, placed_at DESC): one leading
+-- equality and the ordering column already in the direction asked for.
+--
+-- KEYSET, NOT OFFSET, and the ordering is TOTAL. api.sql's header argues both at
+-- length and the argument is unchanged here: an OFFSET page skips or repeats
+-- rows when the underlying set is written between requests, and `ORDER BY
+-- placed_at DESC` alone is not total -- two tickets placed in the same
+-- microsecond come back in an arbitrary order that may differ between two runs
+-- of the same query, so a cursor naming one of them cannot say which. `id` is
+-- the primary key, so (placed_at, id) is total and the cursor is unambiguous.
+--
+-- The tie-break is not theoretical here, which is why it is not optional: a
+-- round robin expands into N tickets that all share ONE placement instant, so a
+-- page boundary landing inside a round robin is an ordinary occurrence rather
+-- than a microsecond coincidence.
+--
+-- The caller asks for one row more than the page size and reports has_more from
+-- whether it got it -- one extra row rather than a second COUNT(*), which over a
+-- continuously-written set is stale before it is serialised.
+--
+-- name: ListWagersForUserFirstPage :many
+SELECT id, user_id, kind, status,
+       stake_minor, accepted_decimal, rounding,
+       potential_payout_minor, potential_profit_minor,
+       teaser_points, round_robin_id,
+       returned_minor, net_return_minor,
+       placed_at, transitioned_at
+  FROM wagers
+ WHERE user_id = @user_id
+ ORDER BY placed_at DESC, id DESC
+ LIMIT @row_limit;
+
+
+-- Wager history for one customer, continued from a cursor.
+--
+-- The row-value comparison `(placed_at, id) < (@before_placed_at, @before_id)`
+-- is written as a ROW comparison rather than as the expanded
+-- `a < x OR (a = x AND b < y)`. They are logically identical, PostgreSQL plans
+-- the row form as a single index range, and the expanded form is where
+-- off-by-one duplicate-row bugs live. The direction is `<` because the ordering
+-- is DESC: "after this cursor" on a newest-first list means "older than".
+--
+-- The pair of statements exists rather than one query with a nullable cursor
+-- because `(@before IS NULL OR (placed_at, id) < (...))` is not sargable -- the
+-- OR defeats the index the whole design depends on.
+--
+-- name: ListWagersForUserAfterCursor :many
+SELECT id, user_id, kind, status,
+       stake_minor, accepted_decimal, rounding,
+       potential_payout_minor, potential_profit_minor,
+       teaser_points, round_robin_id,
+       returned_minor, net_return_minor,
+       placed_at, transitioned_at
+  FROM wagers
+ WHERE user_id = @user_id
+   AND (placed_at, id) < (@before_placed_at, @before_id::TEXT)
+ ORDER BY placed_at DESC, id DESC
+ LIMIT @row_limit;
+
+
+-- The tickets an event can still move.
+--
+-- Settlement's own work queue is settlement.sql's ListPendingLegsForEvent, which
+-- returns the LEGS and their grading inputs. This returns the ticket ids, which
+-- is the shape the admin console's manual-settlement screen wants (CLAUDE.md
+-- section 6, Platform) and the shape an operator asking "what is exposed on this
+-- game" wants. Migration 00006 built legs_event_status_idx (event_id, status)
+-- for both.
+--
+-- BOTH STATUS PREDICATES ARE REQUIRED and they are not the same question. A leg
+-- may still be pending on a wager that is already terminal -- a parlay whose
+-- first leg lost is settled immediately and its remaining legs are never graded,
+-- because the ticket's outcome is already decided and grading them would be work
+-- with no effect. So:
+--
+--   l.status = 'pending'                 there is something to grade on this leg
+--   w.status IN ('placed', 'open')       the ticket can still change
+--
+-- The second predicate's literal set is WagerStatus.HoldsEscrow(), which
+-- ledger.go names as "the predicate the exposure metric and the 'at risk' figure
+-- are built on", and it matches wagers_user_open_idx's partial predicate exactly.
+-- It is written out rather than parameterised so that it keeps matching.
+--
+-- DISTINCT because a same-game parlay puts several legs of one ticket on one
+-- event, and the caller wants each ticket once. Ordered by id so a re-run
+-- processes the queue in the same order, which makes a partially-completed pass
+-- resumable and its logs diffable.
+--
+-- name: GetOpenWagerIDsForEvent :many
+SELECT DISTINCT l.wager_id
+  FROM legs   l
+  JOIN wagers w ON w.id = l.wager_id
+ WHERE l.event_id = @event_id
+   AND l.status = 'pending'
+   AND w.status IN ('placed', 'open')
+ ORDER BY l.wager_id;

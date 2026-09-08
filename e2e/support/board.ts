@@ -21,8 +21,30 @@ export async function gotoBoard(page: Page): Promise<void> {
   await page.goto(ROUTES.board, { waitUntil: 'domcontentloaded' });
 }
 
+/**
+ * Populated means a price cell is VISIBLE, not merely present in the DOM.
+ *
+ * The distinction is load-bearing and was found by the phase-9 gate. Next's
+ * streaming SSR delivers the board's content inside a `<div hidden
+ * style="display:none">` and reveals it with an inline script a beat later, so
+ * for roughly the first 200ms after `domcontentloaded` the table, its forty rows
+ * and its 225 price cells are all in the document and none of them is visible.
+ *
+ * `Locator.count()` on a CSS selector is visibility-blind, so the old check
+ * resolved this branch to 'populated' inside that window — and every assertion
+ * downstream is visibility-AWARE: `getByRole('row')` skips hidden elements and
+ * `focus()` does nothing to a `display:none` element. The result was three tests
+ * that failed against a board a human sees render perfectly.
+ *
+ * Requiring visibility is STRICTER than requiring presence, not weaker: a board
+ * that rendered its rows and never revealed them would now be caught here rather
+ * than misreported as a missing-rows defect three assertions later.
+ */
 async function isPopulated(page: Page): Promise<boolean> {
-  return (await priceCells(page).count()) > 0;
+  return await priceCells(page)
+    .first()
+    .isVisible()
+    .catch(() => false);
 }
 
 async function isExplicitlyEmpty(page: Page): Promise<boolean> {

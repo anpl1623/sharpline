@@ -36,6 +36,20 @@
 // every score change, which is the exact bus flood change detection exists to
 // prevent. They are not needed to price a market. Event status IS carried,
 // because it gates whether a market accepts wagers.
+//
+// THAT EXCLUSION IS RIGHT AND IT LEAVES SETTLEMENT WITH NO INPUT. A FINAL score
+// changes exactly once, and nothing else in the tree carries it, so events.score_*
+// is NULL on every row of a running stack and internal/settlement's results feed
+// is permanently empty. Two further facts make it structural rather than a
+// tuning problem: raw.go's RawEvent has no status, score or completed field, so a
+// provider cannot state a result even when it knows one; and mapper.go derives
+// status from timestamps alone, so EventStatusEnded is unreachable and the status
+// carried here is only ever scheduled or live.
+//
+// The fix is NOT to relax this exclusion — the flood argument above still holds.
+// CLAUDE.md §3's event flow already draws results as their own source into
+// `settle`, and that is the seam to build. See internal/settlement/pgstore/doc.go,
+// which carries the full chain and the evidence.
 package normalizer
 
 import (

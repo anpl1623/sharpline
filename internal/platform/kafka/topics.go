@@ -1,11 +1,35 @@
 // The topic registry: the Go-side mirror of what Terraform declares.
 //
-// CLAUDE.md §3 fixes the four topics and their retention posture:
+// CLAUDE.md §3 fixes the four original topics and their retention posture:
 //
 //	odds.raw.{provider}   retention-based
 //	odds.normalized       compacted, keyed by market
 //	price.computed        compacted
 //	wager.events          retention-based, the settlement audit trail
+//
+// Phase 9 adds the SIGNALS FAMILY. Three of the four names come straight out of
+// §3's event-flow diagram, which draws the phase-12 Flink jobs emitting
+// `signals.steam | signals.arb | signals.clv`:
+//
+//	signals.ev            retention-based, keyed by market
+//	signals.arb           retention-based, keyed by market
+//	signals.steam         retention-based, keyed by market
+//	signals.clv           retention-based, keyed by wager
+//
+// SIGNALS.EV IS AN ADDITION TO THE CHARTER AND IS FLAGGED AS ONE. The diagram does
+// not name it, but §6's Analytics bullet leads with "Positive-EV finder against a
+// sharp reference book", and phase 9 needs it as a first-class signal for the same
+// reason the other three are: a +EV finding is an event that has to reach a
+// subscriber, be recorded, and be replayable. Leaving it off the bus would make
+// the +EV finder the one analytic that phase 12 could not replace like for like.
+//
+// ALL FOUR ARE RETENTION-BASED, NOT COMPACTED, and that is the load-bearing
+// decision rather than an oversight. Compaction keeps the latest record per key,
+// which is only meaningful when the latest record SUPERSEDES the earlier ones --
+// true of a market's current line, false of a finding. "The latest steam move for
+// market X" is not a snapshot of anything; it is one event, and the one before it
+// is a different event that also happened. Compacting these would do to the signal
+// history exactly what §3 says compacting wager.events would do to the audit trail.
 //
 // # Two sources of truth, split along what each one is for
 //
@@ -62,6 +86,48 @@ const (
 	// name is built by OddsRaw; the prefix is exported because kafka-ui users
 	// and operators pattern-match on it.
 	TopicOddsRawPrefix = "odds.raw."
+
+	// TopicSignalsEV carries positive-EV findings from the pricer's signals
+	// stage. Retention-based and keyed by market_id.
+	//
+	// Keyed by MARKET rather than by selection even though a finding is about one
+	// selection, and the reason is co-partitioning: odds.normalized and
+	// price.computed are both keyed by market_id with the same partition count, so
+	// a market-keyed signals topic lands the same market on the same partition
+	// INDEX across all three. Phase 12's Flink jobs join these streams, and
+	// co-partitioned sources on the join key is the difference between a local
+	// join and a network shuffle. Keying by selection would break that for the
+	// sake of a finer granularity nothing consumes.
+	TopicSignalsEV = "signals.ev"
+
+	// TopicSignalsArb carries arbitrage findings. Retention-based, keyed by
+	// market_id — which is also the natural key here rather than a compromise: an
+	// arbitrage is a statement about ONE market's outcome set across books, so
+	// the market is what it is about.
+	TopicSignalsArb = "signals.arb"
+
+	// TopicSignalsSteam carries steam-move detections. Retention-based, keyed by
+	// market_id, which is what CLAUDE.md §3 asks for in as many words: "hopping
+	// window over line-movement velocity, keyed by market, across books".
+	//
+	// Note that the DATABASE key is finer — migration 00009 keys steam_signals by
+	// (market, selection, window) because steam is directional. The bus key stays
+	// at the market so that all of one market's signals stay ordered relative to
+	// each other on one partition; the selection travels in the payload.
+	TopicSignalsSteam = "signals.steam"
+
+	// TopicSignalsCLV carries per-graded-leg closing line value, written by
+	// `settle`. Retention-based and keyed by WAGER, not by market — the only
+	// topic in the signals family that is.
+	//
+	// The other three are findings about a market and are consumed alongside the
+	// market streams. A CLV record is a fact about a WAGER: odds/clv.go says "the
+	// settle service writes one per graded leg". Keying it by wager_id makes it
+	// co-partitioned with wager.events, so a wager's placement, settlement and CLV
+	// stay ordered relative to one another for a consumer building a user's
+	// record — which is exactly what the leaderboard does. Keying by market would
+	// scatter one wager's legs across partitions with no ordering between them.
+	TopicSignalsCLV = "signals.clv"
 )
 
 // maxTopicNameLen is Kafka's own limit on a topic name.
@@ -186,6 +252,33 @@ func WagerEvents() Topic {
 	return Topic{name: TopicWagerEvents, retention: RetentionDelete, key: KeyKindWagerID}
 }
 
+// SignalsEV returns the signals.ev topic (phase 9, the +EV finder).
+//
+// RetentionDelete like every member of the signals family: a finding is a
+// point-in-time event, not a current-state snapshot, so there is nothing for
+// compaction to supersede. See this file's package comment.
+func SignalsEV() Topic {
+	return Topic{name: TopicSignalsEV, retention: RetentionDelete, key: KeyKindMarketID}
+}
+
+// SignalsArb returns the signals.arb topic (phase 9, arbitrage detection).
+func SignalsArb() Topic {
+	return Topic{name: TopicSignalsArb, retention: RetentionDelete, key: KeyKindMarketID}
+}
+
+// SignalsSteam returns the signals.steam topic (phase 9, steam detection).
+func SignalsSteam() Topic {
+	return Topic{name: TopicSignalsSteam, retention: RetentionDelete, key: KeyKindMarketID}
+}
+
+// SignalsCLV returns the signals.clv topic (phase 9, closing line value).
+//
+// The one signals topic keyed by wager rather than by market, so that a wager's
+// CLV stays ordered against its own placement and settlement on wager.events.
+func SignalsCLV() Topic {
+	return Topic{name: TopicSignalsCLV, retention: RetentionDelete, key: KeyKindWagerID}
+}
+
 // Provider is a provider slug as it appears in odds.raw.{provider}.
 //
 // # Why this is not domain.Slug
@@ -258,8 +351,21 @@ func OddsRaw(provider Provider) (Topic, error) {
 // Topics returns the named topics — everything except the per-provider
 // odds.raw.* family, whose membership is a deployment decision held in
 // Terraform's raw_providers.
+//
+// Ordered as the pipeline runs: the market stream, then the signals derived from
+// it, then the wager stream and the CLV derived from that. Callers that enumerate
+// topics for a health check or a kafka-ui bookmark read this order, and pipeline
+// order is the one a human reading the list wants.
 func Topics() []Topic {
-	return []Topic{OddsNormalized(), PriceComputed(), WagerEvents()}
+	return []Topic{
+		OddsNormalized(),
+		PriceComputed(),
+		SignalsEV(),
+		SignalsArb(),
+		SignalsSteam(),
+		WagerEvents(),
+		SignalsCLV(),
+	}
 }
 
 // LookupTopic resolves a topic name back to its registry entry, including the
@@ -267,8 +373,14 @@ func Topics() []Topic {
 //
 // It reports false for a name this system does not declare. Callers use that to
 // stay permissive about topics they do not own — the integration tests create
-// throwaway topics, and a future Flink job (CLAUDE.md §3, phase 12) will publish
-// signals.* topics that this registry deliberately does not enumerate yet.
+// throwaway topics.
+//
+// The signals.* family IS enumerated as of phase 9. Before that it was the
+// standing example of a topic this registry deliberately did not know about,
+// which is why the permissiveness exists at all; the permissiveness is kept
+// because the property it buys — an unrecognised topic is usable but is never
+// treated as compacted — is worth having whether or not anything currently
+// depends on it.
 func LookupTopic(name string) (Topic, bool) {
 	switch name {
 	case TopicOddsNormalized:
@@ -277,6 +389,14 @@ func LookupTopic(name string) (Topic, bool) {
 		return PriceComputed(), true
 	case TopicWagerEvents:
 		return WagerEvents(), true
+	case TopicSignalsEV:
+		return SignalsEV(), true
+	case TopicSignalsArb:
+		return SignalsArb(), true
+	case TopicSignalsSteam:
+		return SignalsSteam(), true
+	case TopicSignalsCLV:
+		return SignalsCLV(), true
 	}
 	if suffix, ok := strings.CutPrefix(name, TopicOddsRawPrefix); ok {
 		t, err := OddsRaw(Provider(suffix))
