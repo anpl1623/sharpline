@@ -248,11 +248,45 @@ func newProducer(ctx context.Context, opts ProducerOptions, profile []kgo.Opt) (
 		// It becomes settable only by disabling idempotence, which is exactly
 		// the combination that reorders.
 
-		// lz4, falling back to none if the broker refuses. Not zstd: its Go
-		// implementation costs more CPU per byte and the deploy target is a
-		// 2 OCPU Ampere box. JSON from one topic is highly repetitive, so lz4
-		// recovers most of the size difference against protobuf (doc.go).
-		kgo.ProducerBatchCompression(kgo.Lz4Compression(), kgo.NoCompression()),
+		// NO COMPRESSION, and the reason is the BROKER's heap rather than this
+		// process's CPU.
+		//
+		// This was lz4. It OOM-killed the broker, repeatably, on a log holding
+		// less than 300 KB:
+		//
+		//   java.lang.OutOfMemoryError: Java heap space
+		//     at Lz4Compression.wrapForInput
+		//     at LogValidator.validateMessagesAndAssignOffsetsCompressed
+		//     at UnifiedLog.append              (topic odds.raw.synthetic)
+		//
+		// The mechanism is a declared buffer size, not a large payload.
+		// franz-go compresses through pierrec/lz4, whose
+		// DefaultBlockSizeOption is Block4Mb, so EVERY frame this producer
+		// writes declares a 4 MiB maximum block — and Kafka sizes its
+		// decompression buffer from that declaration rather than from the
+		// bytes actually present. franz-go builds the writer itself and
+		// applies only a compression level, so there is no option here that
+		// makes the declaration smaller.
+		//
+		// Measured on a running stack: records are ~3.7 KB uncompressed and
+		// ~1.2 KB on the wire, and `kafka-dump-log` reports `count: 1` on every
+		// batch. So the steady state was a 4 MiB broker-side allocation per
+		// 1.2 KB record. At the 192 MiB heap the deploy VM is sized for (see
+		// compose.yaml) the broker died in under four minutes having written
+		// zero prices; at 768 MiB it survived a few minutes and then died the
+		// same way. A bigger heap buys time and does not fix it.
+		//
+		// The cost of turning it off is 3x on the wire and on disk, against
+		// topics whose whole retained volume was 291 KB and whose
+		// retention.bytes is 1 GiB per partition. That is not a trade, it is a
+		// rounding error.
+		//
+		// IF COMPRESSION IS EVER NEEDED AGAIN — a real provider at real volume
+		// — do not simply put lz4 back. Snappy and zstd size their input
+		// buffers from the actual block rather than from a declared maximum,
+		// which is the property that matters here; zstd was already rejected on
+		// CPU in this file's earlier revision, which leaves snappy.
+		kgo.ProducerBatchCompression(kgo.NoCompression()),
 
 		// The murmur2 key partitioner Kafka's own clients use, set explicitly
 		// rather than relied on as a default. A phase-12 Flink SQL job writing
